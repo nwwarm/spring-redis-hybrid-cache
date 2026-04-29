@@ -1,0 +1,12 @@
+# IntelliJ IDEA
+.idea/
+*.iml
+
+# Maven / Gradle build output
+target/
+build/
+out/
+
+# OS files (optional but recommended)
+.DS_Store
+Thumbs.db

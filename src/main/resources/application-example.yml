@@ -1,0 +1,96 @@
+# Hybrid cache configuration example.
+#
+# Three tiers:
+#   NEAR_CACHE       — Caffeine (L1) + Redis (L2) with topic-based invalidation. Default.
+#   LOCAL_ONLY       — Caffeine only. No cross-node coherence. Use for per-instance state.
+#   DISTRIBUTED_ONLY — Redis only. No L1. Use for shared state or working sets too large for L1.
+#
+# Cache names here MUST match the value in @Cacheable / @CacheEvict annotations.
+# Caches not listed here use the default-spec.
+
+cache:
+  # Optional. If unset, a UUID is generated per JVM. Set this if you want cache
+  # invalidation messages to be traceable to a specific instance in your logs.
+  # node-id: ${HOSTNAME}
+
+  server:
+    address: redis://localhost:6379
+    password: ${REDIS_PASSWORD:}
+
+  # Narrows the polymorphic type validator used by the default Jackson codec.
+  # Strongly recommended for production — limits the deserialization attack
+  # surface to types within the listed package prefixes. java.util., java.time.,
+  # and java.lang. are always allowed in addition to whatever you list here.
+  # If empty/unset, a permissive default is used and a startup warning is logged.
+  allowed-packages:
+    - com.example.domain
+    - com.example.dto
+
+  default-spec:
+    tier: NEAR_CACHE
+    ttl: 1h
+    maximum-size: 10000
+    lock-wait: 5s
+    lock-lease: 30s
+    codec: JSON                # JSON (default) or KRYO
+
+  caches:
+    # Read-heavy reference data: near-cache, larger size, longer TTL.
+    products:
+      tier: NEAR_CACHE
+      ttl: 6h
+      maximum-size: 50000
+      lock-wait: 5s
+      lock-lease: 30s
+      # codec defaults to JSON — debuggable from redis-cli, schema-tolerant.
+
+    # Per-node rate limit counters: local only.
+    request-rate-limits:
+      tier: LOCAL_ONLY
+      ttl: 1m
+      maximum-size: 100000
+      # codec is irrelevant for LOCAL_ONLY (no Redis layer).
+
+    # Idempotency keys must be coherent across nodes; no L1.
+    idempotency-keys:
+      tier: DISTRIBUTED_ONLY
+      ttl: 24h
+      lock-wait: 0s            # no single-flight; let writes race
+
+    # Session data: shared across nodes, larger working set than per-node memory.
+    user-sessions:
+      tier: DISTRIBUTED_ONLY
+      ttl: 30m
+      lock-wait: 2s
+      lock-lease: 10s
+
+    # High-throughput hot path: opt into Kryo for compact binary payloads.
+    # Note: switching codec on an existing cache requires clearing it once.
+    auth-tokens:
+      tier: NEAR_CACHE
+      ttl: 5m
+      maximum-size: 200000
+      codec: KRYO              # ~3-5x smaller payloads, ~2-3x faster than JSON
+
+# Resilience4j is configured programmatically in CacheConfig, but you can override
+# via the spring-boot-starter properties below if you prefer YAML configuration.
+#
+# resilience4j.circuitbreaker:
+#   instances:
+#     redis-cache:
+#       sliding-window-size: 20
+#       minimum-number-of-calls: 10
+#       failure-rate-threshold: 50
+#       slow-call-duration-threshold: 500ms
+#       slow-call-rate-threshold: 80
+#       wait-duration-in-open-state: 30s
+#       permitted-number-of-calls-in-half-open-state: 3
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,caches
+  metrics:
+    tags:
+      application: ${spring.application.name}
