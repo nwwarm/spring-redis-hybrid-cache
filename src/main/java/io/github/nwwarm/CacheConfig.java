@@ -14,6 +14,7 @@ import org.redisson.api.RedissonClient;
 import org.redisson.client.RedisException;
 import org.redisson.codec.JsonJacksonCodec;
 import org.redisson.config.Config;
+import org.redisson.config.ReadMode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
@@ -55,13 +56,50 @@ public class CacheConfig {
 
         Config config = new Config();
         config.setCodec(new JsonJacksonCodec(mapper));
-        config.useSingleServer()
-                .setAddress(properties.server().address())
-                .setPassword(properties.server().password() == null
-                        ? null
-                        : properties.server().password().trim());
+        applyTopology(config, properties.server());
         config.setLazyInitialization(true);
         return Redisson.create(config);
+    }
+
+    /**
+     * Applies the topology-specific Redisson configuration based on
+     * {@link CacheProperties.Server#mode()}. Required-field validation has
+     * already happened in the {@link CacheProperties.Server} compact
+     * constructor, so this method only translates configuration into Redisson
+     * builder calls.
+     */
+    private static void applyTopology(Config config, CacheProperties.Server server) {
+        String password = server.password() == null ? null : server.password().trim();
+        switch (server.mode()) {
+            case SINGLE -> config.useSingleServer()
+                    .setAddress(server.address())
+                    .setPassword(password);
+            case CLUSTER -> {
+                // ReadMode.MASTER preserves read-your-writes against the
+                // invalidation pipeline. Redisson's default is SLAVE, which
+                // routes reads to async-replicating replicas and breaks the
+                // <10ms cross-node coherence the library commits to: a node
+                // whose L1 was just invalidated would read a stale value
+                // from a not-yet-replicated replica. Applications wanting
+                // higher read throughput in exchange for eventual-
+                // consistency reads can override the RedissonClient bean.
+                var cluster = config.useClusterServers()
+                        .setReadMode(ReadMode.MASTER)
+                        .setPassword(password)
+                        .setScanInterval(server.scanInterval() != null
+                                ? server.scanInterval()
+                                : 2000);
+                server.addresses().forEach(cluster::addNodeAddress);
+            }
+            case SENTINEL -> {
+                // See CLUSTER branch comment — same rationale for ReadMode.MASTER.
+                var sentinel = config.useSentinelServers()
+                        .setReadMode(ReadMode.MASTER)
+                        .setMasterName(server.masterName())
+                        .setPassword(password);
+                server.addresses().forEach(sentinel::addSentinelAddress);
+            }
+        }
     }
 
     /**

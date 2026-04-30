@@ -4,21 +4,15 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <parent>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-parent</artifactId>
-        <version>3.5.3</version>
-        <relativePath/>
-    </parent>
-
     <groupId>io.github.nwwarm</groupId>
     <artifactId>hybrid-cache-spring-boot-starter</artifactId>
-    <version>0.0.1</version>
+    <version>0.1.0</version>
     <name>spring-redis-hybrid-cache</name>
     <description>Three-tier cache library: local-only, distributed-only, or near-cache (Caffeine + Redisson)</description>
 
     <properties>
         <java.version>17</java.version>
+        <springboot.version>3.5.3</springboot.version>
         <caffeine.version>3.2.3</caffeine.version>
         <redisson.version>3.50.0</redisson.version>
         <resilience4j.version>2.3.0</resilience4j.version>
@@ -34,6 +28,14 @@
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
+
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>${springboot.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
         </dependencies>
     </dependencyManagement>
 
@@ -45,6 +47,10 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-configuration-processor</artifactId>
         </dependency>
 
         <dependency>
@@ -111,6 +117,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
                 <configuration>
                     <source>${java.version}</source>
                     <target>${java.version}</target>

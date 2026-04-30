@@ -59,7 +59,77 @@ public record CacheProperties(
         return spec;
     }
 
-    public record Server(String address, String password) {}
+    /**
+     * Redis connection configuration. The {@link Mode} selects which
+     * Redisson topology is used; required fields differ per mode.
+     *
+     * <ul>
+     *   <li>{@link Mode#SINGLE} — {@link #address} required.</li>
+     *   <li>{@link Mode#CLUSTER} — {@link #addresses} required (one entry per
+     *       node address); {@link #scanInterval} optional, defaults to 2000ms.</li>
+     *   <li>{@link Mode#SENTINEL} — {@link #masterName} required;
+     *       {@link #addresses} required (sentinel addresses).</li>
+     * </ul>
+     *
+     * <p>{@link #password} is optional in all modes. {@link #mode} defaults to
+     * {@link Mode#SINGLE} when unset, preserving backwards compatibility with
+     * the original two-field schema.
+     */
+    public record Server(
+            Mode mode,
+            String address,
+            List<String> addresses,
+            String masterName,
+            String password,
+            Integer scanInterval) {
+
+        public Server {
+            if (mode == null) mode = Mode.SINGLE;
+            if (addresses == null) addresses = List.of();
+            switch (mode) {
+                case SINGLE -> {
+                    if (address == null || address.isBlank()) {
+                        throw new IllegalArgumentException(
+                                "cache.server.address is required when cache.server.mode=SINGLE");
+                    }
+                }
+                case CLUSTER -> {
+                    if (addresses.isEmpty()) {
+                        throw new IllegalArgumentException(
+                                "cache.server.addresses must contain at least one node "
+                                        + "when cache.server.mode=CLUSTER");
+                    }
+                    if (addresses.stream().anyMatch(a -> a == null || a.isBlank())) {
+                        throw new IllegalArgumentException(
+                                "cache.server.addresses contains a blank entry "
+                                        + "(cache.server.mode=CLUSTER)");
+                    }
+                }
+                case SENTINEL -> {
+                    if (masterName == null || masterName.isBlank()) {
+                        throw new IllegalArgumentException(
+                                "cache.server.master-name is required when cache.server.mode=SENTINEL");
+                    }
+                    if (addresses.isEmpty()) {
+                        throw new IllegalArgumentException(
+                                "cache.server.addresses must list sentinel addresses "
+                                        + "when cache.server.mode=SENTINEL");
+                    }
+                    if (addresses.stream().anyMatch(a -> a == null || a.isBlank())) {
+                        throw new IllegalArgumentException(
+                                "cache.server.addresses contains a blank entry "
+                                        + "(cache.server.mode=SENTINEL)");
+                    }
+                }
+            }
+        }
+    }
+
+    public enum Mode {
+        SINGLE,
+        CLUSTER,
+        SENTINEL
+    }
 
     public record CacheSpec(
             Tier tier,

@@ -136,6 +136,11 @@ This is the section that distinguishes a production cache from a demo. Every sce
 | **Loader exception** | Exception propagates to the caller. No partial cache state is written. Subsequent calls retry the loader. |
 | **Lock holder crashes mid-load** | Redisson watchdog releases the lock automatically (default: 30s lease, renewed every 10s while holder is alive). Waiting threads wake up and one becomes the new holder. |
 | **Two nodes write the same key concurrently** | Last write wins at L2 (Redis single-master serializes). Both nodes' L1 entries are invalidated by each other's pub/sub messages. Both nodes lazy-load on next read and see the winning write. No corruption; eventual consistency. |
+| **Cluster shard failover** | Brief unavailability for keys hashing to the failing shard (typically 5-30s while the replica is promoted). Redisson auto-reconnects to the new primary. Single-flight lock holders on the affected shard may lose their lock during failover; acceptable for a cache (single-flight is throughput protection, not correctness). Cache values on other shards continue serving normally. |
+| **Cluster slot migration during reshard** | Operations on migrating keys may receive `ASK` or `MOVED` redirects from Redis. Redisson handles these transparently — the operation completes against the new owner shard. No application-visible failure during reshard. |
+| **Sentinel primary failover** | Brief pause (typically 5-30s) while Sentinels detect failure and elect a new primary. During the pause, L2 reads fail and the circuit breaker may open. Reads degrade to L1 until Redis is reachable again. Recovery is automatic once the new primary is elected and Redisson reconnects. |
+| **Sentinel quorum loss** | If fewer than the configured quorum of Sentinels are reachable, no failover can occur. The current primary remains writable; the cache continues operating normally. If the primary then fails while quorum is lost, manual operator intervention is required. The library cannot detect this state directly — monitor Sentinel quorum health separately via your Redis monitoring. |
+| **Cluster/Sentinel read routing** | Reads are routed to masters by default to preserve read-your-writes coherence with the invalidation pipeline. Applications can override via custom `RedissonClient` bean if eventual-consistency reads are acceptable in exchange for higher read throughput. |
 | **Network partition between nodes** | Each side of the partition serves from L1 within TTL bounds. After partition heals, normal pub/sub propagation resumes. Stale entries written before the partition expire via TTL. This is a correctness-vs-availability tradeoff: the library favors availability. |
 
 ---
@@ -202,6 +207,62 @@ public class ProductService {
 ```
 
 That's the full integration. The `CacheResolver` is wired automatically as the default resolver; no extra annotations needed on services.
+
+---
+
+## Deployment topologies
+
+The library connects to Redis through Redisson and supports three topologies. Select the topology with `cache.server.mode`. If `mode` is not set, `SINGLE` is used — the existing schema continues to work without modification.
+
+Validation runs at application startup. A misconfigured deployment (e.g., `CLUSTER` without `addresses`) fails fast with a mode-aware `IllegalArgumentException`, not at first cache operation.
+
+### Single server (default)
+
+A standalone Redis instance. Appropriate for development and single-instance production deployments.
+
+```yaml
+cache:
+  server:
+    mode: SINGLE                           # optional; this is the default
+    address: redis://redis.internal:6379
+    password: ${REDIS_PASSWORD:}
+```
+
+### Redis Cluster
+
+A horizontally sharded deployment. Use when the working set exceeds a single primary's memory or when you need horizontal write scalability. Redisson handles `MOVED`/`ASK` redirects and shard failover transparently.
+
+```yaml
+cache:
+  server:
+    mode: CLUSTER
+    addresses:
+      - redis://redis-1.internal:6379
+      - redis://redis-2.internal:6379
+      - redis://redis-3.internal:6379
+    password: ${REDIS_PASSWORD:}
+    scan-interval: 2000                    # optional, milliseconds; default 2000
+```
+
+`addresses` should list at least one master per shard; Redisson discovers replicas via `CLUSTER NODES`. The `scan-interval` controls how often Redisson refreshes its slot map to detect topology changes.
+
+### Sentinel
+
+A high-availability deployment with a primary, one or more replicas, and a Sentinel quorum that monitors and elects a new primary on failure. Use when you need automatic failover but don't need horizontal sharding.
+
+```yaml
+cache:
+  server:
+    mode: SENTINEL
+    master-name: mymaster
+    addresses:
+      - redis://sentinel-1.internal:26379
+      - redis://sentinel-2.internal:26379
+      - redis://sentinel-3.internal:26379
+    password: ${REDIS_PASSWORD:}
+```
+
+`addresses` lists Sentinel addresses (not Redis data nodes). The `master-name` must match the `sentinel monitor` configuration on the Sentinels.
 
 ---
 
@@ -293,8 +354,12 @@ Notable log lines and their operational meaning:
 
 | Property | Default | Purpose |
 |---|---|---|
-| `cache.server.address` | (required) | Redis address, e.g., `redis://localhost:6379`. |
-| `cache.server.password` | empty | Redis password. |
+| `cache.server.mode` | `SINGLE` | Connection topology: `SINGLE`, `CLUSTER`, or `SENTINEL`. Determines which other `cache.server.*` fields are required. |
+| `cache.server.address` | (required for `SINGLE`) | Single-server address, e.g., `redis://localhost:6379`. Used only when `mode=SINGLE`. |
+| `cache.server.addresses` | (required for `CLUSTER` and `SENTINEL`) | List of node addresses. For `CLUSTER`, list master node addresses (Redisson discovers replicas). For `SENTINEL`, list Sentinel addresses (not data nodes). |
+| `cache.server.master-name` | (required for `SENTINEL`) | Sentinel `master-name` matching the `sentinel monitor` configuration. Used only when `mode=SENTINEL`. |
+| `cache.server.scan-interval` | `2000` | Milliseconds between Redisson cluster slot-map refreshes. Used only when `mode=CLUSTER`. |
+| `cache.server.password` | empty | Redis password. Applies to all modes. |
 | `cache.node-id` | random UUID | Identifies this JVM in invalidation messages. Set explicitly to correlate with logs. |
 | `cache.allowed-packages` | empty (permissive) | Package prefixes allowed for polymorphic deserialization. Set for production. |
 | `cache.default-spec.tier` | `NEAR_CACHE` | Default tier for caches not explicitly configured. |
@@ -368,6 +433,8 @@ public RedissonClient redissonClient(CacheProperties properties) {
   return Redisson.create(config);
 }
 ```
+
+The same custom bean is the right place to opt into replica reads if you want them. The library defaults to `ReadMode.MASTER` on cluster and sentinel topologies (see Failure behavior, "Cluster/Sentinel read routing"); override by calling `.setReadMode(ReadMode.SLAVE)` on the `useClusterServers()` or `useSentinelServers()` builder. You give up read-your-writes coherence for higher read throughput and load distribution across replicas — appropriate for caches whose values tolerate brief replication lag (seconds at most under normal conditions, longer during replica catch-up after a network event).
 
 ### Custom circuit breaker thresholds
 

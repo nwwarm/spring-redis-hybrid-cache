@@ -21,7 +21,7 @@ import java.util.concurrent.ConcurrentMap;
  * need to repeat those checks. The dispatcher is also the single source of
  * truth for {@code nodeId} — caches read it from here when publishing.
  */
-class InvalidationDispatcher implements MessageListener<InvalidationMessage> {
+public class InvalidationDispatcher implements MessageListener<InvalidationMessage> {
 
     private static final Logger log = LoggerFactory.getLogger(InvalidationDispatcher.class);
     private static final String INVALIDATION_TOPIC = "cache:invalidate";

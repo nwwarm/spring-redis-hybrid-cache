@@ -1,0 +1,102 @@
+# One master + one replica + three sentinels, all using host networking so the
+# sentinels' announce-ip (127.0.0.1) is reachable from both peers and the JVM
+# running the test on the host.
+#
+# Service names avoid trailing -<digit> (e.g. `sentinel1` instead of
+# `sentinel-1`) because Testcontainers' ComposeDelegate.getServiceInstanceName
+# otherwise misreads the dash-suffix as the compose instance index.
+#
+# Linux-only. Ports 6380/6381 (data) and 26379-26381 (sentinels) must be free.
+
+services:
+  redismaster:
+    image: redis:7-alpine
+    network_mode: host
+    command:
+      - redis-server
+      - --port
+      - "6380"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+
+  redisreplica:
+    image: redis:7-alpine
+    network_mode: host
+    depends_on:
+      - redismaster
+    command:
+      - redis-server
+      - --port
+      - "6381"
+      - --replicaof
+      - "127.0.0.1"
+      - "6380"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+
+  sentinel1:
+    image: redis:7-alpine
+    network_mode: host
+    depends_on:
+      - redismaster
+    entrypoint:
+      - sh
+      - -c
+      - |
+        cat > /tmp/sentinel.conf <<EOF
+        port 26379
+        sentinel monitor mymaster 127.0.0.1 6380 2
+        sentinel down-after-milliseconds mymaster 5000
+        sentinel failover-timeout mymaster 10000
+        sentinel parallel-syncs mymaster 1
+        sentinel resolve-hostnames yes
+        sentinel announce-ip 127.0.0.1
+        sentinel announce-port 26379
+        EOF
+        exec redis-sentinel /tmp/sentinel.conf
+
+  sentinel2:
+    image: redis:7-alpine
+    network_mode: host
+    depends_on:
+      - redismaster
+    entrypoint:
+      - sh
+      - -c
+      - |
+        cat > /tmp/sentinel.conf <<EOF
+        port 26380
+        sentinel monitor mymaster 127.0.0.1 6380 2
+        sentinel down-after-milliseconds mymaster 5000
+        sentinel failover-timeout mymaster 10000
+        sentinel parallel-syncs mymaster 1
+        sentinel resolve-hostnames yes
+        sentinel announce-ip 127.0.0.1
+        sentinel announce-port 26380
+        EOF
+        exec redis-sentinel /tmp/sentinel.conf
+
+  sentinel3:
+    image: redis:7-alpine
+    network_mode: host
+    depends_on:
+      - redismaster
+    entrypoint:
+      - sh
+      - -c
+      - |
+        cat > /tmp/sentinel.conf <<EOF
+        port 26381
+        sentinel monitor mymaster 127.0.0.1 6380 2
+        sentinel down-after-milliseconds mymaster 5000
+        sentinel failover-timeout mymaster 10000
+        sentinel parallel-syncs mymaster 1
+        sentinel resolve-hostnames yes
+        sentinel announce-ip 127.0.0.1
+        sentinel announce-port 26381
+        EOF
+        exec redis-sentinel /tmp/sentinel.conf
