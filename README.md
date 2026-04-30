@@ -461,11 +461,14 @@ The library is a thin set of `org.springframework.cache.Cache` implementations d
 
 Spring's `@Cacheable` already handles SpEL keys, conditions, `unless`, sync, multi-cache resolution, and reactive return types. Implementing the `Cache` interface inherits all of that behavior; introducing a custom annotation would mean reimplementing it. The library's value is in the cache implementation, not the orchestration layer.
 
-### Why Redisson (and not Spring Data Redis directly)
+### Why Redisson (and not Spring Data Redis directly)?
+Spring Boot uses Lettuce by default, but this library intentionally relies on Redisson for four critical architectural reasons:
 
-Redisson provides distributed primitives — `RLock` with watchdog auto-renewal, `RAtomicLong`, `RTopic`, `RBucket` — that would otherwise need to be implemented from scratch on top of Lettuce. The `RLock` watchdog in particular is non-trivial: it auto-extends the lock lease while the holder is alive, so a slow loader doesn't have its lock expire under it. A hand-rolled `SET NX PX` lock loses this property and forces longer leases that hurt throughput on contention.
+1. **Safe Distributed Locking (Watchdog):** We rely on Redisson's `RLock`, which includes a background watchdog that automatically extends lock leases while the owning thread is alive. This prevents locks from expiring prematurely during unusually slow database loads. Replicating this with Lettuce requires risky, hardcoded worst-case timeouts and custom Lua scripts.
+2. **Zero-Latency Lock Wake-ups:** During high contention (cache stampedes), Redisson uses Redis Pub/Sub to instantly wake up waiting threads the moment a lock is released. A hand-rolled Lettuce lock forces you to use polling intervals (e.g., checking every 50ms), adding unnecessary latency to cache misses.
+3. **Seamless Cluster Support:** Redisson's high-level objects transparently handle Redis Cluster complexities, such as `MOVED` and `ASK` redirects. Building custom distributed locks and counters on top of raw Lettuce commands would require writing and maintaining that cluster-handling logic ourselves.
+4. **Reliable High-Level Primitives:** Direct access to components like `RBucket`, `RAtomicLong` (for O(1) generation clearing), and `RTopic` keeps the library's codebase clean, focused, and free of the boilerplate required to map raw Redis commands to complex distributed patterns.
 
-This library accepts the additional Redisson dependency in exchange for these primitives. For applications where dependency footprint is critical, Spring Data Redis variants are possible but require reimplementing the lock semantics.
 
 ### Package layout
 
