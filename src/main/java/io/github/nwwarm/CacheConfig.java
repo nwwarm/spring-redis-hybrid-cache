@@ -21,7 +21,6 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.EnableCaching;
-import org.springframework.cache.interceptor.CacheResolver;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -30,8 +29,9 @@ import java.util.UUID;
 import java.util.concurrent.TimeoutException;
 
 /**
- * Primary Spring configuration. Wires Redisson, the per-name Caffeine manager,
- * the circuit breaker, and the tier-aware {@link CacheResolver}.
+ * Primary Spring configuration. Wires Redisson, the tier-aware
+ * {@link HybridCacheManager}, the circuit breaker, and the invalidation
+ * dispatcher.
  *
  * <p>All beans are exposed as {@link ConditionalOnMissingBean} so applications
  * can override any single piece (e.g., supply a custom {@link RedissonClient}
@@ -141,12 +141,6 @@ public class CacheConfig {
     }
 
     @Bean
-    @ConditionalOnMissingBean(CacheManager.class)
-    public CacheManager cacheManager(CacheProperties properties) {
-        return new PerNameCaffeineCacheManager(properties);
-    }
-
-    @Bean
     @ConditionalOnMissingBean(name = "redisCacheCircuitBreakerRegistry")
     public CircuitBreakerRegistry redisCacheCircuitBreakerRegistry() {
         CircuitBreakerConfig config = CircuitBreakerConfig.custom()
@@ -194,15 +188,13 @@ public class CacheConfig {
     }
 
     @Bean
-    @ConditionalOnMissingBean
-    public CacheResolver cacheResolver(CacheManager cacheManager,
-                                       CacheProperties properties,
-                                       RedissonClient redisson,
-                                       CircuitBreaker redisCacheCircuitBreaker,
-                                       InvalidationDispatcher invalidationDispatcher,
-                                       MeterRegistry meterRegistry) {
-        return new LocalCacheResolver(
-                cacheManager,
+    @ConditionalOnMissingBean(CacheManager.class)
+    public HybridCacheManager cacheManager(CacheProperties properties,
+                                           RedissonClient redisson,
+                                           CircuitBreaker redisCacheCircuitBreaker,
+                                           InvalidationDispatcher invalidationDispatcher,
+                                           MeterRegistry meterRegistry) {
+        return new HybridCacheManager(
                 properties,
                 redisson,
                 redisCacheCircuitBreaker,
