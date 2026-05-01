@@ -82,6 +82,7 @@ public class NearCache implements Cache {
 
     public NearCache(Cache caffeineCache,
                      CacheProperties.CacheSpec spec,
+                     Codec bucketCodec,
                      RedissonClient redisson,
                      CircuitBreaker breaker,
                      InvalidationDispatcher dispatcher,
@@ -92,7 +93,7 @@ public class NearCache implements Cache {
         this.redisson = redisson;
         this.breaker = breaker;
         this.dispatcher = dispatcher;
-        this.bucketCodec = CodecResolver.resolve(spec.codec());
+        this.bucketCodec = bucketCodec;
 
         this.distributedGeneration = redisson.getAtomicLong(cacheName + ":generation");
         initializeGeneration();
@@ -141,14 +142,15 @@ public class NearCache implements Cache {
 
     @Override
     public ValueWrapper get(@Nonnull Object key) {
-        ValueWrapper wrapper = caffeineCache.get(key);
+        String stringKey = CacheKeys.stringify(cacheName, key);
+        ValueWrapper wrapper = caffeineCache.get(stringKey);
         if (wrapper != null) return wrapper;
 
-        Object distValue = readFromL2(key);
+        Object distValue = readFromL2(stringKey);
         if (distValue == null) return null;
 
-        caffeineCache.put(key, distValue);
-        return caffeineCache.get(key);  // delegate so CaffeineCache wraps NullValue correctly
+        caffeineCache.put(stringKey, distValue);
+        return caffeineCache.get(stringKey);  // delegate so CaffeineCache wraps NullValue correctly
     }
 
     @Override
@@ -190,21 +192,30 @@ public class NearCache implements Cache {
     @Override
     @SuppressWarnings("unchecked")
     public <T> T get(@Nonnull Object key, @Nonnull Callable<T> valueLoader) {
+        String stringKey = CacheKeys.stringify(cacheName, key);
+
         // Fast path: already cached in L1 or L2.
-        ValueWrapper wrapper = get(key);
+        ValueWrapper wrapper = caffeineCache.get(stringKey);
+        if (wrapper == null) {
+            Object distValue = readFromL2(stringKey);
+            if (distValue != null) {
+                caffeineCache.put(stringKey, distValue);
+                wrapper = caffeineCache.get(stringKey);
+            }
+        }
         if (wrapper != null) return (T) wrapper.get();
 
         com.github.benmanes.caffeine.cache.Cache<Object, Object> nativeCaffeine =
                 (com.github.benmanes.caffeine.cache.Cache<Object, Object>) caffeineCache.getNativeCache();
 
         try {
-            Object stored = nativeCaffeine.get(key, k -> {
+            Object stored = nativeCaffeine.get(stringKey, k -> {
                 // Caffeine guarantees only one thread per JVM enters this lambda for key k.
                 // We may have lost a race with another node since the outer get() — re-check L2.
-                Object distValue = readFromL2(k);
+                Object distValue = readFromL2((String) k);
                 if (distValue != null) return distValue;
 
-                Object loaded = loadWithDistributedLock(k, valueLoader);
+                Object loaded = loadWithDistributedLock((String) k, valueLoader);
                 // Translate null to NullValue so Caffeine actually caches negative results.
                 return loaded == null ? NullValue.INSTANCE : loaded;
             });
@@ -222,7 +233,7 @@ public class NearCache implements Cache {
      * we proceed with the load anyway. The local Caffeine compute lock provides
      * the baseline protection.
      */
-    private Object loadWithDistributedLock(Object key, Callable<?> valueLoader) {
+    private Object loadWithDistributedLock(String key, Callable<?> valueLoader) {
         RLock lock = null;
         boolean acquired = false;
         try {
@@ -273,20 +284,28 @@ public class NearCache implements Cache {
 
     @Override
     public void put(@Nonnull Object key, Object value) {
+        String stringKey = CacheKeys.stringify(cacheName, key);
         // Order on writes: local first (so this node sees its own write immediately),
         // then remote, then publish so other nodes invalidate and lazy-load.
-        caffeineCache.put(key, value);
-        writeToL2(key, value);
-        publishInvalidation(InvalidationMessage.OP_INVALIDATE, key);
+        caffeineCache.put(stringKey, value);
+        writeToL2(stringKey, value);
+        publishInvalidation(InvalidationMessage.OP_INVALIDATE, stringKey);
     }
 
     @Override
     public void evict(@Nonnull Object key) {
-        // Order on evicts: local first so a concurrent read on this node cannot
-        // repopulate from a Redis entry that's about to be removed.
-        caffeineCache.evict(key);
-        deleteFromL2(key);
-        publishInvalidation(InvalidationMessage.OP_INVALIDATE, key);
+        String stringKey = CacheKeys.stringify(cacheName, key);
+        // Order: L2 first. If L2 delete fails (breaker open or transient
+        // exception), do NOT publish — a publish would tell remote nodes to
+        // invalidate when their stale L1 is in fact still consistent with the
+        // L2 value that's still present. Always evict the local L1 so this
+        // node's L1 ends in a strict-or-equal state vs L2 (cross-node
+        // coherence is bounded by TTL when the L2 evict failed).
+        boolean l2Deleted = deleteFromL2(stringKey);
+        if (l2Deleted) {
+            publishInvalidation(InvalidationMessage.OP_INVALIDATE, stringKey);
+        }
+        caffeineCache.evict(stringKey);
     }
 
     @Override
@@ -298,14 +317,14 @@ public class NearCache implements Cache {
 
     // ---------- L2 ops, breaker-wrapped ----------
 
-    private RBucket<Object> bucket(Object key) {
+    private RBucket<Object> bucket(String key) {
         String fullKey = cacheName + ":" + currentGeneration() + ":" + key;
         return bucketCodec == null
                 ? redisson.getBucket(fullKey)
                 : redisson.getBucket(fullKey, bucketCodec);
     }
 
-    private Object readFromL2(Object key) {
+    private Object readFromL2(String key) {
         try {
             return breaker.executeSupplier(() -> {
                 Timer.Sample sample = Timer.start();
@@ -331,7 +350,7 @@ public class NearCache implements Cache {
         }
     }
 
-    private void writeToL2(Object key, Object value) {
+    private void writeToL2(String key, Object value) {
         try {
             breaker.executeRunnable(() -> bucket(key).set(value, spec.ttl()));
         } catch (CallNotPermittedException e) {
@@ -344,14 +363,26 @@ public class NearCache implements Cache {
         }
     }
 
-    private void deleteFromL2(Object key) {
+    /**
+     * Deletes the L2 entry. Returns whether the delete completed successfully —
+     * callers (notably {@link #evict(Object)}) use this to decide whether to
+     * publish an invalidation. A failed L2 delete must not publish: telling
+     * remote nodes to invalidate would defeat the cross-node coherence
+     * guarantee, since their L1 would drop to L2 and find the value still
+     * present.
+     */
+    private boolean deleteFromL2(String key) {
         try {
             breaker.executeRunnable(() -> bucket(key).delete());
+            return true;
         } catch (CallNotPermittedException e) {
             l2BreakerOpen.increment();
+            log.warn("L2 evict failed for key '{}' (breaker open); cross-node coherence not guaranteed until TTL", key);
+            return false;
         } catch (Exception e) {
             l2Failures.increment();
-            log.warn("L2 evict failed for key '{}'", key, e);
+            log.warn("L2 evict failed for key '{}'; cross-node coherence not guaranteed until TTL", key, e);
+            return false;
         }
     }
 
@@ -383,7 +414,7 @@ public class NearCache implements Cache {
 
     // ---------- Pub/sub ----------
 
-    private void publishInvalidation(String op, Object key) {
+    private void publishInvalidation(String op, String key) {
         try {
             breaker.executeRunnable(() ->
                     dispatcher.publish(new InvalidationMessage(dispatcher.getNodeId(), cacheName, op, key)));
@@ -393,7 +424,7 @@ public class NearCache implements Cache {
     }
 
     /** Invoked by {@link InvalidationDispatcher} after self-skip and name routing. */
-    void handleInvalidation(String op, Object key) {
+    void handleInvalidation(String op, String key) {
         switch (op) {
             case InvalidationMessage.OP_INVALIDATE -> caffeineCache.evict(key);
             case InvalidationMessage.OP_CLEAR -> {

@@ -13,10 +13,13 @@ import org.redisson.Redisson;
 import org.redisson.api.RedissonClient;
 import org.redisson.client.RedisException;
 import org.redisson.codec.JsonJacksonCodec;
+import org.redisson.codec.Kryo5Codec;
 import org.redisson.config.Config;
 import org.redisson.config.ReadMode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.actuate.health.HealthIndicator;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.cache.CacheManager;
@@ -25,6 +28,8 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 import java.time.Duration;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeoutException;
 
@@ -105,39 +110,76 @@ public class CacheConfig {
     /**
      * Builds the polymorphic type validator used by the default codec.
      *
-     * <p>If {@code cache.allowed-packages} is configured, only base types whose
-     * fully-qualified name starts with one of those prefixes can be deserialized.
-     * This is the recommended production configuration — narrow to the application's
-     * domain and DTO packages plus {@code java.util} / {@code java.time} for
-     * collections and dates.
+     * <p>Fails fast at startup if {@code cache.allowed-packages} is empty.
+     * Jackson's default-typing-with-permissive-validator pattern has been
+     * the foundation of 50+ deserialization CVEs (see CVE-2017-7525); a
+     * library that ships with this configuration as a default would invite
+     * RCE in any deployment that forgot to set the property.
      *
-     * <p>If unset, falls back to a permissive validator that accepts any
-     * {@link Object}-derived type. A startup warning is logged. The permissive
-     * default exists for backwards compatibility and ease of first use; production
-     * deployments should always set {@code cache.allowed-packages} explicitly to
-     * limit the deserialization attack surface.
+     * <p>Each entry must end with {@code '.'} (package prefix) or be a
+     * fully-qualified class name. {@code com.example} alone is rejected:
+     * Jackson's {@code allowIfBaseType} matches via {@code startsWith}, so
+     * {@code com.example} would also accept {@code com.examplerogue.evil}.
+     * The trailing dot enforces the package boundary.
+     *
+     * <p>{@code java.util.}, {@code java.time.}, and {@code java.lang.} are
+     * always added regardless of user configuration; collections, dates,
+     * and primitive wrappers are part of every realistic value graph.
      */
     private static BasicPolymorphicTypeValidator buildPolymorphicTypeValidator(CacheProperties properties) {
-        BasicPolymorphicTypeValidator.Builder builder = BasicPolymorphicTypeValidator.builder();
-
         if (properties.allowedPackages() == null || properties.allowedPackages().isEmpty()) {
-            log.warn("cache.allowed-packages is not configured. Using permissive polymorphic type validator " +
-                    "(allows any Object-derived type for deserialization). Configure cache.allowed-packages " +
-                    "to narrow the deserialization attack surface for production deployments.");
-            return builder.allowIfBaseType(Object.class).build();
+            throw new IllegalStateException(
+                    "cache.allowed-packages is not configured. The library will not start with "
+                            + "a permissive Jackson polymorphic type validator: that pattern has "
+                            + "been the basis of 50+ Jackson deserialization CVEs (canonical "
+                            + "example: CVE-2017-7525) and is unsafe to deploy. Choose one:\n"
+                            + "  (a) Set cache.allowed-packages to a list of your domain package "
+                            + "prefixes — each entry must end with '.' (e.g., 'com.example.domain.').\n"
+                            + "  (b) Switch to KRYO codec (cache.default-spec.codec=KRYO and "
+                            + "cache.kryo.registered-classes=[...]).\n"
+                            + "  (c) Provide a custom RedissonClient bean with a different codec.");
         }
 
-        for (String prefix : properties.allowedPackages()) {
-            builder.allowIfBaseType(prefix);
+        BasicPolymorphicTypeValidator.Builder builder = BasicPolymorphicTypeValidator.builder();
+        for (String entry : properties.allowedPackages()) {
+            validateAllowedPackagesEntry(entry);
+            builder.allowIfBaseType(entry);
         }
-        // Always allow JDK collection and date types — values typically contain these
-        // even when the top-level type is in user packages.
+        // Always allow JDK collection, date, and primitive-wrapper types — values
+        // typically contain these even when the top-level type is in user packages.
         builder.allowIfBaseType("java.util.")
                .allowIfBaseType("java.time.")
                .allowIfBaseType("java.lang.");
         log.info("Polymorphic type validator restricted to packages: {} (plus java.util., java.time., java.lang.)",
                 properties.allowedPackages());
         return builder.build();
+    }
+
+    /**
+     * An entry is valid if it ends with {@code '.'} (package prefix) or its
+     * last dotted segment looks like a class name (starts with an uppercase
+     * letter). Anything else — typically a bare package without a trailing
+     * dot — is rejected with the boundary-collision footgun spelled out.
+     */
+    private static void validateAllowedPackagesEntry(String entry) {
+        if (entry == null || entry.isBlank()) {
+            throw new IllegalArgumentException(
+                    "cache.allowed-packages contains a blank entry");
+        }
+        if (entry.endsWith(".")) return;
+
+        int lastDot = entry.lastIndexOf('.');
+        String lastSegment = lastDot < 0 ? entry : entry.substring(lastDot + 1);
+        if (!lastSegment.isEmpty() && Character.isUpperCase(lastSegment.charAt(0))) {
+            // Looks like a fully-qualified class name (e.g., com.example.User).
+            return;
+        }
+
+        throw new IllegalArgumentException(
+                "cache.allowed-packages entry '" + entry + "' is invalid. Jackson matches via "
+                        + "startsWith(), so '" + entry + "' would also accept '" + entry
+                        + "rogue' or '" + entry + "evil'. Use '" + entry + ".' to enforce a "
+                        + "package boundary, or supply a fully-qualified class name.");
     }
 
     @Bean
@@ -187,18 +229,106 @@ public class CacheConfig {
         return new InvalidationDispatcher(redisson, nodeId);
     }
 
+    /**
+     * Resolves per-cache codec overrides. KRYO is locked down — class
+     * registration is mandatory because Kryo with no registration accepts
+     * arbitrary class names from the payload, the same threat model as
+     * Jackson's permissive default typing.
+     *
+     * <p>If any cache (default-spec or per-name) is configured to use KRYO,
+     * {@link CacheProperties.Kryo#registeredClasses()} must be non-empty.
+     * Each class name is loaded via {@code Class.forName} at startup — a
+     * missing class fails the context with the offending name. The
+     * resulting {@link Kryo5Codec} runs with {@code registrationRequired=true}
+     * (set by Redisson when classes are passed to its constructor); a
+     * payload referencing an unregistered class will fail to deserialize.
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    CodecResolver codecResolver(CacheProperties properties) {
+        if (!anyCacheUsesKryo(properties)) {
+            return new CodecResolver(null);
+        }
+
+        List<String> registered = properties.kryo() == null
+                ? List.of()
+                : properties.kryo().registeredClasses();
+        if (registered == null || registered.isEmpty()) {
+            throw new IllegalStateException(
+                    "Cache configured with codec=KRYO but cache.kryo.registered-classes is empty. "
+                            + "Kryo without registration accepts arbitrary class names from the "
+                            + "payload — same threat model as Jackson's permissive default "
+                            + "typing. Declare every class the cache will store, in a stable "
+                            + "order (changing the order changes Kryo registration ids and "
+                            + "breaks deserialization of payloads written by older deployments).");
+        }
+        // Pre-load each class so a typo or stale entry fails the context here,
+        // not on the first cache miss in production.
+        ClassLoader cl = Thread.currentThread().getContextClassLoader();
+        if (cl == null) cl = CacheConfig.class.getClassLoader();
+        for (String className : registered) {
+            try {
+                Class.forName(className, false, cl);
+            } catch (ClassNotFoundException e) {
+                throw new IllegalStateException(
+                        "cache.kryo.registered-classes entry '" + className + "' could not be "
+                                + "loaded by the application classloader: " + e.getMessage(), e);
+            }
+        }
+        // LinkedHashSet preserves the configured order so Kryo registration ids
+        // are stable across deployments — changing the order of an existing
+        // entry would break deserialization of payloads written by older nodes.
+        // The boolean is Redisson's `useReferences` (circular-graph support);
+        // we keep it false because cache values are domain DTOs, not graphs.
+        return new CodecResolver(new Kryo5Codec(cl, new LinkedHashSet<>(registered), false));
+    }
+
+    private static boolean anyCacheUsesKryo(CacheProperties properties) {
+        if (properties.defaultSpec() != null
+                && properties.defaultSpec().codec() == CacheProperties.Codec.KRYO) {
+            return true;
+        }
+        if (properties.caches() == null) return false;
+        for (CacheProperties.CacheSpec spec : properties.caches().values()) {
+            if (spec != null && spec.codec() == CacheProperties.Codec.KRYO) return true;
+        }
+        return false;
+    }
+
     @Bean
     @ConditionalOnMissingBean(CacheManager.class)
     public HybridCacheManager cacheManager(CacheProperties properties,
                                            RedissonClient redisson,
                                            CircuitBreaker redisCacheCircuitBreaker,
                                            InvalidationDispatcher invalidationDispatcher,
-                                           MeterRegistry meterRegistry) {
+                                           MeterRegistry meterRegistry,
+                                           CodecResolver codecResolver) {
         return new HybridCacheManager(
                 properties,
                 redisson,
                 redisCacheCircuitBreaker,
                 invalidationDispatcher,
-                meterRegistry);
+                meterRegistry,
+                codecResolver);
+    }
+
+    /**
+     * Spring Boot Actuator integration. Only registered when
+     * {@link HealthIndicator} is on the classpath, so applications that
+     * exclude {@code spring-boot-starter-actuator} aren't forced to add it.
+     */
+    @Bean
+    @ConditionalOnClass(HealthIndicator.class)
+    @ConditionalOnMissingBean(name = "hybridCacheHealthIndicator")
+    public HybridCacheHealthIndicator hybridCacheHealthIndicator(
+            RedissonClient redisson,
+            CircuitBreaker redisCacheCircuitBreaker,
+            HybridCacheManager cacheManager,
+            CacheProperties properties) {
+        return new HybridCacheHealthIndicator(
+                redisson,
+                redisCacheCircuitBreaker,
+                cacheManager,
+                properties.health().pingTimeout());
     }
 }

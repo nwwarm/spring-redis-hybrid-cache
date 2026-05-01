@@ -45,7 +45,8 @@ class SingleServerCacheIT extends RedisTestBase {
                 null,
                 null);
         CacheProperties props = new CacheProperties(
-                server, null, null, "single-it", List.of("io.github.nwwarm"));
+                server, null, null, "single-it",
+                List.of("io.github.nwwarm."), null, null);
         return new CacheConfig().redissonClient(props);
     }
 
@@ -129,7 +130,8 @@ class SingleServerCacheIT extends RedisTestBase {
         assertThat(server.mode()).isEqualTo(CacheProperties.Mode.SINGLE);
         // And the production wiring works against this constructor shape.
         CacheProperties props = new CacheProperties(
-                server, null, null, "compat-it", List.of("io.github.nwwarm"));
+                server, null, null, "compat-it",
+                List.of("io.github.nwwarm."), null, null);
         RedissonClient client = new CacheConfig().redissonClient(props);
         try {
             client.getBucket("compat-it:ping").set("ok");

@@ -82,6 +82,7 @@ public class DistributedOnlyCache implements Cache {
 
     public DistributedOnlyCache(String cacheName,
                                 CacheProperties.CacheSpec spec,
+                                Codec bucketCodec,
                                 RedissonClient redisson,
                                 CircuitBreaker breaker,
                                 MeterRegistry meterRegistry) {
@@ -89,7 +90,7 @@ public class DistributedOnlyCache implements Cache {
         this.spec = spec;
         this.redisson = redisson;
         this.breaker = breaker;
-        this.bucketCodec = CodecResolver.resolve(spec.codec());
+        this.bucketCodec = bucketCodec;
         this.distributedGeneration = redisson.getAtomicLong(cacheName + ":generation");
 
         try {
@@ -125,14 +126,16 @@ public class DistributedOnlyCache implements Cache {
 
     @Override
     public ValueWrapper get(@Nonnull Object key) {
-        Object value = readFromRedis(key);
+        String stringKey = CacheKeys.stringify(cacheName, key);
+        Object value = readFromRedis(stringKey);
         return value == null ? null : new SimpleValueWrapper(value);
     }
 
     @Override
     @SuppressWarnings("unchecked")
     public <T> T get(@Nonnull Object key, Class<T> type) {
-        Object value = readFromRedis(key);
+        String stringKey = CacheKeys.stringify(cacheName, key);
+        Object value = readFromRedis(stringKey);
         if (value != null && type != null && !type.isInstance(value)) {
             throw new IllegalStateException(
                     "Cached value [" + value + "] is not of required type [" + type.getName() + "]");
@@ -155,12 +158,14 @@ public class DistributedOnlyCache implements Cache {
     @Override
     @SuppressWarnings("unchecked")
     public <T> T get(@Nonnull Object key, @Nonnull Callable<T> valueLoader) {
+        String stringKey = CacheKeys.stringify(cacheName, key);
+
         // Fast path: already in Redis.
-        Object existing = readFromRedis(key);
+        Object existing = readFromRedis(stringKey);
         if (existing != null) return (T) existing;
 
         CompletableFuture<Object> mine = new CompletableFuture<>();
-        CompletableFuture<Object> theirs = inflight.putIfAbsent(key, mine);
+        CompletableFuture<Object> theirs = inflight.putIfAbsent(stringKey, mine);
 
         if (theirs != null) {
             // Another thread on this JVM is already loading. Wait for its result.
@@ -179,7 +184,7 @@ public class DistributedOnlyCache implements Cache {
 
         // We're the first; do the load.
         try {
-            Object value = doLoadWithCrossNodeSingleFlight(key, valueLoader);
+            Object value = doLoadWithCrossNodeSingleFlight(stringKey, valueLoader);
             mine.complete(value);
             return (T) value;
         } catch (RuntimeException t) {
@@ -189,7 +194,7 @@ public class DistributedOnlyCache implements Cache {
             mine.completeExceptionally(t);
             throw new ValueRetrievalException(key, valueLoader, t);
         } finally {
-            inflight.remove(key, mine);
+            inflight.remove(stringKey, mine);
         }
     }
 
@@ -198,7 +203,7 @@ public class DistributedOnlyCache implements Cache {
      * loader-only if Redis is unreachable — local inflight map already handles
      * the per-JVM herd.
      */
-    private Object doLoadWithCrossNodeSingleFlight(Object key, Callable<?> valueLoader) {
+    private Object doLoadWithCrossNodeSingleFlight(String key, Callable<?> valueLoader) {
         RLock lock = null;
         boolean acquired = false;
         try {
@@ -223,7 +228,8 @@ public class DistributedOnlyCache implements Cache {
 
         try {
             Object value = valueLoader.call();
-            put(key, value);
+            // Bypass put()'s key validation: we already stringified above.
+            writeToRedis(key, value);
             return value;
         } catch (Throwable t) {
             throw new ValueRetrievalException(key, valueLoader, t);
@@ -240,6 +246,11 @@ public class DistributedOnlyCache implements Cache {
 
     @Override
     public void put(@Nonnull Object key, Object value) {
+        String stringKey = CacheKeys.stringify(cacheName, key);
+        writeToRedis(stringKey, value);
+    }
+
+    private void writeToRedis(String key, Object value) {
         try {
             breaker.executeRunnable(() -> bucket(key).set(value, spec.ttl()));
         } catch (CallNotPermittedException e) {
@@ -253,13 +264,14 @@ public class DistributedOnlyCache implements Cache {
 
     @Override
     public void evict(@Nonnull Object key) {
+        String stringKey = CacheKeys.stringify(cacheName, key);
         try {
-            breaker.executeRunnable(() -> bucket(key).delete());
+            breaker.executeRunnable(() -> bucket(stringKey).delete());
         } catch (CallNotPermittedException e) {
             breakerOpen.increment();
         } catch (Exception e) {
             failures.increment();
-            log.warn("Distributed evict failed for key '{}'", key, e);
+            log.warn("Distributed evict failed for key '{}'", stringKey, e);
         }
     }
 
@@ -275,7 +287,7 @@ public class DistributedOnlyCache implements Cache {
         }
     }
 
-    private Object readFromRedis(Object key) {
+    private Object readFromRedis(String key) {
         try {
             return breaker.executeSupplier(() -> {
                 Timer.Sample sample = Timer.start();
@@ -301,7 +313,7 @@ public class DistributedOnlyCache implements Cache {
         }
     }
 
-    private RBucket<Object> bucket(Object key) {
+    private RBucket<Object> bucket(String key) {
         String fullKey = cacheName + ":" + currentGeneration() + ":" + key;
         return bucketCodec == null
                 ? redisson.getBucket(fullKey)

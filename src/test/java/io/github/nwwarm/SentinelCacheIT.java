@@ -113,7 +113,7 @@ class SentinelCacheIT {
                 .registerModule(new JavaTimeModule())
                 .activateDefaultTyping(
                         BasicPolymorphicTypeValidator.builder()
-                                .allowIfBaseType("io.github.nwwarm")
+                                .allowIfBaseType("io.github.nwwarm.")
                                 .allowIfBaseType("java.util.")
                                 .allowIfBaseType("java.time.")
                                 .allowIfBaseType("java.lang.")
@@ -138,7 +138,8 @@ class SentinelCacheIT {
                 null,
                 null);
         CacheProperties props = new CacheProperties(
-                server, null, null, "sentinel-it", List.of("io.github.nwwarm"));
+                server, null, null, "sentinel-it",
+                List.of("io.github.nwwarm."), null, null);
         return new CacheConfig().redissonClient(props);
     }
 
@@ -157,7 +158,7 @@ class SentinelCacheIT {
         InvalidationDispatcher dispatcher = new InvalidationDispatcher(client, nodeId);
         CircuitBreaker breaker = CircuitBreakerRegistry.ofDefaults()
                 .circuitBreaker("sentinel-test-" + System.nanoTime());
-        return new NearCache(springCache, spec, client, breaker, dispatcher,
+        return new NearCache(springCache, spec, null, client, breaker, dispatcher,
                 new SimpleMeterRegistry());
     }
 

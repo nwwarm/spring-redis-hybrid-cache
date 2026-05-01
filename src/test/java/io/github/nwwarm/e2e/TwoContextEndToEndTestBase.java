@@ -66,7 +66,7 @@ public abstract class TwoContextEndToEndTestBase {
                 .properties(
                         "cache.server.address=redis://"
                                 + REDIS.getHost() + ":" + REDIS.getMappedPort(6379),
-                        "cache.allowed-packages=io.github.nwwarm",
+                        "cache.allowed-packages=io.github.nwwarm.",
                         "cache.node-id=" + nodeId,
                         // Avoid logging clobber when two contexts run in the same JVM.
                         "spring.main.register-shutdown-hook=false")

@@ -38,7 +38,7 @@ public abstract class EndToEndTestBase {
                 () -> "redis://" + REDIS.getHost() + ":" + REDIS.getMappedPort(6379));
         // Restrict the JSON codec's polymorphic type validator to the test package
         // so the Product record can round-trip through L2.
-        registry.add("cache.allowed-packages", () -> "io.github.nwwarm");
+        registry.add("cache.allowed-packages", () -> "io.github.nwwarm.");
     }
 
     @Autowired

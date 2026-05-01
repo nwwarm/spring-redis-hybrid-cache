@@ -87,10 +87,10 @@ This library is the wrong choice when:
    populate L2 → populate L1 → return
 ```
 
-### Write or evict
+### Write
 
 ```
-@CacheEvict / @CachePut / Cache.put method invoked
+@CachePut / Cache.put method invoked
         │
         ▼
    ┌─────────────┐
@@ -109,6 +109,33 @@ This library is the wrong choice when:
          ▼
    other nodes evict L1 → lazy-load from L2 on next read
 ```
+
+### Evict (NearCache)
+
+```
+@CacheEvict method invoked
+        │
+        ▼
+   ┌─────────────┐   success    ┌──────────────────┐
+   │ delete L2   ├─────────────►│ publish          │
+   └─────┬───────┘              │ invalidation     │
+         │ failure              │ message          │
+         │ (breaker open        └─────┬────────────┘
+         │  or exception)             ▼
+         │                       other nodes evict L1
+         ▼
+   ┌─────────────────────────┐
+   │ skip publish            │ ◄── if L2 still has the value, telling
+   │ log WARN                │     remote nodes to invalidate would let
+   │ increment l2Failures    │     them re-populate L1 from L2 with the
+   └─────┬───────────────────┘     stale value. Better to leave them
+         │                          serving from L1 until TTL.
+         ▼
+   evict local L1 (always)        ◄── this node's L1 ends in a
+                                      strict-or-equal state vs L2
+```
+
+The local L1 is evicted on both branches — this node's L1 cannot end up holding a value that's no longer in L2. Cross-node coherence is bounded by TTL when the L2 delete failed.
 
 ### Staleness boundaries
 
@@ -132,6 +159,7 @@ This is the section that distinguishes a production cache from a demo. Every sce
 | **Redis becomes slow** | Slow-call detection (default: >500ms threshold, 80% slow rate triggers open). Same behavior as unreachable: open breaker, L1-only. The application does not block on slow Redis calls. |
 | **Redis recovers** | Breaker enters half-open state after configured wait (default: 30s). A small number of probe calls (default: 3) test Redis health. On success, breaker closes and full L2 operation resumes. On failure, breaker re-opens. |
 | **Pub/sub message lost** | L1 entries on remote nodes serve stale values until L1 TTL expiration. Bounded by configured TTL per cache (default: 1 hour). For caches where this window is unacceptable, configure shorter TTLs. |
+| **L2 delete fails during evict** (`NearCache` only) | The `NearCache` evict path runs as `bucket.delete(key)` → publish invalidation → evict local L1. If the L2 delete fails (breaker open, connection error), the cross-node invalidation message is **not** published — publishing would tell remote nodes to drop a still-coherent L1 entry that would then re-populate from the still-present L2 value. The local L1 is always evicted; this node ends in a strict-or-equal state vs L2. Cross-node coherence is bounded by TTL until the next successful evict or write. The originating node logs `WARN  L2 evict failed for key '...'; cross-node coherence not guaranteed until TTL`. |
 | **Cache stampede on cold key** | Local single-flight via Caffeine: only one thread per JVM enters the loader. Cross-node single-flight via Redisson `RLock`: only one node loads when Redis is healthy. During Redis outage, cross-node coordination is suspended; worst case becomes N database loads across N nodes (still bounded, much better than N × threads-per-node). |
 | **Loader exception** | Exception propagates to the caller. No partial cache state is written. Subsequent calls retry the loader. |
 | **Lock holder crashes mid-load** | Redisson watchdog releases the lock automatically (default: 30s lease, renewed every 10s while holder is alive). Waiting threads wake up and one becomes the new holder. |
@@ -164,7 +192,8 @@ cache:
   server:
     address: redis://localhost:6379
   allowed-packages:
-    - com.example.domain      # security: narrow polymorphic deserialization
+    - com.example.domain.     # security: narrow polymorphic deserialization
+                              # entries MUST end with '.' (see Security)
   default-spec:
     tier: NEAR_CACHE
     ttl: 1h
@@ -181,6 +210,8 @@ cache:
       tier: LOCAL_ONLY        # per-node, no Redis
       ttl: 1m
 ```
+
+`cache.allowed-packages` is **required** — the application will not start without it. See the Security section for why and what alternatives exist.
 
 ### 3. Use `@Cacheable` as normal
 
@@ -328,11 +359,22 @@ histogram_quantile(0.99, rate(cache_l2_get_latency_seconds_bucket[5m])) > 0.1
 
 ### Health
 
-The library registers a Spring Boot Actuator `HealthIndicator`. `/actuator/health` reports:
+The library registers a Spring Boot Actuator `HealthIndicator` named `hybridCache` when Actuator is on the classpath. `/actuator/health` reports the operational state of the L2 path:
 
-- Redis connectivity status
-- Circuit breaker state
-- Per-cache Caffeine size and hit rate
+| Breaker state | Redis ping | Reported status |
+|---|---|---|
+| `CLOSED` | success | `UP` |
+| `CLOSED` | timeout/unreachable | `DOWN` |
+| `OPEN` / `FORCED_OPEN` | (any) | `OUT_OF_SERVICE` |
+| `HALF_OPEN` | (any) | `UNKNOWN` |
+
+Details include:
+
+- `breakerState`, `breakerFailureRate`, `breakerSlowCallRate`
+- `redisPing` (`ok`, `timeout after Nms`, or `unreachable: <message>`) and `redisPingMs` when reachable
+- `caches.<name>` map with per-cache `size`, `hitCount`, `missCount`, `hitRate` from the underlying Caffeine when present
+
+The Redis ping is a single async `EXISTS` against a sentinel key, bounded by `cache.health.ping-timeout` (default `500ms`). The endpoint never blocks longer than the timeout — `/actuator/health` stays responsive during a Redis incident, which matters because Kubernetes liveness probes and load balancers hit it.
 
 Useful for Kubernetes readiness probes and monitoring tool health checks.
 
@@ -344,9 +386,9 @@ Notable log lines and their operational meaning:
 |---|---|
 | `WARN  L2 read failed for key '...'; degrading to local-only` | Single L2 read exception. If frequent, breaker will open. |
 | `WARN  L2 write failed for key '...'; cross-node incoherence until TTL` | A write succeeded locally but didn't reach Redis. Bounded by TTL. |
+| `WARN  L2 evict failed for key '...'; cross-node coherence not guaranteed until TTL` | An evict couldn't reach L2. The `NearCache` suppresses the cross-node invalidation message in this case (see Failure behavior, "L2 delete fails"); remote nodes' L1 entries serve their stale value until the TTL expires. |
 | `WARN  Generation bump failed; clear visible only locally` | A `clear()` couldn't update Redis. Other nodes won't see the clear until their generation refreshes (which won't help if Redis is down). |
 | `INFO  Polymorphic type validator restricted to packages: [...]` | At startup, confirms the security validator is configured. |
-| `WARN  cache.allowed-packages is not configured` | Permissive deserialization is in effect. Configure for production. |
 
 ---
 
@@ -361,7 +403,9 @@ Notable log lines and their operational meaning:
 | `cache.server.scan-interval` | `2000` | Milliseconds between Redisson cluster slot-map refreshes. Used only when `mode=CLUSTER`. |
 | `cache.server.password` | empty | Redis password. Applies to all modes. |
 | `cache.node-id` | random UUID | Identifies this JVM in invalidation messages. Set explicitly to correlate with logs. |
-| `cache.allowed-packages` | empty (permissive) | Package prefixes allowed for polymorphic deserialization. Set for production. |
+| `cache.allowed-packages` | (required for default JSON codec) | Package prefixes allowed for Jackson polymorphic deserialization. Each entry must end with `.` or be a fully-qualified class name. Empty value fails startup. See Security. |
+| `cache.kryo.registered-classes` | `[]` | Fully-qualified class names registered with the Kryo codec. Required (non-empty) when any cache uses `codec: KRYO`. Order matters — appending is safe, reordering breaks the wire format. See Security. |
+| `cache.health.ping-timeout` | `500ms` | Bounds the Redis ping issued by the Actuator health indicator. `/actuator/health` returns within this window even if Redis is unreachable. |
 | `cache.default-spec.tier` | `NEAR_CACHE` | Default tier for caches not explicitly configured. |
 | `cache.default-spec.ttl` | `1h` | Default TTL. |
 | `cache.default-spec.maximum-size` | `10000` | Default L1 maximum entries. |
@@ -371,6 +415,18 @@ Notable log lines and their operational meaning:
 | `cache.caches.<name>.*` | inherits default-spec | Per-cache overrides. |
 
 ---
+
+## Cache keys
+
+Keys are stringified at every cache boundary (`put`, `get`, `evict`) before they reach Caffeine, Redis, or the cross-node invalidation pipeline. The library never stores `Object` keys internally and never serializes a key into a pub/sub payload. This avoids cross-type mismatches like a `Long` key that arrives on a remote node as `Integer` and fails to match the original entry.
+
+The stringification has three constraints:
+
+- **Reserved character `':'`** — colons are used as path separators inside Redis bucket keys (`<cacheName>:<generation>:<key>`) and lock keys (`<cacheName>:lock:<key>`). A user-supplied key whose `toString()` contains `':'` is rejected at `put`/`get`/`evict` with `IllegalArgumentException`. If your keys naturally contain colons (tenant prefixes, namespaced ids), apply a custom `KeyGenerator` that escapes them.
+- **256-byte length limit** — measured in UTF-8 bytes after stringification. Long keys waste Redis memory and CPU; if you have keys this large, hash them in a `KeyGenerator` (UUID, SHA-1, etc.) before they reach the cache.
+- **Null keys** — map to the sentinel string `_null`. A `null` key is valid (you can cache and evict by null), but only one entry per cache shares that key.
+
+Cache names are subject to the same `':'` prohibition for the same reason: a name containing `':'` would collide with the path separator and silently mis-route lookups. Names listed under `cache.caches.*` are validated at startup; names that fall through to `default-spec` are validated on first access.
 
 ## Multi-tenancy
 
@@ -396,18 +452,46 @@ Two operational notes:
 
 ## Security
 
-The library uses Jackson's polymorphic typing for L2 serialization (so cached objects deserialize to their concrete types, not just `LinkedHashMap`). The polymorphic type validator is narrowed via `cache.allowed-packages`:
+The library uses Jackson's polymorphic typing for L2 serialization (so cached objects deserialize to their concrete types, not just `LinkedHashMap`). The same threat model applies to the optional Kryo codec. Both surfaces are **fail-closed by default**: misconfiguration prevents the application from starting rather than shipping a permissive deserializer to production.
+
+### Jackson polymorphic typing (default codec)
 
 ```yaml
 cache:
   allowed-packages:
-    - com.example.domain
-    - com.example.dto
+    - com.example.domain.     # MUST end with '.'
+    - com.example.dto.
 ```
 
-Only types whose fully-qualified name starts with one of these prefixes can be deserialized. `java.util.`, `java.time.`, and `java.lang.` are always allowed. Without this configuration, a permissive validator is used and a startup warning is logged. **Configure this for production deployments** — unrestricted polymorphic deserialization has been a vector for past CVEs in the Jackson ecosystem.
+`cache.allowed-packages` is required — startup fails with `IllegalStateException` if it is empty. Jackson's permissive default-typing pattern has been the basis of 50+ deserialization CVEs (canonical example: CVE-2017-7525), and a library that ships with that pattern as a default would invite RCE in any deployment that forgot to set the property.
 
-For applications with stricter requirements, override the `RedissonClient` bean with a Kryo codec or a custom Jackson configuration. See Customization.
+**Each entry must end with `.`** (package prefix) or be a fully-qualified class name. Jackson matches via `startsWith`, so `com.example` (no trailing dot) would also accept `com.examplerogue.evil`. The trailing dot enforces the package boundary; the validator rejects entries that don't with a clear error message.
+
+`java.util.`, `java.time.`, and `java.lang.` are always added regardless of user configuration — collections, dates, and primitive wrappers appear in every realistic value graph.
+
+Three remediation paths if the default codec doesn't fit:
+
+1. Set `cache.allowed-packages` to your domain package prefixes (each ending with `.`).
+2. Switch to the Kryo codec (`cache.default-spec.codec=KRYO` plus `cache.kryo.registered-classes=[...]`). See below.
+3. Provide a custom `RedissonClient` bean with a different codec (see Customization).
+
+### Kryo codec (optional, more compact)
+
+Kryo without class registration accepts arbitrary class names from the payload — the same threat model as Jackson's permissive default typing. The library enforces registration:
+
+```yaml
+cache:
+  default-spec:
+    codec: KRYO
+  kryo:
+    registered-classes:
+      - com.example.domain.Product
+      - com.example.domain.User
+```
+
+If any cache (default-spec or per-cache) is configured to use KRYO, `cache.kryo.registered-classes` must be non-empty. Each class is loaded via `Class.forName` at startup — a missing class fails the context with the offending name. The resulting `Kryo5Codec` runs with class registration mandatory; payloads referencing an unregistered class cannot be deserialized.
+
+**Order matters.** Kryo assigns numeric registration ids in declaration order. Changing the order of an existing entry changes the wire format and breaks deserialization of payloads written by older deployments. Append new entries to the end; do not reorder.
 
 ---
 
@@ -474,28 +558,19 @@ Spring Boot uses Lettuce by default, but this library intentionally relies on Re
 
 ```
 io.github.nwwarm
-  CacheConfig                  — Spring auto-configuration
-  CacheProperties              — @ConfigurationProperties + Tier and Codec enums
-  PerNameCaffeineCacheManager  — per-name TTL and size for L1
-  LocalCacheResolver           — tier dispatch; injects dispatcher into NearCache                                                                                                                                                   
-  InvalidationDispatcher       — single RTopic subscription; self-skip + name routing                                                                                                                                               
-  InvalidationMessage          — wire format
-  CodecResolver                — maps codec enum to Redisson codec instance
-  NearCache                    — L1 + L2; publishes/handles invalidations via the dispatcher                                                                                                                                        
-  LocalOnlyCache               — Caffeine-only wrapper with metrics
-  DistributedOnlyCache         — Redis-only with two-tier single-flight, breaker, generation
+  CacheConfig                   — Spring auto-configuration
+  CacheProperties               — @ConfigurationProperties + Tier, Codec, Kryo, Health
+  CacheKeys                     — key stringification + cache-name and key validation
+  HybridCacheManager            — tier-aware Spring CacheManager; per-name dispatch
+  InvalidationDispatcher        — single RTopic subscription; self-skip + name routing
+  InvalidationMessage           — wire format (key is String — see CacheKeys)
+  CodecResolver                 — maps codec enum to Redisson codec instance
+  NearCache                     — L1 + L2; publishes/handles invalidations via the dispatcher
+  LocalOnlyCache                — Caffeine-only wrapper with metrics
+  DistributedOnlyCache          — Redis-only with two-tier single-flight, breaker, generation
+  HybridCacheHealthIndicator    — Actuator HealthIndicator (breaker + Redis ping + per-cache stats)
 ```
 
----
-
-## Roadmap
-
-- **0.1.0** — Initial release. Three tiers, single-flight, circuit breaker, generation-counter clear, Micrometer metrics, health indicator.
-- **0.2.0** — TTL jitter on L1 (spreads expiration to reduce coordinated reload spikes), `clearImmediate()` for caches needing eager memory reclaim.
-- **0.3.0** — Stale-while-revalidate refresh strategy for hot keys, exposed via per-call mode override.
-- **1.0.0** — API stable. No breaking changes without major version bump.
-
----
 
 ## License
 

@@ -28,7 +28,9 @@ public record CacheProperties(
         Map<String, CacheSpec> caches,
         CacheSpec defaultSpec,
         String nodeId,
-        List<String> allowedPackages) {
+        List<String> allowedPackages,
+        Kryo kryo,
+        Health health) {
 
     private static final Logger log = LoggerFactory.getLogger(CacheProperties.class);
     private static final Set<String> WARNED_NAMES = ConcurrentHashMap.newKeySet();
@@ -36,6 +38,8 @@ public record CacheProperties(
     public CacheProperties {
         if (caches == null) caches = Map.of();
         if (allowedPackages == null) allowedPackages = List.of();
+        if (kryo == null) kryo = new Kryo(List.of());
+        if (health == null) health = new Health(Duration.ofMillis(500));
         if (defaultSpec == null) {
             defaultSpec = new CacheSpec(
                     Tier.NEAR_CACHE,
@@ -129,6 +133,44 @@ public record CacheProperties(
         SINGLE,
         CLUSTER,
         SENTINEL
+    }
+
+    /**
+     * Kryo codec configuration. The Kryo wire format requires class
+     * registration to be safe — without it, a payload can encode an
+     * arbitrary class name and Kryo will instantiate it via reflection,
+     * which is the same threat model as Jackson's permissive default
+     * typing. The library enforces registration: any cache configured
+     * with {@link Codec#KRYO} requires {@link #registeredClasses} to be
+     * non-empty, validated at startup.
+     *
+     * <p>Each entry must be a fully-qualified class name resolvable via
+     * the application classloader. Order matters for Kryo's registration
+     * IDs across deployments; if you add a new class to the list, append
+     * rather than insert in the middle, otherwise existing payloads will
+     * deserialize with the wrong class id.
+     */
+    public record Kryo(List<String> registeredClasses) {
+        public Kryo {
+            if (registeredClasses == null) registeredClasses = List.of();
+        }
+    }
+
+    /**
+     * Health-indicator tuning.
+     *
+     * <p>{@link #pingTimeout} bounds the Redis EXISTS round-trip used by
+     * the health endpoint. /actuator/health must not block on a Redis
+     * incident — if the ping doesn't return within the timeout, the
+     * indicator reports the breaker state and the ping as
+     * "timeout" rather than waiting on the full Redis call.
+     */
+    public record Health(Duration pingTimeout) {
+        public Health {
+            if (pingTimeout == null || pingTimeout.isZero() || pingTimeout.isNegative()) {
+                pingTimeout = Duration.ofMillis(500);
+            }
+        }
     }
 
     public record CacheSpec(

@@ -11,7 +11,9 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.redisson.Redisson;
 import org.redisson.api.RedissonClient;
 import org.redisson.client.RedisException;
+import org.redisson.client.codec.Codec;
 import org.redisson.codec.JsonJacksonCodec;
+import org.redisson.codec.Kryo5Codec;
 import org.redisson.config.Config;
 import org.springframework.cache.caffeine.CaffeineCache;
 import org.testcontainers.containers.GenericContainer;
@@ -138,7 +140,8 @@ public abstract class RedisTestBase {
                 .build();
         CaffeineCache springCache = new CaffeineCache(name, caffeineNative, true);
         InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, nodeId);
-        return new NearCache(springCache, spec, redisson, breaker, dispatcher, meterRegistry);
+        return new NearCache(springCache, spec, resolveTestCodec(codec), redisson,
+                breaker, dispatcher, meterRegistry);
     }
 
     protected DistributedOnlyCache newDistributedCache(String name,
@@ -149,7 +152,21 @@ public abstract class RedisTestBase {
                 Duration.ofMinutes(10), 10_000,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
                 CacheProperties.Codec.JSON);
-        return new DistributedOnlyCache(name, spec, redisson, breaker, new SimpleMeterRegistry());
+        return new DistributedOnlyCache(name, spec, resolveTestCodec(spec.codec()),
+                redisson, breaker, new SimpleMeterRegistry());
+    }
+
+    /**
+     * Resolves the per-cache codec for direct test construction. Tests that
+     * use {@link CacheProperties.Codec#KRYO} get a default {@link Kryo5Codec}
+     * with no registration — the production-side registration validator
+     * lives in {@code CacheConfig}, which these tests bypass on purpose.
+     */
+    protected Codec resolveTestCodec(CacheProperties.Codec choice) {
+        return switch (choice) {
+            case JSON -> null;
+            case KRYO -> new Kryo5Codec();
+        };
     }
 
     protected LocalOnlyCache newLocalCache(String name) {

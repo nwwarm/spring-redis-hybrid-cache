@@ -34,6 +34,7 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
     private final CircuitBreaker breaker;
     private final InvalidationDispatcher dispatcher;
     private final MeterRegistry meterRegistry;
+    private final CodecResolver codecResolver;
 
     private final List<NearCache> nearCaches = new CopyOnWriteArrayList<>();
 
@@ -41,12 +42,18 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
                               RedissonClient redisson,
                               CircuitBreaker breaker,
                               InvalidationDispatcher dispatcher,
-                              MeterRegistry meterRegistry) {
+                              MeterRegistry meterRegistry,
+                              CodecResolver codecResolver) {
+        // Fail fast on configured cache names that contain ':'. Names that
+        // fall through to defaultSpec (i.e., not listed in cache.caches.*)
+        // are validated lazily in getMissingCache.
+        properties.caches().keySet().forEach(CacheKeys::validateCacheName);
         this.properties = properties;
         this.redisson = redisson;
         this.breaker = breaker;
         this.dispatcher = dispatcher;
         this.meterRegistry = meterRegistry;
+        this.codecResolver = codecResolver;
     }
 
     @Override
@@ -61,15 +68,17 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
 
     @Override
     protected Cache getMissingCache(@Nonnull String name) {
+        CacheKeys.validateCacheName(name);
         CacheProperties.CacheSpec spec = properties.specFor(name);
+        org.redisson.client.codec.Codec bucketCodec = codecResolver.resolve(spec.codec());
         return switch (spec.tier()) {
             case LOCAL_ONLY -> new LocalOnlyCache(buildCaffeineCache(name, spec), meterRegistry);
             case DISTRIBUTED_ONLY ->
-                    new DistributedOnlyCache(name, spec, redisson, breaker, meterRegistry);
+                    new DistributedOnlyCache(name, spec, bucketCodec, redisson, breaker, meterRegistry);
             case NEAR_CACHE -> {
                 NearCache near = new NearCache(
                         buildCaffeineCache(name, spec),
-                        spec, redisson, breaker, dispatcher, meterRegistry);
+                        spec, bucketCodec, redisson, breaker, dispatcher, meterRegistry);
                 nearCaches.add(near);
                 yield near;
             }
