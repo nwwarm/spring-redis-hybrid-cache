@@ -37,7 +37,7 @@ public class InvalidationDispatcher implements MessageListener<InvalidationMessa
     private final String nodeId;
     private final RTopic topic;
     private final int listenerId;
-    private final ConcurrentMap<String, NearCache> caches = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, InvalidationListener> caches = new ConcurrentHashMap<>();
 
     InvalidationDispatcher(RedissonClient redisson, String nodeId) {
         this.nodeId = nodeId;
@@ -49,10 +49,10 @@ public class InvalidationDispatcher implements MessageListener<InvalidationMessa
         return nodeId;
     }
 
-    void register(NearCache cache) {
-        NearCache prev = caches.put(cache.getName(), cache);
+    void register(InvalidationListener cache) {
+        InvalidationListener prev = caches.put(cache.getName(), cache);
         if (prev != null && prev != cache) {
-            log.warn("Replacing existing NearCache registration for '{}'", cache.getName());
+            log.warn("Replacing existing cache registration for '{}'", cache.getName());
         }
     }
 
@@ -67,7 +67,7 @@ public class InvalidationDispatcher implements MessageListener<InvalidationMessa
     @Override
     public void onMessage(CharSequence channel, InvalidationMessage msg) {
         if (nodeId.equals(msg.nodeId())) return;
-        NearCache cache = caches.get(msg.cacheName());
+        InvalidationListener cache = caches.get(msg.cacheName());
         if (cache == null) return;
         cache.handleInvalidation(msg.op(), msg.key());
     }

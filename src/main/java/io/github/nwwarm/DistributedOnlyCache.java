@@ -56,7 +56,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * it must fail open. Source systems behind a distributed-only cache must handle
  * full unfiltered load during a Redis incident.
  */
-public class DistributedOnlyCache implements Cache {
+public class DistributedOnlyCache implements Cache, InvalidationListener {
 
     private static final Logger log = LoggerFactory.getLogger(DistributedOnlyCache.class);
     private static final long GENERATION_REFRESH_NANOS = 1_000_000_000L; // 1s
@@ -67,6 +67,7 @@ public class DistributedOnlyCache implements Cache {
     private final CircuitBreaker breaker;
     private final Codec bucketCodec;
     private final KeyLogFormatter keyLogFormatter;
+    private final InvalidationDispatcher dispatcher;
 
     private final RAtomicLong distributedGeneration;
     private final AtomicLong localGeneration = new AtomicLong(0);
@@ -86,6 +87,7 @@ public class DistributedOnlyCache implements Cache {
                                 Codec bucketCodec,
                                 RedissonClient redisson,
                                 CircuitBreaker breaker,
+                                InvalidationDispatcher dispatcher,
                                 MeterRegistry meterRegistry,
                                 KeyLogFormatter keyLogFormatter) {
         this.cacheName = cacheName;
@@ -94,6 +96,7 @@ public class DistributedOnlyCache implements Cache {
         this.breaker = breaker;
         this.bucketCodec = bucketCodec;
         this.keyLogFormatter = keyLogFormatter;
+        this.dispatcher = dispatcher;
         this.distributedGeneration = redisson.getAtomicLong(cacheName + ":generation");
 
         try {
@@ -102,6 +105,8 @@ public class DistributedOnlyCache implements Cache {
         } catch (Exception e) {
             log.warn("Failed to initialize generation for cache '{}'", cacheName, e);
         }
+
+        dispatcher.register(this);
 
         this.hits = Counter.builder("cache.distributed.gets")
                 .tag("cache", cacheName).tag("result", "hit").register(meterRegistry);
@@ -288,6 +293,47 @@ public class DistributedOnlyCache implements Cache {
             failures.increment();
             log.warn("Distributed clear (generation bump) failed for cache '{}'", cacheName, e);
         }
+        // Publish so peers refresh their cached generation immediately rather
+        // than waiting up to GENERATION_REFRESH_NANOS for the next poll. The
+        // 1s poll remains as a backstop if the message is dropped.
+        publishClear();
+    }
+
+    private void publishClear() {
+        try {
+            breaker.executeRunnable(() ->
+                    dispatcher.publish(new InvalidationMessage(
+                            dispatcher.getNodeId(), cacheName, InvalidationMessage.OP_CLEAR, null)));
+        } catch (Exception e) {
+            // Suppressed — peers will catch up via the 1s generation poll.
+        }
+    }
+
+    /**
+     * Invoked by {@link InvalidationDispatcher} after self-skip and name routing.
+     * Only {@code OP_CLEAR} drives any action: a clear from a peer means the
+     * generation counter has advanced, so we force a refresh on the next read
+     * instead of waiting for the 1s poll. {@code OP_INVALIDATE} carries no
+     * action here — there is no L1 to evict, and the peer's L2 delete already
+     * removed the entry from L2.
+     */
+    @Override
+    public void handleInvalidation(String op, String key) {
+        switch (op) {
+            case InvalidationMessage.OP_CLEAR -> {
+                lastRefreshNanos.set(0);
+                currentGeneration();
+            }
+            case InvalidationMessage.OP_INVALIDATE -> log.trace(
+                    "Ignoring per-key invalidation on distributed-only cache '{}' key={}",
+                    cacheName, keyLogFormatter.format(key));
+            default -> log.warn("Unknown invalidation op '{}' on cache '{}'", op, cacheName);
+        }
+    }
+
+    /** Called by the cache manager during context shutdown. Idempotent. */
+    public void shutdown() {
+        dispatcher.deregister(cacheName);
     }
 
     private Object readFromRedis(String key) {

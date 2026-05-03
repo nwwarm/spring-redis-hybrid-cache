@@ -55,7 +55,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * A cache is by definition allowed to lose data. These tradeoffs prioritize
  * availability over coherence during partial Redis outages.
  */
-public class NearCache implements Cache {
+public class NearCache implements Cache, InvalidationListener {
 
     private static final Logger log = LoggerFactory.getLogger(NearCache.class);
     private static final long GENERATION_REFRESH_NANOS = 1_000_000_000L; // 1s
@@ -460,7 +460,8 @@ public class NearCache implements Cache {
     }
 
     /** Invoked by {@link InvalidationDispatcher} after self-skip and name routing. */
-    void handleInvalidation(String op, String key) {
+    @Override
+    public void handleInvalidation(String op, String key) {
         switch (op) {
             case InvalidationMessage.OP_INVALIDATE -> caffeineCache.evict(key);
             case InvalidationMessage.OP_CLEAR -> {

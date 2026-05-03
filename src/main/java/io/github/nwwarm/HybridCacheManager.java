@@ -43,6 +43,7 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
     private final KeyLogFormatter keyLogFormatter;
 
     private final List<NearCache> nearCaches = new CopyOnWriteArrayList<>();
+    private final List<DistributedOnlyCache> distributedCaches = new CopyOnWriteArrayList<>();
 
     public HybridCacheManager(CacheProperties properties,
                               RedissonClient redisson,
@@ -83,7 +84,10 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
             case LOCAL_ONLY -> new LocalOnlyCache(buildCaffeineCache(name, spec), meterRegistry);
             case DISTRIBUTED_ONLY -> {
                 CircuitBreaker breaker = breakerFactory.resolve(name, spec.circuitBreaker());
-                yield new DistributedOnlyCache(name, spec, bucketCodec, redisson, breaker, meterRegistry, keyLogFormatter);
+                DistributedOnlyCache distributed = new DistributedOnlyCache(
+                        name, spec, bucketCodec, redisson, breaker, dispatcher, meterRegistry, keyLogFormatter);
+                distributedCaches.add(distributed);
+                yield distributed;
             }
             case NEAR_CACHE -> {
                 CircuitBreaker breaker = breakerFactory.resolve(name, spec.circuitBreaker());
@@ -109,5 +113,7 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
     public void destroy() {
         nearCaches.forEach(NearCache::shutdown);
         nearCaches.clear();
+        distributedCaches.forEach(DistributedOnlyCache::shutdown);
+        distributedCaches.clear();
     }
 }

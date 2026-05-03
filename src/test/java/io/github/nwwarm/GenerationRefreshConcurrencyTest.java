@@ -106,8 +106,9 @@ class GenerationRefreshConcurrencyTest {
     void distributedOnlyCache_exactlyOneGenerationRead_whenRefreshDue() throws Exception {
         CircuitBreaker breaker = CircuitBreakerRegistry.ofDefaults().circuitBreaker("test-dist");
 
+        InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, "test-node");
         DistributedOnlyCache cache = new DistributedOnlyCache(
-                "dist-test", spec(), null, redisson, breaker, new SimpleMeterRegistry(),
+                "dist-test", spec(), null, redisson, breaker, dispatcher, new SimpleMeterRegistry(),
                 new KeyLogFormatter(false, "test"));
 
         getCallCount.set(0);

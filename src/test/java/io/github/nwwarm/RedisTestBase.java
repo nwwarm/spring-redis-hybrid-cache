@@ -147,13 +147,22 @@ public abstract class RedisTestBase {
     protected DistributedOnlyCache newDistributedCache(String name,
                                                        RedissonClient redisson,
                                                        CircuitBreaker breaker) {
+        return newDistributedCache(name, redisson, breaker, "test-node-" + System.nanoTime());
+    }
+
+    protected DistributedOnlyCache newDistributedCache(String name,
+                                                       RedissonClient redisson,
+                                                       CircuitBreaker breaker,
+                                                       String nodeId) {
         CacheProperties.CacheSpec spec = new CacheProperties.CacheSpec(
                 CacheProperties.Tier.DISTRIBUTED_ONLY,
                 Duration.ofMinutes(10), 10_000,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
                 CacheProperties.Codec.JSON, null);
+        InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, nodeId);
         return new DistributedOnlyCache(name, spec, resolveTestCodec(spec.codec()),
-                redisson, breaker, new SimpleMeterRegistry(), new KeyLogFormatter(false, "test"));
+                redisson, breaker, dispatcher, new SimpleMeterRegistry(),
+                new KeyLogFormatter(false, "test"));
     }
 
     /**
