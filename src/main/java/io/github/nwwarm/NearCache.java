@@ -104,7 +104,7 @@ public class NearCache implements Cache, InvalidationListener {
         this.loaderGate = new LoaderGate(cacheName,
                 spec.maxConcurrentLoaders(), spec.loaderAcquireTimeout(), meterRegistry);
 
-        this.distributedGeneration = redisson.getAtomicLong(cacheName + ":generation");
+        this.distributedGeneration = redisson.getAtomicLong(CacheKeys.generationKey(cacheName));
         initializeGeneration();
 
         dispatcher.register(this);
@@ -248,7 +248,7 @@ public class NearCache implements Cache, InvalidationListener {
         RLock lock = null;
         boolean acquired = false;
         try {
-            lock = redisson.getLock(cacheName + ":lock:" + key);
+            lock = redisson.getLock(CacheKeys.lockKey(cacheName, key));
             acquired = lock.tryLock(
                     spec.lockWait().toMillis(),
                     spec.lockLease().toMillis(),
@@ -357,7 +357,7 @@ public class NearCache implements Cache, InvalidationListener {
     // ---------- L2 ops, breaker-wrapped ----------
 
     private RBucket<Object> bucket(String key) {
-        String fullKey = cacheName + ":" + currentGeneration() + ":" + key;
+        String fullKey = CacheKeys.valueKey(cacheName, key, currentGeneration());
         return bucketCodec == null
                 ? redisson.getBucket(fullKey)
                 : redisson.getBucket(fullKey, bucketCodec);

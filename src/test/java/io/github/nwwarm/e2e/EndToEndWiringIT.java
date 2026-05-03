@@ -43,16 +43,17 @@ class EndToEndWiringIT extends EndToEndTestBase {
                 .isEqualTo(before + 1);
 
         // 3. Value must be present in Redis (L2). NearCache writes under
-        //    "<cacheName>:<generation>:<key>"; generation starts at 0.
+        //    "{<cacheName>:<key>}:v:<generation>" (hash-tagged so value and
+        //    lock collocate on one Cluster slot); generation starts at 0.
         //    Use isExists() to avoid round-tripping the Product through the
         //    global codec — that's a codec concern, not a wiring concern.
-        assertThat(redisson.getBucket("products:0:42").isExists())
+        assertThat(redisson.getBucket("{products:42}:v:0").isExists())
                 .as("L2 should hold the value — proves the NearCache tier is engaged")
                 .isTrue();
 
         // 4. @CacheEvict must remove the value from Redis.
         productService.invalidate(42L);
-        assertThat(redisson.getBucket("products:0:42").isExists())
+        assertThat(redisson.getBucket("{products:42}:v:0").isExists())
                 .as("@CacheEvict should clear L2")
                 .isFalse();
 

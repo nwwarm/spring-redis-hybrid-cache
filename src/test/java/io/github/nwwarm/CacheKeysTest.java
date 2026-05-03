@@ -83,4 +83,100 @@ class CacheKeysTest {
         assertThatThrownBy(() -> CacheKeys.validateCacheName(null))
                 .isInstanceOf(IllegalArgumentException.class);
     }
+
+    @Test
+    void validateCacheName_rejectsOpenBrace() {
+        // A name like "tenant{a}" produces a value key "{tenant{a}:42}:v:0".
+        // Redis Cluster matches the first balanced {...} substring, so the
+        // slot would be computed from "tenant{a}" alone, routing every key
+        // in the cache to a single shard.
+        assertThatThrownBy(() -> CacheKeys.validateCacheName("tenant{a}"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("tenant{a}")
+                .hasMessageContaining("hash tag");
+    }
+
+    @Test
+    void validateCacheName_rejectsCloseBrace() {
+        assertThatThrownBy(() -> CacheKeys.validateCacheName("a}b"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("hash tag");
+    }
+
+    // ---------- Redis key formatting ----------
+
+    @Test
+    void valueKey_producesHashTaggedFormat() {
+        assertThat(CacheKeys.valueKey("products", "42", 0))
+                .isEqualTo("{products:42}:v:0");
+    }
+
+    @Test
+    void valueKey_generationGoesOutsideTheTag() {
+        // Same logical key, different generations: the {...} substring is
+        // identical so both keys hash to the same slot. This is what makes
+        // a future atomic evict-and-bump pipeline possible.
+        String g0 = CacheKeys.valueKey("products", "42", 0);
+        String g7 = CacheKeys.valueKey("products", "42", 7);
+        assertThat(g0).isEqualTo("{products:42}:v:0");
+        assertThat(g7).isEqualTo("{products:42}:v:7");
+        // Hash-tag substrings match exactly.
+        assertThat(extractTag(g0)).isEqualTo(extractTag(g7));
+    }
+
+    @Test
+    void lockKey_producesHashTaggedFormat() {
+        assertThat(CacheKeys.lockKey("products", "42"))
+                .isEqualTo("{products:42}:lock");
+    }
+
+    @Test
+    void valueAndLockShareTheSameHashTag() {
+        // The collocation property — value and lock for the same logical
+        // key live in the same {...} substring, so Cluster routes them to
+        // the same slot.
+        String v = CacheKeys.valueKey("products", "42", 0);
+        String l = CacheKeys.lockKey("products", "42");
+        assertThat(extractTag(v)).isEqualTo(extractTag(l)).isEqualTo("products:42");
+    }
+
+    @Test
+    void generationKey_isPerCacheAndUnchanged() {
+        // Intentionally NOT inside a hash tag — the generation counter is
+        // per-cache; collocating it with each key would scatter it across
+        // every slot.
+        assertThat(CacheKeys.generationKey("products"))
+                .isEqualTo("products:generation");
+    }
+
+    @Test
+    void valueKey_keyContainingBraces_doesNotShiftHashTagBoundary() {
+        // A user-supplied key containing { or } is permitted (we don't
+        // validate keys for braces). Redis Cluster matches the FIRST
+        // balanced {...} substring, which is still the outer cache:key
+        // tag — so routing remains correct.
+        String key = CacheKeys.valueKey("products", "{nested}", 0);
+        assertThat(key).isEqualTo("{products:{nested}}:v:0");
+        // The first balanced {...} starts at index 0 and closes at the
+        // first matching '}' (after "products:{nested"). Redis Cluster's
+        // implementation actually closes at the *first* '}', giving the
+        // tag "products:{nested" — different from a clean key, but
+        // deterministic and not catastrophic. The crucial property is
+        // that the cache name is brace-free (validated) so the tag still
+        // begins where we expect.
+        assertThat(extractTag(key)).isEqualTo("products:{nested");
+    }
+
+    /**
+     * Mirrors Redis Cluster's hash-tag extraction: the substring between
+     * the first '{' and the first subsequent '}'. Empty tag (e.g. {@code "{}"})
+     * causes Cluster to hash the whole key — but we never produce that.
+     */
+    private static String extractTag(String key) {
+        int open = key.indexOf('{');
+        if (open < 0) return key;
+        int close = key.indexOf('}', open + 1);
+        if (close < 0 || close == open + 1) return key;
+        return key.substring(open + 1, close);
+    }
 }

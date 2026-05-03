@@ -65,10 +65,51 @@ final class CacheKeys {
         if (name.indexOf(':') >= 0) {
             throw new IllegalArgumentException(
                     "Cache name '" + name + "' contains reserved character ':'. "
-                            + "Cache names form the root prefix of Redis bucket keys "
-                            + "(<cacheName>:<generation>:<key>); a name containing ':' "
-                            + "would collide with the path separator and break the "
-                            + "generation-based clear semantics.");
+                            + "Cache names form part of every Redis key produced by the "
+                            + "library; a name containing ':' would collide with the path "
+                            + "separator and break the generation-based clear semantics.");
         }
+        if (name.indexOf('{') >= 0 || name.indexOf('}') >= 0) {
+            // Redis Cluster routes by the first balanced {...} substring. A
+            // cache name containing '{' or '}' would shift that boundary
+            // (e.g. "tenant{a}" gives a value key "{tenant{a}:42}:v:0", and
+            // Redis hashes "tenant{a}" rather than "tenant{a}:42"), routing
+            // every key in the cache to a single shard. Catastrophic for
+            // cluster scaling, silent at runtime — fail at startup.
+            throw new IllegalArgumentException(
+                    "Cache name '" + name + "' contains reserved character '{' or '}'. "
+                            + "These delimit Redis Cluster hash tags; a cache name "
+                            + "containing them shifts the tag boundary and routes every "
+                            + "key in the cache to the same shard, defeating cluster scaling.");
+        }
+    }
+
+    // ---------- Redis key formatting ----------
+    //
+    // Hash-tag layout (Redis Cluster routes by the first balanced {...} substring):
+    //   value:  {<cache>:<key>}:v:<generation>
+    //   lock:   {<cache>:<key>}:lock
+    //   gen:    <cache>:generation         (per-cache, intentionally NOT collocated)
+    //
+    // value + lock for the same logical (cache, key) collocate on one slot;
+    // a generation bump produces a new value key for the same logical key
+    // that still lands on the same slot, enabling a future atomic
+    // evict-and-bump pipeline. The generation counter itself is per-cache
+    // and stays outside the tag so it isn't scattered across slots by
+    // collocation with each individual key.
+
+    /** Per-key value bucket. {@code key} must already be stringified. */
+    static String valueKey(String cacheName, String key, long generation) {
+        return "{" + cacheName + ":" + key + "}:v:" + generation;
+    }
+
+    /** Per-key lock. {@code key} must already be stringified. */
+    static String lockKey(String cacheName, String key) {
+        return "{" + cacheName + ":" + key + "}:lock";
+    }
+
+    /** Per-cache generation counter. */
+    static String generationKey(String cacheName) {
+        return cacheName + ":generation";
     }
 }

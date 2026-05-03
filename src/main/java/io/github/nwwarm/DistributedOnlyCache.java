@@ -98,7 +98,7 @@ public class DistributedOnlyCache implements Cache, InvalidationListener {
         this.bucketCodec = bucketCodec;
         this.keyLogFormatter = keyLogFormatter;
         this.dispatcher = dispatcher;
-        this.distributedGeneration = redisson.getAtomicLong(cacheName + ":generation");
+        this.distributedGeneration = redisson.getAtomicLong(CacheKeys.generationKey(cacheName));
 
         try {
             breaker.executeRunnable(() -> localGeneration.set(distributedGeneration.get()));
@@ -221,7 +221,7 @@ public class DistributedOnlyCache implements Cache, InvalidationListener {
         boolean acquired = false;
         try {
             if (!spec.lockWait().isZero()) {
-                lock = redisson.getLock(cacheName + ":lock:" + key);
+                lock = redisson.getLock(CacheKeys.lockKey(cacheName, key));
                 acquired = lock.tryLock(
                         spec.lockWait().toMillis(),
                         spec.lockLease().toMillis(),
@@ -373,7 +373,7 @@ public class DistributedOnlyCache implements Cache, InvalidationListener {
     }
 
     private RBucket<Object> bucket(String key) {
-        String fullKey = cacheName + ":" + currentGeneration() + ":" + key;
+        String fullKey = CacheKeys.valueKey(cacheName, key, currentGeneration());
         return bucketCodec == null
                 ? redisson.getBucket(fullKey)
                 : redisson.getBucket(fullKey, bucketCodec);

@@ -95,8 +95,12 @@ class GenerationClearIT extends RedisTestBase {
     }
 
     private static long countKeysFor(RKeys keys, String cacheName) {
+        // Hash-tagged value and lock keys ({<cache>:<key>}:...) do not start
+        // with the cache name; the generation counter (<cache>:generation)
+        // does. Match anything that contains "<cache>:" — covers all three
+        // shapes the library produces.
         long count = 0;
-        for (String key : keys.getKeysByPattern(cacheName + ":*")) {
+        for (String key : keys.getKeysByPattern("*" + cacheName + ":*")) {
             count++;
         }
         return count;

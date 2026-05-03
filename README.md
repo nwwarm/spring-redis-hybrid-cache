@@ -8,7 +8,7 @@ Drop-in replacement for the typical `@Cacheable` + Redis setup that addresses th
 <dependency>
   <groupId>io.github.nwwarm</groupId>
   <artifactId>hybrid-cache-spring-boot-starter</artifactId>
-  <version>0.2.0</version>
+  <version>0.3.0</version>
 </dependency>
 ```
 
@@ -422,11 +422,25 @@ Keys are stringified at every cache boundary (`put`, `get`, `evict`) before they
 
 The stringification has three constraints:
 
-- **Reserved character `':'`** — colons are used as path separators inside Redis bucket keys (`<cacheName>:<generation>:<key>`) and lock keys (`<cacheName>:lock:<key>`). A user-supplied key whose `toString()` contains `':'` is rejected at `put`/`get`/`evict` with `IllegalArgumentException`. If your keys naturally contain colons (tenant prefixes, namespaced ids), apply a custom `KeyGenerator` that escapes them.
+- **Reserved character `':'`** — colons are used as path separators inside Redis keys. A user-supplied key whose `toString()` contains `':'` is rejected at `put`/`get`/`evict` with `IllegalArgumentException`. If your keys naturally contain colons (tenant prefixes, namespaced ids), apply a custom `KeyGenerator` that escapes them.
 - **256-byte length limit** — measured in UTF-8 bytes after stringification. Long keys waste Redis memory and CPU; if you have keys this large, hash them in a `KeyGenerator` (UUID, SHA-1, etc.) before they reach the cache.
 - **Null keys** — map to the sentinel string `_null`. A `null` key is valid (you can cache and evict by null), but only one entry per cache shares that key.
 
-Cache names are subject to the same `':'` prohibition for the same reason: a name containing `':'` would collide with the path separator and silently mis-route lookups. Names listed under `cache.caches.*` are validated at startup; names that fall through to `default-spec` are validated on first access.
+Cache names share the `':'` prohibition (same path-separator reason) and additionally reject `'{'` and `'}'` — these delimit Redis Cluster hash tags, and a name containing them would shift the tag boundary and route every key in the cache to a single shard. Names listed under `cache.caches.*` are validated at startup; names that fall through to `default-spec` are validated on first access.
+
+### Redis key layout (0.3.0+)
+
+The library produces three kinds of Redis key per logical cache entry:
+
+| | Format | Example |
+|---|---|---|
+| value | `{<cache>:<key>}:v:<generation>` | `{products:42}:v:0` |
+| lock | `{<cache>:<key>}:lock` | `{products:42}:lock` |
+| gen | `<cache>:generation` | `products:generation` |
+
+The `{...}` is a Redis Cluster hash tag — Cluster routes by the substring inside it. So value and lock for the same logical `(cache, key)` collocate on one shard, while different keys distribute across shards normally. The generation counter sits outside the tag (per-cache, intentionally not collocated with each key).
+
+**Upgrading from 0.2.0:** the key format changed. 0.3.0 will not see entries written by 0.2.0; entries lazily reload — acceptable for a cache, but plan for a brief cold-start period after the upgrade. Lock keys also changed, so during a rolling deploy 0.2.0 and 0.3.0 nodes cannot coordinate single-flight on the same key. See [`CHANGELOG.md`](CHANGELOG.md) for full migration guidance.
 
 ## Multi-tenancy
 
