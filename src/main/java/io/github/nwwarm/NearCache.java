@@ -82,6 +82,7 @@ public class NearCache implements Cache {
     private final Counter l2Failures;
     private final Counter l2BreakerOpen;
     private final Timer l2GetLatency;
+    private final Counter invalidationsSuppressedColdLoad;
 
     public NearCache(Cache caffeineCache,
                      CacheProperties.CacheSpec spec,
@@ -114,6 +115,8 @@ public class NearCache implements Cache {
         this.l2BreakerOpen = Counter.builder("cache.l2.breaker.open")
                 .tag("cache", cacheName).register(meterRegistry);
         this.l2GetLatency = Timer.builder("cache.l2.get.latency")
+                .tag("cache", cacheName).register(meterRegistry);
+        this.invalidationsSuppressedColdLoad = Counter.builder("cache.invalidations.suppressed.cold_load")
                 .tag("cache", cacheName).register(meterRegistry);
 
         Object native_ = caffeineCache.getNativeCache();
@@ -267,7 +270,29 @@ public class NearCache implements Cache {
         try {
             Object value = valueLoader.call();
             writeToL2(key, value);
-            publishInvalidation(InvalidationMessage.OP_INVALIDATE, key);
+            // Cold-load completion: do NOT publish.
+            //
+            // Two sub-cases land here:
+            //   1. Lock acquired, re-check empty: a true cold load. No peer has
+            //      written to L2 yet, so no peer can have a stale L1.
+            //   2. Lock acquisition failed (Redis slow, breaker open, tryLock
+            //      timeout): we loaded unilaterally. A peer may also be loading
+            //      concurrently. If loaders are deterministic, both writes produce
+            //      the same value and there's nothing to invalidate. If loaders
+            //      are non-deterministic, last-writer-wins on L2 — and a publish
+            //      from us would force peers to drop their L1 and reload, only to
+            //      potentially get our value or theirs depending on L2 timing.
+            //      That's not coherence; it's just churn. Application-level
+            //      determinism of loaders is the correct fix for that case, not
+            //      cache-level invalidation.
+            //
+            // In both sub-cases, peer L1 is either empty (lazy-loads on next read
+            // from now-warm L2) or holds a value the peer wrote itself. Neither
+            // is stale in the sense that requires invalidation.
+            //
+            // put(...) and evict(...) DO publish — they replace or remove existing
+            // state, so remote L1 copies must be invalidated.
+            invalidationsSuppressedColdLoad.increment();
             return value;
         } catch (Throwable t) {
             throw new LoaderException(t);
