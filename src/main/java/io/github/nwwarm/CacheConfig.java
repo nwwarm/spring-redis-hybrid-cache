@@ -129,15 +129,16 @@ public class CacheConfig {
     private static BasicPolymorphicTypeValidator buildPolymorphicTypeValidator(CacheProperties properties) {
         if (properties.allowedPackages() == null || properties.allowedPackages().isEmpty()) {
             throw new IllegalStateException(
-                    "cache.allowed-packages is not configured. The library will not start with "
-                            + "a permissive Jackson polymorphic type validator: that pattern has "
-                            + "been the basis of 50+ Jackson deserialization CVEs (canonical "
-                            + "example: CVE-2017-7525) and is unsafe to deploy. Choose one:\n"
-                            + "  (a) Set cache.allowed-packages to a list of your domain package "
-                            + "prefixes — each entry must end with '.' (e.g., 'com.example.domain.').\n"
-                            + "  (b) Switch to KRYO codec (cache.default-spec.codec=KRYO and "
-                            + "cache.kryo.registered-classes=[...]).\n"
-                            + "  (c) Provide a custom RedissonClient bean with a different codec.");
+                    """
+                            cache.allowed-packages is not configured. The library will not start with \
+                            a permissive Jackson polymorphic type validator: that pattern has \
+                            been the basis of 50+ Jackson deserialization CVEs (canonical \
+                            example: CVE-2017-7525) and is unsafe to deploy. Choose one:
+                              (a) Set cache.allowed-packages to a list of your domain package \
+                            prefixes — each entry must end with '.' (e.g., 'com.example.domain.').
+                              (b) Switch to KRYO codec (cache.default-spec.codec=KRYO and \
+                            cache.kryo.registered-classes=[...]).
+                              (c) Provide a custom RedissonClient bean with a different codec.""");
         }
 
         BasicPolymorphicTypeValidator.Builder builder = BasicPolymorphicTypeValidator.builder();
@@ -195,6 +196,7 @@ public class CacheConfig {
     @Bean
     @ConditionalOnMissingBean(name = "redisCacheCircuitBreakerRegistry")
     public CircuitBreakerRegistry redisCacheCircuitBreakerRegistry(CacheProperties properties) {
+        CacheSpecValidator.validate(properties);
         CacheProperties.CircuitBreaker overlay = properties.resilience() == null
                 ? null
                 : properties.resilience().circuitBreaker();

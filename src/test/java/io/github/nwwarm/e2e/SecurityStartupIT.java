@@ -95,12 +95,14 @@ class SecurityStartupIT {
 
     @Test
     void contextFailsToStart_whenKryoSelectedWithoutRegisteredClasses() {
+        // The startup validator (CacheSpecValidator) fires before codecResolver,
+        // so the root cause is now IllegalArgumentException with the per-spec label.
         assertThatThrownBy(() -> app(
                 "cache.allowed-packages=io.github.nwwarm.",
                 "cache.default-spec.codec=KRYO"
         ).run().close())
                 .rootCause()
-                .isInstanceOf(IllegalStateException.class)
+                .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("cache.kryo.registered-classes")
                 .hasMessageContaining("KRYO");
     }
