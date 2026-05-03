@@ -332,4 +332,8 @@ public class DistributedOnlyCache implements Cache {
         }
         return localGeneration.get();
     }
+
+    CircuitBreaker getBreaker() {
+        return breaker;
+    }
 }

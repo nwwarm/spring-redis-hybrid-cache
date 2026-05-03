@@ -4,7 +4,6 @@ import com.fasterxml.jackson.annotation.JsonTypeInfo;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
-import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.github.resilience4j.micrometer.tagged.TaggedCircuitBreakerMetrics;
@@ -30,13 +29,14 @@ import org.springframework.context.annotation.Configuration;
 import java.time.Duration;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeoutException;
 
 /**
  * Primary Spring configuration. Wires Redisson, the tier-aware
- * {@link HybridCacheManager}, the circuit breaker, and the invalidation
- * dispatcher.
+ * {@link HybridCacheManager}, the per-cache circuit-breaker registry, and the
+ * invalidation dispatcher.
  *
  * <p>All beans are exposed as {@link ConditionalOnMissingBean} so applications
  * can override any single piece (e.g., supply a custom {@link RedissonClient}
@@ -182,10 +182,48 @@ public class CacheConfig {
                         + "package boundary, or supply a fully-qualified class name.");
     }
 
+    /**
+     * The library's circuit-breaker registry. Default config is built from
+     * {@code cache.resilience.circuit-breaker.*} (with library fallbacks for
+     * any missing field) and applies to every per-cache breaker unless that
+     * cache supplies its own overlay under
+     * {@code cache.caches.<name>.circuit-breaker.*}.
+     *
+     * <p>{@code recordExceptions} is hardcoded to the universe of "L2 is
+     * unhealthy" — see README. Not a per-deployment knob.
+     */
     @Bean
     @ConditionalOnMissingBean(name = "redisCacheCircuitBreakerRegistry")
-    public CircuitBreakerRegistry redisCacheCircuitBreakerRegistry() {
-        CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+    public CircuitBreakerRegistry redisCacheCircuitBreakerRegistry(CacheProperties properties) {
+        CacheProperties.CircuitBreaker overlay = properties.resilience() == null
+                ? null
+                : properties.resilience().circuitBreaker();
+        CircuitBreakerConfig defaultConfig = buildDefaultBreakerConfig(overlay);
+        CircuitBreakerRegistry registry = CircuitBreakerRegistry.of(defaultConfig);
+
+        // Pre-register breakers for every explicitly-configured cache. This
+        // validates per-cache overrides at startup (Resilience4j's builder
+        // throws on out-of-range values) and exposes metrics before first
+        // traffic. Caches that fall through to default-spec are still
+        // resolved lazily on first @Cacheable access.
+        CircuitBreakerFactory factory = new CircuitBreakerFactory(registry);
+        for (Map.Entry<String, CacheProperties.CacheSpec> entry : properties.caches().entrySet()) {
+            String name = entry.getKey();
+            CacheProperties.CacheSpec spec = entry.getValue();
+            if (spec == null) continue;
+            try {
+                factory.resolve(name, spec.circuitBreaker());
+            } catch (Exception e) {
+                throw new IllegalStateException(
+                        "Invalid circuit-breaker configuration for cache '" + name
+                                + "' (cache.caches." + name + ".circuit-breaker.*): " + e.getMessage(), e);
+            }
+        }
+        return registry;
+    }
+
+    private static CircuitBreakerConfig buildDefaultBreakerConfig(CacheProperties.CircuitBreaker overlay) {
+        CircuitBreakerConfig.Builder builder = CircuitBreakerConfig.custom()
                 .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
                 .slidingWindowSize(20)
                 .minimumNumberOfCalls(10)
@@ -197,15 +235,20 @@ public class CacheConfig {
                 .recordExceptions(
                         RedisException.class,
                         TimeoutException.class,
-                        java.net.ConnectException.class)
-                .build();
-        return CircuitBreakerRegistry.of(config);
-    }
+                        java.net.ConnectException.class);
 
-    @Bean
-    @ConditionalOnMissingBean(name = "redisCacheCircuitBreaker")
-    public CircuitBreaker redisCacheCircuitBreaker(CircuitBreakerRegistry registry) {
-        return registry.circuitBreaker("redis-cache");
+        if (overlay == null) return builder.build();
+
+        if (overlay.slidingWindowSize() != null) builder.slidingWindowSize(overlay.slidingWindowSize());
+        if (overlay.minimumNumberOfCalls() != null) builder.minimumNumberOfCalls(overlay.minimumNumberOfCalls());
+        if (overlay.failureRateThreshold() != null) builder.failureRateThreshold(overlay.failureRateThreshold());
+        if (overlay.slowCallDurationThreshold() != null) builder.slowCallDurationThreshold(overlay.slowCallDurationThreshold());
+        if (overlay.slowCallRateThreshold() != null) builder.slowCallRateThreshold(overlay.slowCallRateThreshold());
+        if (overlay.waitDurationInOpenState() != null) builder.waitDurationInOpenState(overlay.waitDurationInOpenState());
+        if (overlay.permittedNumberOfCallsInHalfOpenState() != null)
+            builder.permittedNumberOfCallsInHalfOpenState(overlay.permittedNumberOfCallsInHalfOpenState());
+
+        return builder.build();
     }
 
     @Bean
@@ -299,14 +342,14 @@ public class CacheConfig {
     @ConditionalOnMissingBean(CacheManager.class)
     public HybridCacheManager cacheManager(CacheProperties properties,
                                            RedissonClient redisson,
-                                           CircuitBreaker redisCacheCircuitBreaker,
+                                           CircuitBreakerRegistry circuitBreakerRegistry,
                                            InvalidationDispatcher invalidationDispatcher,
                                            MeterRegistry meterRegistry,
                                            CodecResolver codecResolver) {
         return new HybridCacheManager(
                 properties,
                 redisson,
-                redisCacheCircuitBreaker,
+                circuitBreakerRegistry,
                 invalidationDispatcher,
                 meterRegistry,
                 codecResolver);
@@ -322,12 +365,12 @@ public class CacheConfig {
     @ConditionalOnMissingBean(name = "hybridCacheHealthIndicator")
     public HybridCacheHealthIndicator hybridCacheHealthIndicator(
             RedissonClient redisson,
-            CircuitBreaker redisCacheCircuitBreaker,
+            CircuitBreakerRegistry circuitBreakerRegistry,
             HybridCacheManager cacheManager,
             CacheProperties properties) {
         return new HybridCacheHealthIndicator(
                 redisson,
-                redisCacheCircuitBreaker,
+                circuitBreakerRegistry,
                 cacheManager,
                 properties.health().pingTimeout());
     }

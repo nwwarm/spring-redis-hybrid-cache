@@ -2,6 +2,7 @@ package io.github.nwwarm;
 
 import com.github.benmanes.caffeine.cache.stats.CacheStats;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,22 +21,29 @@ import java.util.concurrent.TimeoutException;
 /**
  * Spring Boot Actuator {@link HealthIndicator} for the hybrid cache.
  *
- * <p>Reports the operational state of the L2 path: circuit breaker, Redis
- * reachability, and a per-cache snapshot of L1 stats.
+ * <p>Reports the operational state of the L2 path: per-cache circuit breaker
+ * state (one entry per cache name), Redis reachability, and a per-cache
+ * snapshot of L1 stats.
  *
  * <h2>Status mapping</h2>
+ *
+ * <p>Top-level status is the aggregate over every breaker registered for a
+ * cache:
  * <ul>
- *   <li>Breaker {@code CLOSED} + Redis ping success → {@link Status#UP}.</li>
- *   <li>Breaker {@code OPEN} or {@code FORCED_OPEN} → {@link Status#OUT_OF_SERVICE}.
- *       Reads still return cached values from L1; writes are suppressed.</li>
- *   <li>Breaker {@code HALF_OPEN} → {@link Status#UNKNOWN}. Trial calls in
- *       progress; the next few results determine whether the breaker
- *       closes or reopens.</li>
- *   <li>Breaker {@code CLOSED} but Redis ping fails → {@link Status#DOWN}.
- *       Either Redis is briefly unavailable but the breaker hasn't tripped
- *       yet, or the connection is too slow to complete inside the
- *       configured ping timeout.</li>
+ *   <li>Any breaker {@code OPEN} or {@code FORCED_OPEN} → {@link Status#OUT_OF_SERVICE}.</li>
+ *   <li>Else any breaker {@code HALF_OPEN} → {@link Status#UNKNOWN}.</li>
+ *   <li>Else all breakers {@code CLOSED}/{@code METRICS_ONLY}/{@code DISABLED}
+ *       and Redis ping success → {@link Status#UP}.</li>
+ *   <li>All breakers nominally CLOSED but Redis ping fails →
+ *       {@link Status#DOWN}. Either Redis is briefly unavailable but no
+ *       breaker has tripped yet, or the connection is too slow to complete
+ *       inside the configured ping timeout.</li>
  * </ul>
+ *
+ * <p>Each cache also reports its own breaker state under
+ * {@code details.caches.<name>.breakerState}, so dashboards can show which
+ * caches have lost L2 access without having to inspect every breaker
+ * separately.
  *
  * <p>The Redis ping is a single asynchronous {@code EXISTS} on a sentinel
  * key, bounded by the configured timeout (default 500ms). The timeout
@@ -50,57 +58,83 @@ public class HybridCacheHealthIndicator implements HealthIndicator {
     private static final String PING_KEY = "hybrid-cache:health-ping";
 
     private final RedissonClient redisson;
-    private final CircuitBreaker breaker;
+    private final CircuitBreakerRegistry breakerRegistry;
     private final HybridCacheManager cacheManager;
     private final Duration pingTimeout;
 
     public HybridCacheHealthIndicator(RedissonClient redisson,
-                                      CircuitBreaker breaker,
+                                      CircuitBreakerRegistry breakerRegistry,
                                       HybridCacheManager cacheManager,
                                       Duration pingTimeout) {
         this.redisson = redisson;
-        this.breaker = breaker;
+        this.breakerRegistry = breakerRegistry;
         this.cacheManager = cacheManager;
         this.pingTimeout = pingTimeout;
     }
 
     @Override
     public Health health() {
-        CircuitBreaker.State state = breaker.getState();
-        CircuitBreaker.Metrics metrics = breaker.getMetrics();
+        AggregateState aggregate = aggregateBreakerState();
 
-        Health.Builder builder = switch (state) {
+        Health.Builder builder = switch (aggregate.worst()) {
             case OPEN, FORCED_OPEN -> Health.outOfService();
             case HALF_OPEN -> Health.unknown();
             case CLOSED, METRICS_ONLY, DISABLED -> Health.up();
         };
 
-        builder.withDetail("breakerState", state.name())
-               .withDetail("breakerFailureRate", metrics.getFailureRate())
-               .withDetail("breakerSlowCallRate", metrics.getSlowCallRate());
-
         PingResult ping = pingRedis();
+        // If every breaker is nominally CLOSED but Redis is unreachable,
+        // downgrade to DOWN — the application is one slow call away from
+        // tripping and operators should know the L2 path is broken even if
+        // no breaker has caught up yet.
+        if (aggregate.allClosed() && !ping.reachable) {
+            builder = Health.down();
+        }
+
         builder.withDetail("redisPing", ping.label);
         if (ping.latencyMs >= 0) {
             builder.withDetail("redisPingMs", ping.latencyMs);
         }
-        // If the breaker reports closed but Redis is unreachable, downgrade
-        // to DOWN — the application is one slow call away from tripping and
-        // operators should know the L2 path is broken even if the breaker
-        // hasn't caught up yet.
-        if (state == CircuitBreaker.State.CLOSED && !ping.reachable) {
-            builder = Health.down()
-                    .withDetail("breakerState", state.name())
-                    .withDetail("breakerFailureRate", metrics.getFailureRate())
-                    .withDetail("breakerSlowCallRate", metrics.getSlowCallRate())
-                    .withDetail("redisPing", ping.label);
-            if (ping.latencyMs >= 0) {
-                builder.withDetail("redisPingMs", ping.latencyMs);
-            }
-        }
-
         builder.withDetail("caches", buildCacheDetails());
         return builder.build();
+    }
+
+    /**
+     * Worst breaker state across every cache, plus whether every breaker is in
+     * a nominally-closed state. Defaults to CLOSED + allClosed=true when no
+     * breakers have been registered yet (e.g., fresh context, no cache has
+     * been touched).
+     */
+    private record AggregateState(CircuitBreaker.State worst, boolean allClosed) {}
+
+    private AggregateState aggregateBreakerState() {
+        CircuitBreaker.State worst = CircuitBreaker.State.CLOSED;
+        boolean allClosed = true;
+        for (CircuitBreaker breaker : breakerRegistry.getAllCircuitBreakers()) {
+            CircuitBreaker.State state = breaker.getState();
+            if (!isNominallyClosed(state)) allClosed = false;
+            worst = worse(worst, state);
+        }
+        return new AggregateState(worst, allClosed);
+    }
+
+    private static boolean isNominallyClosed(CircuitBreaker.State state) {
+        return state == CircuitBreaker.State.CLOSED
+                || state == CircuitBreaker.State.METRICS_ONLY
+                || state == CircuitBreaker.State.DISABLED;
+    }
+
+    /** Severity ordering: OPEN/FORCED_OPEN > HALF_OPEN > CLOSED/METRICS_ONLY/DISABLED. */
+    private static CircuitBreaker.State worse(CircuitBreaker.State a, CircuitBreaker.State b) {
+        return rank(b) > rank(a) ? b : a;
+    }
+
+    private static int rank(CircuitBreaker.State state) {
+        return switch (state) {
+            case OPEN, FORCED_OPEN -> 2;
+            case HALF_OPEN -> 1;
+            case CLOSED, METRICS_ONLY, DISABLED -> 0;
+        };
     }
 
     private record PingResult(boolean reachable, long latencyMs, String label) {}
@@ -140,6 +174,16 @@ public class HybridCacheHealthIndicator implements HealthIndicator {
                 // DistributedOnlyCache has no L1 to report on.
                 entry.put("type", cache.getClass().getSimpleName());
             }
+            // Per-cache breaker state. Look up by the same name the cache
+            // registers under at construction. A LocalOnlyCache has no
+            // breaker, so we omit those fields rather than report a bogus
+            // CLOSED.
+            breakerRegistry.find(CircuitBreakerFactory.breakerName(name)).ifPresent(breaker -> {
+                CircuitBreaker.Metrics metrics = breaker.getMetrics();
+                entry.put("breakerState", breaker.getState().name());
+                entry.put("breakerFailureRate", metrics.getFailureRate());
+                entry.put("breakerSlowCallRate", metrics.getSlowCallRate());
+            });
             out.put(name, entry);
         }
         return out;

@@ -30,7 +30,8 @@ public record CacheProperties(
         String nodeId,
         List<String> allowedPackages,
         Kryo kryo,
-        Health health) {
+        Health health,
+        Resilience resilience) {
 
     private static final Logger log = LoggerFactory.getLogger(CacheProperties.class);
     private static final Set<String> WARNED_NAMES = ConcurrentHashMap.newKeySet();
@@ -40,6 +41,7 @@ public record CacheProperties(
         if (allowedPackages == null) allowedPackages = List.of();
         if (kryo == null) kryo = new Kryo(List.of());
         if (health == null) health = new Health(Duration.ofMillis(500));
+        if (resilience == null) resilience = new Resilience(null);
         if (defaultSpec == null) {
             defaultSpec = new CacheSpec(
                     Tier.NEAR_CACHE,
@@ -47,7 +49,8 @@ public record CacheProperties(
                     10_000,
                     Duration.ofSeconds(5),
                     Duration.ofSeconds(30),
-                    Codec.JSON);
+                    Codec.JSON,
+                    null);
         }
     }
 
@@ -173,13 +176,53 @@ public record CacheProperties(
         }
     }
 
+    /**
+     * Resilience-layer configuration. Currently scopes the circuit-breaker
+     * defaults that every per-cache breaker inherits from. Additional
+     * resilience primitives (bulkhead, rate limiter) can be added here without
+     * a top-level schema change.
+     */
+    public record Resilience(CircuitBreaker circuitBreaker) {}
+
+    /**
+     * Circuit-breaker configuration. Used in two places:
+     *
+     * <ul>
+     *   <li>{@code cache.resilience.circuit-breaker.*} — defaults that apply to
+     *       every per-cache breaker. Missing fields fall back to the library's
+     *       hardcoded defaults (sliding-window=20, min-calls=10,
+     *       failure-rate=50, slow-call-duration=500ms, slow-call-rate=80,
+     *       wait-in-open=30s, half-open-permitted=3).</li>
+     *   <li>{@code cache.caches.<name>.circuit-breaker.*} — per-cache overlay.
+     *       Any field set here overrides the corresponding default; unset
+     *       fields inherit.</li>
+     * </ul>
+     *
+     * <p>All fields are boxed so {@code null} can mean "inherit" — a primitive
+     * default of 0 would be ambiguous with a deliberate 0 (and would fail
+     * Resilience4j's own range checks anyway).
+     *
+     * <p>{@code recordExceptions} is intentionally not exposed — it is a
+     * property of what "Redis is unhealthy" means (see README), not a
+     * per-deployment knob.
+     */
+    public record CircuitBreaker(
+            Integer slidingWindowSize,
+            Integer minimumNumberOfCalls,
+            Float failureRateThreshold,
+            Duration slowCallDurationThreshold,
+            Float slowCallRateThreshold,
+            Duration waitDurationInOpenState,
+            Integer permittedNumberOfCallsInHalfOpenState) {}
+
     public record CacheSpec(
             Tier tier,
             Duration ttl,
             long maximumSize,
             Duration lockWait,
             Duration lockLease,
-            Codec codec) {
+            Codec codec,
+            CircuitBreaker circuitBreaker) {
 
         public CacheSpec {
             if (tier == null) tier = Tier.NEAR_CACHE;

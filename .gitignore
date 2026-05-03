@@ -10,3 +10,4 @@ out/
 # OS files (optional but recommended)
 .DS_Store
 Thumbs.db
+/DESIGN.md

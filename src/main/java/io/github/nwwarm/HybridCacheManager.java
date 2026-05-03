@@ -2,6 +2,7 @@ package io.github.nwwarm;
 
 import com.github.benmanes.caffeine.cache.Caffeine;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.Nonnull;
 import org.redisson.api.RedissonClient;
@@ -26,12 +27,16 @@ import java.util.concurrent.CopyOnWriteArrayList;
  * resolves through Spring's default {@code SimpleCacheResolver}, which calls
  * this manager — so a single bean replaces the previous
  * {@code CacheResolver} + {@code CacheManager} pair.
+ *
+ * <p>Each cache resolves its own {@link CircuitBreaker} from the shared
+ * {@link CircuitBreakerRegistry} at construction time so a noisy cache trips
+ * only its own breaker, leaving every other cache's L2 path open.
  */
 public class HybridCacheManager extends AbstractCacheManager implements DisposableBean {
 
     private final CacheProperties properties;
     private final RedissonClient redisson;
-    private final CircuitBreaker breaker;
+    private final CircuitBreakerFactory breakerFactory;
     private final InvalidationDispatcher dispatcher;
     private final MeterRegistry meterRegistry;
     private final CodecResolver codecResolver;
@@ -40,7 +45,7 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
 
     public HybridCacheManager(CacheProperties properties,
                               RedissonClient redisson,
-                              CircuitBreaker breaker,
+                              CircuitBreakerRegistry circuitBreakerRegistry,
                               InvalidationDispatcher dispatcher,
                               MeterRegistry meterRegistry,
                               CodecResolver codecResolver) {
@@ -50,7 +55,7 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
         properties.caches().keySet().forEach(CacheKeys::validateCacheName);
         this.properties = properties;
         this.redisson = redisson;
-        this.breaker = breaker;
+        this.breakerFactory = new CircuitBreakerFactory(circuitBreakerRegistry);
         this.dispatcher = dispatcher;
         this.meterRegistry = meterRegistry;
         this.codecResolver = codecResolver;
@@ -73,9 +78,12 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
         org.redisson.client.codec.Codec bucketCodec = codecResolver.resolve(spec.codec());
         return switch (spec.tier()) {
             case LOCAL_ONLY -> new LocalOnlyCache(buildCaffeineCache(name, spec), meterRegistry);
-            case DISTRIBUTED_ONLY ->
-                    new DistributedOnlyCache(name, spec, bucketCodec, redisson, breaker, meterRegistry);
+            case DISTRIBUTED_ONLY -> {
+                CircuitBreaker breaker = breakerFactory.resolve(name, spec.circuitBreaker());
+                yield new DistributedOnlyCache(name, spec, bucketCodec, redisson, breaker, meterRegistry);
+            }
             case NEAR_CACHE -> {
+                CircuitBreaker breaker = breakerFactory.resolve(name, spec.circuitBreaker());
                 NearCache near = new NearCache(
                         buildCaffeineCache(name, spec),
                         spec, bucketCodec, redisson, breaker, dispatcher, meterRegistry);

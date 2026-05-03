@@ -450,4 +450,8 @@ public class NearCache implements Cache {
         }
         return CacheStats.empty();
     }
+
+    CircuitBreaker getBreaker() {
+        return breaker;
+    }
 }
