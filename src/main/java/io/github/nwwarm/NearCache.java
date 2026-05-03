@@ -58,7 +58,7 @@ import java.util.concurrent.atomic.AtomicLong;
 public class NearCache implements Cache {
 
     private static final Logger log = LoggerFactory.getLogger(NearCache.class);
-    private static final long GENERATION_REFRESH_MS = 1000;
+    private static final long GENERATION_REFRESH_NANOS = 1_000_000_000L; // 1s
 
     private final Cache caffeineCache;
     private final String cacheName;
@@ -71,7 +71,9 @@ public class NearCache implements Cache {
     // Generation counter for O(1) clear
     private final RAtomicLong distributedGeneration;
     private final AtomicLong localGeneration = new AtomicLong(0);
-    private volatile long lastGenerationRefresh = 0;
+    // CAS-guarded: the first thread past the staleness check wins the right
+    // to refresh; all others return the cached local generation.
+    private final AtomicLong lastRefreshNanos = new AtomicLong(0);
 
     // Metrics
     private final Counter l2Hits;
@@ -120,7 +122,7 @@ public class NearCache implements Cache {
     private void initializeGeneration() {
         try {
             breaker.executeRunnable(() -> localGeneration.set(distributedGeneration.get()));
-            lastGenerationRefresh = System.currentTimeMillis();
+            lastRefreshNanos.set(System.nanoTime());
         } catch (Exception e) {
             log.warn("Failed to initialize generation for cache '{}'; defaulting to 0", cacheName, e);
         }
@@ -389,14 +391,20 @@ public class NearCache implements Cache {
     // ---------- Generation counter ----------
 
     private long currentGeneration() {
-        long now = System.currentTimeMillis();
-        if (now - lastGenerationRefresh > GENERATION_REFRESH_MS) {
-            try {
-                breaker.executeRunnable(() -> localGeneration.set(distributedGeneration.get()));
-                lastGenerationRefresh = now;
-            } catch (Exception e) {
-                // Use stale local generation; cache stays usable.
-            }
+        long observed = lastRefreshNanos.get();
+        long now = System.nanoTime();
+        if (now - observed < GENERATION_REFRESH_NANOS) return localGeneration.get();
+        // Only the thread that wins the CAS proceeds with the Redis round-trip;
+        // all others return the previously-cached generation, which is correct
+        // since the refresh hasn't completed yet by definition.
+        if (!lastRefreshNanos.compareAndSet(observed, now)) return localGeneration.get();
+        try {
+            breaker.executeRunnable(() -> localGeneration.set(distributedGeneration.get()));
+        } catch (Exception e) {
+            // Refresh failed — reset so the next call retries rather than
+            // waiting a full interval on stale data. CAS ensures we only
+            // reset if nothing else (e.g. bumpGeneration) has written since.
+            lastRefreshNanos.compareAndSet(now, observed);
         }
         return localGeneration.get();
     }
@@ -405,7 +413,7 @@ public class NearCache implements Cache {
         try {
             Long newGen = breaker.executeSupplier(distributedGeneration::incrementAndGet);
             localGeneration.set(newGen);
-            lastGenerationRefresh = System.currentTimeMillis();
+            lastRefreshNanos.set(System.nanoTime());
         } catch (Exception e) {
             l2Failures.increment();
             log.warn("Generation bump failed; clear visible only locally on '{}'", cacheName, e);
@@ -429,7 +437,7 @@ public class NearCache implements Cache {
             case InvalidationMessage.OP_INVALIDATE -> caffeineCache.evict(key);
             case InvalidationMessage.OP_CLEAR -> {
                 caffeineCache.clear();
-                lastGenerationRefresh = 0;  // force generation refresh on next read
+                lastRefreshNanos.set(0);  // force generation refresh on next read
                 currentGeneration();
             }
             default -> log.warn("Unknown invalidation op '{}' on cache '{}'", op, cacheName);
@@ -449,6 +457,10 @@ public class NearCache implements Cache {
             return native_.stats();
         }
         return CacheStats.empty();
+    }
+
+    void forceRefreshDue() {
+        lastRefreshNanos.set(0);
     }
 
     CircuitBreaker getBreaker() {

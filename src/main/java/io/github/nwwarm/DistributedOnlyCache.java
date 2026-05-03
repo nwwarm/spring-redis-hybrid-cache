@@ -59,7 +59,7 @@ import java.util.concurrent.atomic.AtomicLong;
 public class DistributedOnlyCache implements Cache {
 
     private static final Logger log = LoggerFactory.getLogger(DistributedOnlyCache.class);
-    private static final long GENERATION_REFRESH_MS = 1000;
+    private static final long GENERATION_REFRESH_NANOS = 1_000_000_000L; // 1s
 
     private final String cacheName;
     private final CacheProperties.CacheSpec spec;
@@ -69,7 +69,7 @@ public class DistributedOnlyCache implements Cache {
 
     private final RAtomicLong distributedGeneration;
     private final AtomicLong localGeneration = new AtomicLong(0);
-    private volatile long lastGenerationRefresh = 0;
+    private final AtomicLong lastRefreshNanos = new AtomicLong(0);
 
     /** In-flight loads, used for local single-flight when there is no L1 to lean on. */
     private final ConcurrentMap<Object, CompletableFuture<Object>> inflight = new ConcurrentHashMap<>();
@@ -95,7 +95,7 @@ public class DistributedOnlyCache implements Cache {
 
         try {
             breaker.executeRunnable(() -> localGeneration.set(distributedGeneration.get()));
-            lastGenerationRefresh = System.currentTimeMillis();
+            lastRefreshNanos.set(System.nanoTime());
         } catch (Exception e) {
             log.warn("Failed to initialize generation for cache '{}'", cacheName, e);
         }
@@ -280,7 +280,7 @@ public class DistributedOnlyCache implements Cache {
         try {
             Long newGen = breaker.executeSupplier(distributedGeneration::incrementAndGet);
             localGeneration.set(newGen);
-            lastGenerationRefresh = System.currentTimeMillis();
+            lastRefreshNanos.set(System.nanoTime());
         } catch (Exception e) {
             failures.increment();
             log.warn("Distributed clear (generation bump) failed for cache '{}'", cacheName, e);
@@ -321,16 +321,20 @@ public class DistributedOnlyCache implements Cache {
     }
 
     private long currentGeneration() {
-        long now = System.currentTimeMillis();
-        if (now - lastGenerationRefresh > GENERATION_REFRESH_MS) {
-            try {
-                breaker.executeRunnable(() -> localGeneration.set(distributedGeneration.get()));
-                lastGenerationRefresh = now;
-            } catch (Exception e) {
-                // Use stale generation
-            }
+        long observed = lastRefreshNanos.get();
+        long now = System.nanoTime();
+        if (now - observed < GENERATION_REFRESH_NANOS) return localGeneration.get();
+        if (!lastRefreshNanos.compareAndSet(observed, now)) return localGeneration.get();
+        try {
+            breaker.executeRunnable(() -> localGeneration.set(distributedGeneration.get()));
+        } catch (Exception e) {
+            lastRefreshNanos.compareAndSet(now, observed);
         }
         return localGeneration.get();
+    }
+
+    void forceRefreshDue() {
+        lastRefreshNanos.set(0);
     }
 
     CircuitBreaker getBreaker() {
