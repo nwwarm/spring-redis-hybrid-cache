@@ -40,6 +40,7 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
     private final InvalidationDispatcher dispatcher;
     private final MeterRegistry meterRegistry;
     private final CodecResolver codecResolver;
+    private final KeyLogFormatter keyLogFormatter;
 
     private final List<NearCache> nearCaches = new CopyOnWriteArrayList<>();
 
@@ -48,7 +49,8 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
                               CircuitBreakerRegistry circuitBreakerRegistry,
                               InvalidationDispatcher dispatcher,
                               MeterRegistry meterRegistry,
-                              CodecResolver codecResolver) {
+                              CodecResolver codecResolver,
+                              KeyLogFormatter keyLogFormatter) {
         // Fail fast on configured cache names that contain ':'. Names that
         // fall through to defaultSpec (i.e., not listed in cache.caches.*)
         // are validated lazily in getMissingCache.
@@ -59,6 +61,7 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
         this.dispatcher = dispatcher;
         this.meterRegistry = meterRegistry;
         this.codecResolver = codecResolver;
+        this.keyLogFormatter = keyLogFormatter;
     }
 
     @Override
@@ -80,13 +83,13 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
             case LOCAL_ONLY -> new LocalOnlyCache(buildCaffeineCache(name, spec), meterRegistry);
             case DISTRIBUTED_ONLY -> {
                 CircuitBreaker breaker = breakerFactory.resolve(name, spec.circuitBreaker());
-                yield new DistributedOnlyCache(name, spec, bucketCodec, redisson, breaker, meterRegistry);
+                yield new DistributedOnlyCache(name, spec, bucketCodec, redisson, breaker, meterRegistry, keyLogFormatter);
             }
             case NEAR_CACHE -> {
                 CircuitBreaker breaker = breakerFactory.resolve(name, spec.circuitBreaker());
                 NearCache near = new NearCache(
                         buildCaffeineCache(name, spec),
-                        spec, bucketCodec, redisson, breaker, dispatcher, meterRegistry);
+                        spec, bucketCodec, redisson, breaker, dispatcher, meterRegistry, keyLogFormatter);
                 nearCaches.add(near);
                 yield near;
             }

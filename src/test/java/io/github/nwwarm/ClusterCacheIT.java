@@ -119,7 +119,7 @@ class ClusterCacheIT {
                 null);
         CacheProperties props = new CacheProperties(
                 server, null, null, "cluster-it",
-                List.of("io.github.nwwarm."), null, null, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null);
         return new CacheConfig().redissonClient(props);
     }
 
@@ -139,7 +139,7 @@ class ClusterCacheIT {
         CircuitBreaker breaker = CircuitBreakerRegistry.ofDefaults()
                 .circuitBreaker("cluster-test-" + System.nanoTime());
         return new NearCache(springCache, spec, null, client, breaker, dispatcher,
-                new SimpleMeterRegistry());
+                new SimpleMeterRegistry(), new KeyLogFormatter(false, "test"));
     }
 
     @Test

@@ -145,7 +145,8 @@ class CircuitBreakerPerCacheTest {
                 java.util.List.of("io.github.nwwarm."),
                 null,
                 null,
-                null);
+                null,
+                false, null);
 
         CircuitBreakerRegistry registry = new CacheConfig().redisCacheCircuitBreakerRegistry(props);
 
@@ -189,6 +190,6 @@ class CircuitBreakerPerCacheTest {
                 CacheProperties.Codec.JSON,
                 null);
         return new NearCache(springCache, spec, null, redisson, breaker, dispatcher,
-                new SimpleMeterRegistry());
+                new SimpleMeterRegistry(), new KeyLogFormatter(false, "test"));
     }
 }

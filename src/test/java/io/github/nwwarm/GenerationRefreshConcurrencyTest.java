@@ -85,7 +85,8 @@ class GenerationRefreshConcurrencyTest {
 
         NearCache cache = new NearCache(
                 caffeineCache("near-test"),
-                spec(), null, redisson, breaker, dispatcher, new SimpleMeterRegistry());
+                spec(), null, redisson, breaker, dispatcher, new SimpleMeterRegistry(),
+                new KeyLogFormatter(false, "test"));
 
         // Construction called distributedGeneration.get() once (initializeGeneration).
         // Reset the counter and force a refresh to be due before the concurrent phase.
@@ -106,7 +107,8 @@ class GenerationRefreshConcurrencyTest {
         CircuitBreaker breaker = CircuitBreakerRegistry.ofDefaults().circuitBreaker("test-dist");
 
         DistributedOnlyCache cache = new DistributedOnlyCache(
-                "dist-test", spec(), null, redisson, breaker, new SimpleMeterRegistry());
+                "dist-test", spec(), null, redisson, breaker, new SimpleMeterRegistry(),
+                new KeyLogFormatter(false, "test"));
 
         getCallCount.set(0);
         cache.forceRefreshDue();

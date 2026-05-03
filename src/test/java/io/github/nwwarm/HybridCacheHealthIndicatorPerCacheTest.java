@@ -50,12 +50,13 @@ class HybridCacheHealthIndicatorPerCacheTest {
                         Map.of(),
                         null, "test-node",
                         java.util.List.of("io.github.nwwarm."),
-                        null, null, null),
+                        null, null, null, false, null),
                 redisson,
                 registry,
                 dispatcher,
                 new SimpleMeterRegistry(),
-                new CodecResolver(null)) {
+                new CodecResolver(null),
+                new KeyLogFormatter(false, "test")) {
             @Override
             public java.util.Collection<String> getCacheNames() {
                 return java.util.List.of("a", "b");
@@ -102,6 +103,6 @@ class HybridCacheHealthIndicatorPerCacheTest {
                 CacheProperties.Codec.JSON,
                 null);
         return new NearCache(springCache, spec, null, redisson, breaker, dispatcher,
-                new SimpleMeterRegistry());
+                new SimpleMeterRegistry(), new KeyLogFormatter(false, "test"));
     }
 }

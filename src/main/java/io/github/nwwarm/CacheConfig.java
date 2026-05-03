@@ -341,20 +341,28 @@ public class CacheConfig {
     }
 
     @Bean
+    @ConditionalOnMissingBean
+    KeyLogFormatter keyLogFormatter(CacheProperties properties) {
+        return new KeyLogFormatter(properties.logKeys(), properties.logKeySalt());
+    }
+
+    @Bean
     @ConditionalOnMissingBean(CacheManager.class)
     public HybridCacheManager cacheManager(CacheProperties properties,
                                            RedissonClient redisson,
                                            CircuitBreakerRegistry circuitBreakerRegistry,
                                            InvalidationDispatcher invalidationDispatcher,
                                            MeterRegistry meterRegistry,
-                                           CodecResolver codecResolver) {
+                                           CodecResolver codecResolver,
+                                           KeyLogFormatter keyLogFormatter) {
         return new HybridCacheManager(
                 properties,
                 redisson,
                 circuitBreakerRegistry,
                 invalidationDispatcher,
                 meterRegistry,
-                codecResolver);
+                codecResolver,
+                keyLogFormatter);
     }
 
     /**

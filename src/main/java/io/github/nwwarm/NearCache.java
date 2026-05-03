@@ -67,6 +67,7 @@ public class NearCache implements Cache {
     private final CircuitBreaker breaker;
     private final InvalidationDispatcher dispatcher;
     private final Codec bucketCodec;
+    private final KeyLogFormatter keyLogFormatter;
 
     // Generation counter for O(1) clear
     private final RAtomicLong distributedGeneration;
@@ -88,7 +89,8 @@ public class NearCache implements Cache {
                      RedissonClient redisson,
                      CircuitBreaker breaker,
                      InvalidationDispatcher dispatcher,
-                     MeterRegistry meterRegistry) {
+                     MeterRegistry meterRegistry,
+                     KeyLogFormatter keyLogFormatter) {
         this.caffeineCache = caffeineCache;
         this.cacheName = caffeineCache.getName();
         this.spec = spec;
@@ -96,6 +98,7 @@ public class NearCache implements Cache {
         this.breaker = breaker;
         this.dispatcher = dispatcher;
         this.bucketCodec = bucketCodec;
+        this.keyLogFormatter = keyLogFormatter;
 
         this.distributedGeneration = redisson.getAtomicLong(cacheName + ":generation");
         initializeGeneration();
@@ -258,7 +261,7 @@ public class NearCache implements Cache {
             throw new LoaderException(e);
         } catch (Exception e) {
             // Redis-side failure during lock acquisition. Local single-flight remains.
-            log.debug("Distributed lock acquisition failed for key '{}'; proceeding with local single-flight only", key, e);
+            log.debug("Distributed lock acquisition failed for key '{}'; proceeding with local single-flight only", keyLogFormatter.format(key), e);
         }
 
         try {
@@ -273,7 +276,7 @@ public class NearCache implements Cache {
                 try {
                     lock.unlock();
                 } catch (Exception e) {
-                    log.warn("Failed to unlock {}", lock.getName(), e);
+                    log.warn("Failed to unlock cache='{}' key={}", cacheName, keyLogFormatter.format(key), e);
                 }
             }
         }
@@ -347,7 +350,7 @@ public class NearCache implements Cache {
             return null;
         } catch (Exception e) {
             l2Failures.increment();
-            log.warn("L2 read failed for key '{}'; degrading to local-only", key, e);
+            log.warn("L2 read failed for key '{}'; degrading to local-only", keyLogFormatter.format(key), e);
             return null;
         }
     }
@@ -361,7 +364,7 @@ public class NearCache implements Cache {
             // Acceptable for a cache; bounded by TTL.
         } catch (Exception e) {
             l2Failures.increment();
-            log.warn("L2 write failed for key '{}'; cross-node incoherence until TTL", key, e);
+            log.warn("L2 write failed for key '{}'; cross-node incoherence until TTL", keyLogFormatter.format(key), e);
         }
     }
 
@@ -379,11 +382,11 @@ public class NearCache implements Cache {
             return true;
         } catch (CallNotPermittedException e) {
             l2BreakerOpen.increment();
-            log.warn("L2 evict failed for key '{}' (breaker open); cross-node coherence not guaranteed until TTL", key);
+            log.warn("L2 evict failed for key '{}' (breaker open); cross-node coherence not guaranteed until TTL", keyLogFormatter.format(key));
             return false;
         } catch (Exception e) {
             l2Failures.increment();
-            log.warn("L2 evict failed for key '{}'; cross-node coherence not guaranteed until TTL", key, e);
+            log.warn("L2 evict failed for key '{}'; cross-node coherence not guaranteed until TTL", keyLogFormatter.format(key), e);
             return false;
         }
     }

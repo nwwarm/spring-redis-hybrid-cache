@@ -139,7 +139,7 @@ class SentinelCacheIT {
                 null);
         CacheProperties props = new CacheProperties(
                 server, null, null, "sentinel-it",
-                List.of("io.github.nwwarm."), null, null, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null);
         return new CacheConfig().redissonClient(props);
     }
 
@@ -159,7 +159,7 @@ class SentinelCacheIT {
         CircuitBreaker breaker = CircuitBreakerRegistry.ofDefaults()
                 .circuitBreaker("sentinel-test-" + System.nanoTime());
         return new NearCache(springCache, spec, null, client, breaker, dispatcher,
-                new SimpleMeterRegistry());
+                new SimpleMeterRegistry(), new KeyLogFormatter(false, "test"));
     }
 
     @Test

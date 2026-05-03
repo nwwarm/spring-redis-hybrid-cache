@@ -152,7 +152,7 @@ class CacheSpecValidatorTest {
                 server(), Map.of("tokens", kryo), defaultSpec(), null,
                 List.of("io.github.nwwarm."),
                 new CacheProperties.Kryo(List.of("java.lang.String")),
-                null, null);
+                null, null, false, null);
         assertThatNoException().isThrownBy(() -> CacheSpecValidator.validate(props));
     }
 
@@ -243,7 +243,7 @@ class CacheSpecValidatorTest {
         CacheProperties props = new CacheProperties(
                 server(), Map.of(), defaultSpec(), null,
                 List.of("io.github.nwwarm."), null, null,
-                new CacheProperties.Resilience(badGlobal));
+                new CacheProperties.Resilience(badGlobal), false, null);
         assertViolation(props, "global circuit-breaker defaults", "failure-rate-threshold");
     }
 
@@ -308,18 +308,18 @@ class CacheSpecValidatorTest {
 
     private static CacheProperties minimalValidProperties() {
         return new CacheProperties(server(), Map.of(), defaultSpec(), null,
-                List.of("io.github.nwwarm."), null, null, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null);
     }
 
     private static CacheProperties propertiesWithCaches(
             Map<String, CacheProperties.CacheSpec> caches) {
         return new CacheProperties(server(), caches, defaultSpec(), null,
-                List.of("io.github.nwwarm."), null, null, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null);
     }
 
     private static CacheProperties propertiesWithDefaultSpec(CacheProperties.CacheSpec defaultSpec) {
         return new CacheProperties(server(), Map.of(), defaultSpec, null,
-                List.of("io.github.nwwarm."), null, null, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null);
     }
 
     private static CacheProperties.Server server() {

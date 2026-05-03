@@ -31,7 +31,9 @@ public record CacheProperties(
         List<String> allowedPackages,
         Kryo kryo,
         Health health,
-        Resilience resilience) {
+        Resilience resilience,
+        boolean logKeys,
+        String logKeySalt) {
 
     private static final Logger log = LoggerFactory.getLogger(CacheProperties.class);
     private static final Set<String> WARNED_NAMES = ConcurrentHashMap.newKeySet();

@@ -66,6 +66,7 @@ public class DistributedOnlyCache implements Cache {
     private final RedissonClient redisson;
     private final CircuitBreaker breaker;
     private final Codec bucketCodec;
+    private final KeyLogFormatter keyLogFormatter;
 
     private final RAtomicLong distributedGeneration;
     private final AtomicLong localGeneration = new AtomicLong(0);
@@ -85,12 +86,14 @@ public class DistributedOnlyCache implements Cache {
                                 Codec bucketCodec,
                                 RedissonClient redisson,
                                 CircuitBreaker breaker,
-                                MeterRegistry meterRegistry) {
+                                MeterRegistry meterRegistry,
+                                KeyLogFormatter keyLogFormatter) {
         this.cacheName = cacheName;
         this.spec = spec;
         this.redisson = redisson;
         this.breaker = breaker;
         this.bucketCodec = bucketCodec;
+        this.keyLogFormatter = keyLogFormatter;
         this.distributedGeneration = redisson.getAtomicLong(cacheName + ":generation");
 
         try {
@@ -223,7 +226,7 @@ public class DistributedOnlyCache implements Cache {
             Thread.currentThread().interrupt();
             throw new ValueRetrievalException(key, valueLoader, e);
         } catch (Exception e) {
-            log.debug("Distributed lock acquisition failed for key '{}'; proceeding with local single-flight only", key, e);
+            log.debug("Distributed lock acquisition failed for key '{}'; proceeding with local single-flight only", keyLogFormatter.format(key), e);
         }
 
         try {
@@ -238,7 +241,7 @@ public class DistributedOnlyCache implements Cache {
                 try {
                     lock.unlock();
                 } catch (Exception e) {
-                    log.warn("Failed to unlock {}", lock.getName(), e);
+                    log.warn("Failed to unlock cache='{}' key={}", cacheName, keyLogFormatter.format(key), e);
                 }
             }
         }
@@ -258,7 +261,7 @@ public class DistributedOnlyCache implements Cache {
             // Distributed-only + Redis down = no caching this call. Caller hits source on next read.
         } catch (Exception e) {
             failures.increment();
-            log.warn("Distributed put failed for key '{}'", key, e);
+            log.warn("Distributed put failed for key '{}'", keyLogFormatter.format(key), e);
         }
     }
 
@@ -271,7 +274,7 @@ public class DistributedOnlyCache implements Cache {
             breakerOpen.increment();
         } catch (Exception e) {
             failures.increment();
-            log.warn("Distributed evict failed for key '{}'", stringKey, e);
+            log.warn("Distributed evict failed for key '{}'", keyLogFormatter.format(stringKey), e);
         }
     }
 
@@ -308,7 +311,7 @@ public class DistributedOnlyCache implements Cache {
             return null;
         } catch (Exception e) {
             failures.increment();
-            log.warn("Distributed read failed for key '{}'", key, e);
+            log.warn("Distributed read failed for key '{}'", keyLogFormatter.format(key), e);
             return null;
         }
     }
