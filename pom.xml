@@ -6,7 +6,7 @@
 
     <groupId>io.github.nwwarm</groupId>
     <artifactId>hybrid-cache-spring-boot-starter</artifactId>
-    <version>0.2.0</version>
+    <version>0.3.0</version>
     <name>spring-redis-hybrid-cache</name>
     <description>Three-tier cache library: local-only, distributed-only, or near-cache (Caffeine + Redisson)</description>
     <url>https://github.com/nwwarm/spring-redis-hybrid-cache</url>
