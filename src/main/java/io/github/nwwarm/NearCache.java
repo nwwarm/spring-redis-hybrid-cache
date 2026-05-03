@@ -68,6 +68,7 @@ public class NearCache implements Cache, InvalidationListener {
     private final InvalidationDispatcher dispatcher;
     private final Codec bucketCodec;
     private final KeyLogFormatter keyLogFormatter;
+    private final LoaderGate loaderGate;
 
     // Generation counter for O(1) clear
     private final RAtomicLong distributedGeneration;
@@ -100,6 +101,8 @@ public class NearCache implements Cache, InvalidationListener {
         this.dispatcher = dispatcher;
         this.bucketCodec = bucketCodec;
         this.keyLogFormatter = keyLogFormatter;
+        this.loaderGate = new LoaderGate(cacheName,
+                spec.maxConcurrentLoaders(), spec.loaderAcquireTimeout(), meterRegistry);
 
         this.distributedGeneration = redisson.getAtomicLong(cacheName + ":generation");
         initializeGeneration();
@@ -268,7 +271,7 @@ public class NearCache implements Cache, InvalidationListener {
         }
 
         try {
-            Object value = valueLoader.call();
+            Object value = loaderGate.run(key, valueLoader);
             writeToL2(key, value);
             // Cold-load completion: do NOT publish.
             //
@@ -294,6 +297,12 @@ public class NearCache implements Cache, InvalidationListener {
             // state, so remote L1 copies must be invalidated.
             invalidationsSuppressedColdLoad.increment();
             return value;
+        } catch (LoaderRejectedException e) {
+            // Surface backpressure as itself; do NOT wrap in LoaderException
+            // (which the outer get(key, valueLoader) translates into a
+            // ValueRetrievalException — the wrong type for callers that want
+            // to distinguish "loader rejected" from "loader failed").
+            throw e;
         } catch (Throwable t) {
             throw new LoaderException(t);
         } finally {

@@ -131,7 +131,7 @@ public abstract class RedisTestBase {
                                      Duration lockLease) {
         CacheProperties.CacheSpec spec = new CacheProperties.CacheSpec(
                 CacheProperties.Tier.NEAR_CACHE,
-                ttl, 10_000, lockWait, lockLease, codec, null);
+                ttl, 10_000, lockWait, lockLease, codec, null, null, null);
 
         com.github.benmanes.caffeine.cache.Cache<Object, Object> caffeineNative = Caffeine.newBuilder()
                 .expireAfterWrite(ttl)
@@ -158,7 +158,7 @@ public abstract class RedisTestBase {
                 CacheProperties.Tier.DISTRIBUTED_ONLY,
                 Duration.ofMinutes(10), 10_000,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
-                CacheProperties.Codec.JSON, null);
+                CacheProperties.Codec.JSON, null, null, null);
         InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, nodeId);
         return new DistributedOnlyCache(name, spec, resolveTestCodec(spec.codec()),
                 redisson, breaker, dispatcher, new SimpleMeterRegistry(),

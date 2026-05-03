@@ -52,6 +52,8 @@ public record CacheProperties(
                     Duration.ofSeconds(5),
                     Duration.ofSeconds(30),
                     Codec.JSON,
+                    null,
+                    null,
                     null);
         }
     }
@@ -224,7 +226,9 @@ public record CacheProperties(
             Duration lockWait,
             Duration lockLease,
             Codec codec,
-            CircuitBreaker circuitBreaker) {
+            CircuitBreaker circuitBreaker,
+            Integer maxConcurrentLoaders,
+            Duration loaderAcquireTimeout) {
 
         public CacheSpec {
             if (tier == null) tier = Tier.NEAR_CACHE;
@@ -233,6 +237,11 @@ public record CacheProperties(
             if (lockWait == null) lockWait = Duration.ofSeconds(5);
             if (lockLease == null) lockLease = Duration.ofSeconds(30);
             if (codec == null) codec = Codec.JSON;
+            // maxConcurrentLoaders null = unlimited (back-compat default).
+            // loaderAcquireTimeout defaults to lockWait so users who only set
+            // maxConcurrentLoaders get a sensible wait without an extra knob,
+            // but the two are independently overridable.
+            if (loaderAcquireTimeout == null) loaderAcquireTimeout = lockWait;
         }
     }
 

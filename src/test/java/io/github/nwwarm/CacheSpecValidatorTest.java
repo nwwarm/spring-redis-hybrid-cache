@@ -332,7 +332,7 @@ class CacheSpecValidatorTest {
         return new CacheProperties.CacheSpec(
                 CacheProperties.Tier.NEAR_CACHE, Duration.ofHours(1), 10_000,
                 Duration.ofSeconds(5), Duration.ofSeconds(30),
-                CacheProperties.Codec.JSON, null);
+                CacheProperties.Codec.JSON, null, null, null);
     }
 
     private static CacheProperties.CacheSpec spec(
@@ -340,7 +340,7 @@ class CacheSpecValidatorTest {
             Duration lockWait, Duration lockLease,
             CacheProperties.Codec codec, CacheProperties.CircuitBreaker cb) {
         return new CacheProperties.CacheSpec(
-                tier, ttl, 10_000, lockWait, lockLease, codec, cb);
+                tier, ttl, 10_000, lockWait, lockLease, codec, cb, null, null);
     }
 
     private static CacheProperties.CacheSpec specWithCb(CacheProperties.CircuitBreaker cb) {

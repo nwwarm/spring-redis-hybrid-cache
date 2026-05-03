@@ -143,6 +143,23 @@ final class CacheSpecValidator {
             }
         }
 
+        // E13: max-concurrent-loaders, when set, must be > 0.
+        if (spec.maxConcurrentLoaders() != null && spec.maxConcurrentLoaders() <= 0) {
+            violations.add(label + ": max-concurrent-loaders must be > 0 when set"
+                    + " (got " + spec.maxConcurrentLoaders() + "); leave unset for unlimited");
+        }
+
+        // E14: loader-acquire-timeout must be > 0 when the gate is actually
+        // in use. With max-concurrent-loaders unset, the timeout is not
+        // consulted, so a zero default cascaded from lockWait=0 is harmless.
+        if (spec.maxConcurrentLoaders() != null
+                && spec.loaderAcquireTimeout() != null
+                && (spec.loaderAcquireTimeout().isZero()
+                    || spec.loaderAcquireTimeout().isNegative())) {
+            violations.add(label + ": loader-acquire-timeout must be positive when"
+                    + " max-concurrent-loaders is set (got " + spec.loaderAcquireTimeout() + ")");
+        }
+
         // W1
         if (spec.tier() == CacheProperties.Tier.LOCAL_ONLY && spec.circuitBreaker() != null) {
             log.warn("{}: circuit-breaker overrides have no effect on tier=LOCAL_ONLY"

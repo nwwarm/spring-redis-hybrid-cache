@@ -81,7 +81,8 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
         CacheProperties.CacheSpec spec = properties.specFor(name);
         org.redisson.client.codec.Codec bucketCodec = codecResolver.resolve(spec.codec());
         return switch (spec.tier()) {
-            case LOCAL_ONLY -> new LocalOnlyCache(buildCaffeineCache(name, spec), meterRegistry);
+            case LOCAL_ONLY -> new LocalOnlyCache(buildCaffeineCache(name, spec),
+                    spec.maxConcurrentLoaders(), spec.loaderAcquireTimeout(), meterRegistry);
             case DISTRIBUTED_ONLY -> {
                 CircuitBreaker breaker = breakerFactory.resolve(name, spec.circuitBreaker());
                 DistributedOnlyCache distributed = new DistributedOnlyCache(

@@ -81,6 +81,7 @@ public class DistributedOnlyCache implements Cache, InvalidationListener {
     private final Counter failures;
     private final Counter breakerOpen;
     private final Timer getLatency;
+    private final LoaderGate loaderGate;
 
     public DistributedOnlyCache(String cacheName,
                                 CacheProperties.CacheSpec spec,
@@ -118,6 +119,8 @@ public class DistributedOnlyCache implements Cache, InvalidationListener {
                 .tag("cache", cacheName).register(meterRegistry);
         this.getLatency = Timer.builder("cache.distributed.get.latency")
                 .tag("cache", cacheName).register(meterRegistry);
+        this.loaderGate = new LoaderGate(cacheName,
+                spec.maxConcurrentLoaders(), spec.loaderAcquireTimeout(), meterRegistry);
     }
 
     @Override
@@ -185,8 +188,10 @@ public class DistributedOnlyCache implements Cache, InvalidationListener {
                 Thread.currentThread().interrupt();
                 throw new ValueRetrievalException(key, valueLoader, e);
             } catch (ExecutionException | TimeoutException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof LoaderRejectedException lr) throw lr;
                 throw new ValueRetrievalException(key, valueLoader,
-                        e.getCause() != null ? e.getCause() : e);
+                        cause != null ? cause : e);
             }
         }
 
@@ -235,10 +240,15 @@ public class DistributedOnlyCache implements Cache, InvalidationListener {
         }
 
         try {
-            Object value = valueLoader.call();
+            Object value = loaderGate.run(key, valueLoader);
             // Bypass put()'s key validation: we already stringified above.
             writeToRedis(key, value);
             return value;
+        } catch (LoaderRejectedException e) {
+            // Backpressure: do not wrap as ValueRetrievalException — callers
+            // distinguish rejection (no loader call made) from failure
+            // (loader ran and threw).
+            throw e;
         } catch (Throwable t) {
             throw new ValueRetrievalException(key, valueLoader, t);
         } finally {

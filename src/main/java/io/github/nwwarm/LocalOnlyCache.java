@@ -19,9 +19,19 @@ import java.util.concurrent.Callable;
 public class LocalOnlyCache implements Cache {
 
     private final Cache delegate;
+    private final LoaderGate loaderGate;
 
     public LocalOnlyCache(Cache delegate, MeterRegistry meterRegistry) {
+        this(delegate, null, null, meterRegistry);
+    }
+
+    public LocalOnlyCache(Cache delegate,
+                          Integer maxConcurrentLoaders,
+                          java.time.Duration loaderAcquireTimeout,
+                          MeterRegistry meterRegistry) {
         this.delegate = delegate;
+        this.loaderGate = new LoaderGate(delegate.getName(),
+                maxConcurrentLoaders, loaderAcquireTimeout, meterRegistry);
         Object native_ = delegate.getNativeCache();
         if (native_ instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineNative) {
             CaffeineCacheMetrics.monitor(meterRegistry, caffeineNative, delegate.getName());
@@ -52,7 +62,21 @@ public class LocalOnlyCache implements Cache {
 
     @Override
     public <T> T get(@Nonnull Object key, @Nonnull Callable<T> valueLoader) {
-        return delegate.get(key, valueLoader);
+        // Wrap the loader so the per-cache concurrency cap gates Caffeine's
+        // compute lambda. When the gate is unconfigured, LoaderGate.run is a
+        // direct loader.call() — same control flow as the pre-feature
+        // pass-through.
+        //
+        // Spring's CaffeineCache.LoadFunction wraps any Throwable from the
+        // inner Callable in Cache.ValueRetrievalException. Unwrap on the way
+        // out so a rejection surfaces as itself — callers want to distinguish
+        // "loader rejected" from "loader ran and failed."
+        try {
+            return delegate.get(key, () -> loaderGate.run(key, valueLoader));
+        } catch (Cache.ValueRetrievalException e) {
+            if (e.getCause() instanceof LoaderRejectedException lr) throw lr;
+            throw e;
+        }
     }
 
     @Override
