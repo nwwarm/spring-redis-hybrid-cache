@@ -3,13 +3,18 @@ package io.github.nwwarm;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.search.Search;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.redisson.api.RKeys;
+import org.redisson.api.RTopic;
 import org.redisson.api.RedissonClient;
+import org.redisson.client.codec.Codec;
+import org.redisson.codec.TypedJsonJacksonCodec;
 import org.springframework.cache.caffeine.CaffeineCache;
 import org.testcontainers.containers.ComposeContainer;
 import org.testcontainers.containers.Container;
@@ -120,7 +125,7 @@ class ClusterCacheIT {
                 null);
         CacheProperties props = new CacheProperties(
                 server, null, null, "cluster-it",
-                List.of("io.github.nwwarm."), null, null, null, false, null, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null, null, null);
         return new CacheConfig().redissonClient(props);
     }
 
@@ -266,6 +271,112 @@ class ClusterCacheIT {
             cache.shutdown();
             client.shutdown();
         }
+    }
+
+    /**
+     * Mirrors {@link #crossNodeInvalidation_overCluster()} but with the
+     * dispatcher running on {@code RShardedTopic} ({@code SPUBLISH}/
+     * {@code SSUBSCRIBE}). All nodes still receive every invalidation —
+     * the channel is pinned to one shard, every subscriber connects to
+     * it, the cluster bus stays out of the path. We assert: peer L1
+     * eviction lands within the usual budget; the publisher self-skips
+     * its own message; a forged message for a cache name no node hosts
+     * lights up the {@code received.unknown} counter, not
+     * {@code received}.
+     */
+    @Test
+    void shardedPubsub_crossNodeInvalidation_andSelfSkip_andUnknownRouting() {
+        RedissonClient clientA = buildProductionClient();
+        RedissonClient clientB = buildProductionClient();
+        RedissonClient publisher = buildProductionClient();
+        SimpleMeterRegistry registryA = new SimpleMeterRegistry();
+        SimpleMeterRegistry registryB = new SimpleMeterRegistry();
+        String name = "cluster-sharded-" + UUID.randomUUID().toString().substring(0, 8);
+        String ghostName = "cluster-ghost-" + UUID.randomUUID().toString().substring(0, 8);
+
+        NearCache a = newShardedNearCache(name, clientA, "node-A", registryA);
+        NearCache b = newShardedNearCache(name, clientB, "node-B", registryB);
+        try {
+            // Cross-node invalidation lands within a few seconds, same as
+            // the regular pub/sub case.
+            a.put("k", "v1");
+            Awaitility.await().atMost(Duration.ofSeconds(3)).untilAsserted(() ->
+                    assertThat(b.get("k", String.class)).isEqualTo("v1"));
+
+            a.put("k", "v2");
+            Awaitility.await().atMost(Duration.ofSeconds(3)).untilAsserted(() ->
+                    assertThat(nativeOf(b).getIfPresent("k")).isNull());
+            assertThat(b.get("k", String.class)).isEqualTo("v2");
+
+            // Self-skip: A's dispatcher must ignore A's own messages.
+            // Two puts from A → A's `received` counter must remain 0;
+            // B's must be exactly 2 (one per put).
+            Awaitility.await().atMost(Duration.ofSeconds(2)).untilAsserted(() ->
+                    assertThat(receivedCount(registryB, name, "invalidate"))
+                            .isEqualTo(2.0));
+            assertThat(receivedCount(registryA, name, "invalidate"))
+                    .as("A must self-skip its own published messages")
+                    .isZero();
+
+            // Unknown-cache routing on the sharded transport: forge a
+            // message for a name nobody registered. Publish through a
+            // separate sharded topic on the publisher client so the
+            // dispatcher path on B sees a real SSUBSCRIBE delivery.
+            RTopic topic = publisher.getShardedTopic("cache:invalidate", TOPIC_CODEC);
+            topic.publish(new InvalidationMessage(
+                    "node-forged", ghostName, InvalidationMessage.OP_INVALIDATE, "k"));
+
+            Awaitility.await().atMost(Duration.ofSeconds(3)).untilAsserted(() ->
+                    assertThat(unknownReceivedCount(registryB, ghostName, "invalidate"))
+                            .as("forged message for an unknown cache must hit"
+                                    + " received.unknown on the sharded transport")
+                            .isEqualTo(1.0));
+            assertThat(receivedCount(registryB, ghostName, "invalidate"))
+                    .as("regular received counter must not exist for the ghost cache")
+                    .isZero();
+        } finally {
+            a.shutdown();
+            b.shutdown();
+            clientA.shutdown();
+            clientB.shutdown();
+            publisher.shutdown();
+        }
+    }
+
+    private static final Codec TOPIC_CODEC = new TypedJsonJacksonCodec(InvalidationMessage.class);
+
+    private static NearCache newShardedNearCache(String name, RedissonClient client,
+                                                 String nodeId, MeterRegistry meterRegistry) {
+        CacheProperties.CacheSpec spec = new CacheProperties.CacheSpec(
+                CacheProperties.Tier.NEAR_CACHE,
+                Duration.ofMinutes(10), 10_000,
+                Duration.ofSeconds(2), Duration.ofSeconds(10),
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null);
+        var caffeineNative = Caffeine.newBuilder()
+                .expireAfterWrite(Duration.ofMinutes(10))
+                .maximumSize(spec.maximumSize())
+                .recordStats()
+                .build();
+        CaffeineCache springCache = new CaffeineCache(name, caffeineNative, true);
+        // shardedPubsub=true here — the load-bearing flag for this test.
+        InvalidationDispatcher dispatcher = new InvalidationDispatcher(
+                client, nodeId, meterRegistry, true);
+        CircuitBreaker breaker = CircuitBreakerRegistry.ofDefaults()
+                .circuitBreaker("cluster-sharded-" + System.nanoTime());
+        return new NearCache(springCache, spec, null, client, breaker, dispatcher,
+                meterRegistry, new KeyLogFormatter(false, "test"));
+    }
+
+    private static double receivedCount(MeterRegistry registry, String cacheName, String op) {
+        var c = Search.in(registry).name("cache.invalidations.received")
+                .tag("cache", cacheName).tag("op", op).counter();
+        return c == null ? 0.0 : c.count();
+    }
+
+    private static double unknownReceivedCount(MeterRegistry registry, String cacheName, String op) {
+        var c = Search.in(registry).name("cache.invalidations.received.unknown")
+                .tag("cache", cacheName).tag("op", op).counter();
+        return c == null ? 0.0 : c.count();
     }
 
     /**

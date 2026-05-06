@@ -82,10 +82,28 @@ public class InvalidationDispatcher implements MessageListener<InvalidationMessa
     private volatile Boolean redissonAliveAtStop;
 
     InvalidationDispatcher(RedissonClient redisson, String nodeId, MeterRegistry meterRegistry) {
+        this(redisson, nodeId, meterRegistry, false);
+    }
+
+    /**
+     * @param shardedPubsub when {@code true}, subscribes via Redisson's
+     *        {@link org.redisson.api.RShardedTopic} ({@code SPUBLISH}/{@code
+     *        SSUBSCRIBE}, Redis 7.0+) instead of {@link RTopic}. Cluster-only —
+     *        validated upstream by {@code CacheSpecValidator}. The wire format
+     *        and routing logic are unchanged; only the channel-to-shard
+     *        binding differs.
+     */
+    InvalidationDispatcher(RedissonClient redisson, String nodeId,
+                           MeterRegistry meterRegistry, boolean shardedPubsub) {
         this.redisson = redisson;
         this.nodeId = nodeId;
         this.meterRegistry = meterRegistry;
-        this.topic = redisson.getTopic(INVALIDATION_TOPIC, INVALIDATION_CODEC);
+        // RShardedTopic extends RTopic, so we can hold either via the same
+        // field type. Subscribe/publish/listener-id semantics are identical;
+        // the only on-the-wire difference is SPUBLISH vs PUBLISH.
+        this.topic = shardedPubsub
+                ? redisson.getShardedTopic(INVALIDATION_TOPIC, INVALIDATION_CODEC)
+                : redisson.getTopic(INVALIDATION_TOPIC, INVALIDATION_CODEC);
         // Subscribe eagerly. Direct construction in tests then works without a
         // separate start() call; Spring's later start() during refresh is a
         // no-op because isRunning() is already true. Stop semantics are

@@ -152,7 +152,7 @@ class CacheSpecValidatorTest {
                 server(), Map.of("tokens", kryo), defaultSpec(), null,
                 List.of("io.github.nwwarm."),
                 new CacheProperties.Kryo(List.of("java.lang.String")),
-                null, null, false, null, null);
+                null, null, false, null, null, null);
         assertThatNoException().isThrownBy(() -> CacheSpecValidator.validate(props));
     }
 
@@ -243,7 +243,7 @@ class CacheSpecValidatorTest {
         CacheProperties props = new CacheProperties(
                 server(), Map.of(), defaultSpec(), null,
                 List.of("io.github.nwwarm."), null, null,
-                new CacheProperties.Resilience(badGlobal), false, null, null);
+                new CacheProperties.Resilience(badGlobal), false, null, null, null);
         assertViolation(props, "global circuit-breaker defaults", "failure-rate-threshold");
     }
 
@@ -503,6 +503,58 @@ class CacheSpecValidatorTest {
     }
 
     // -----------------------------------------------------------------------
+    // E23 — sharded pub/sub requires cluster mode
+    // -----------------------------------------------------------------------
+
+    @Test
+    void e23_shardedPubsub_onCluster_isValid() {
+        CacheProperties.Server cluster = new CacheProperties.Server(
+                CacheProperties.Mode.CLUSTER, null,
+                List.of("redis://a:6379"), null, null, null);
+        CacheProperties props = propertiesWithInvalidation(cluster,
+                new CacheProperties.Invalidation(true));
+        assertThatNoException().isThrownBy(() -> CacheSpecValidator.validate(props));
+    }
+
+    @Test
+    void e23_shardedPubsub_onSingle_fails() {
+        CacheProperties.Server single = new CacheProperties.Server(
+                CacheProperties.Mode.SINGLE, "redis://localhost:6379",
+                null, null, null, null);
+        CacheProperties props = propertiesWithInvalidation(single,
+                new CacheProperties.Invalidation(true));
+        assertThatThrownBy(() -> CacheSpecValidator.validate(props))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("invalidation.sharded-pubsub=true requires"
+                        + " cache.server.mode=CLUSTER")
+                .hasMessageContaining("got SINGLE");
+    }
+
+    @Test
+    void e23_shardedPubsub_onSentinel_fails() {
+        CacheProperties.Server sentinel = new CacheProperties.Server(
+                CacheProperties.Mode.SENTINEL, null,
+                List.of("redis://s1:26379"), "mymaster", null, null);
+        CacheProperties props = propertiesWithInvalidation(sentinel,
+                new CacheProperties.Invalidation(true));
+        assertThatThrownBy(() -> CacheSpecValidator.validate(props))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("got SENTINEL");
+    }
+
+    @Test
+    void e23_shardedPubsubDisabled_anyMode_isValid() {
+        // Sanity: the validator is only consulted when shardedPubsub=true,
+        // so SINGLE + Invalidation(false) must not trip E23.
+        CacheProperties.Server single = new CacheProperties.Server(
+                CacheProperties.Mode.SINGLE, "redis://localhost:6379",
+                null, null, null, null);
+        CacheProperties props = propertiesWithInvalidation(single,
+                new CacheProperties.Invalidation(false));
+        assertThatNoException().isThrownBy(() -> CacheSpecValidator.validate(props));
+    }
+
+    // -----------------------------------------------------------------------
     // Multi-violation test (acceptance criterion: all in one exception)
     // -----------------------------------------------------------------------
 
@@ -571,23 +623,29 @@ class CacheSpecValidatorTest {
 
     private static CacheProperties minimalValidProperties() {
         return new CacheProperties(server(), Map.of(), defaultSpec(), null,
-                List.of("io.github.nwwarm."), null, null, null, false, null, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null, null, null);
     }
 
     private static CacheProperties propertiesWithCaches(
             Map<String, CacheProperties.CacheSpec> caches) {
         return new CacheProperties(server(), caches, defaultSpec(), null,
-                List.of("io.github.nwwarm."), null, null, null, false, null, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null, null, null);
     }
 
     private static CacheProperties propertiesWithDefaultSpec(CacheProperties.CacheSpec defaultSpec) {
         return new CacheProperties(server(), Map.of(), defaultSpec, null,
-                List.of("io.github.nwwarm."), null, null, null, false, null, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null, null, null);
     }
 
     private static CacheProperties propertiesWithStartupProbe(CacheProperties.StartupProbe probe) {
         return new CacheProperties(server(), Map.of(), defaultSpec(), null,
-                List.of("io.github.nwwarm."), null, null, null, false, null, probe);
+                List.of("io.github.nwwarm."), null, null, null, false, null, probe, null);
+    }
+
+    private static CacheProperties propertiesWithInvalidation(
+            CacheProperties.Server server, CacheProperties.Invalidation invalidation) {
+        return new CacheProperties(server, Map.of(), defaultSpec(), null,
+                List.of("io.github.nwwarm."), null, null, null, false, null, null, invalidation);
     }
 
     private static CacheProperties.Server server() {

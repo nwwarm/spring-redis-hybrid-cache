@@ -50,7 +50,7 @@ class HybridCacheHealthIndicatorPerCacheTest {
                         Map.of(),
                         null, "test-node",
                         java.util.List.of("io.github.nwwarm."),
-                        null, null, null, false, null, null),
+                        null, null, null, false, null, null, null),
                 redisson,
                 registry,
                 dispatcher,

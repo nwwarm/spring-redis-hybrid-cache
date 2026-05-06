@@ -139,7 +139,7 @@ class SentinelCacheIT {
                 null);
         CacheProperties props = new CacheProperties(
                 server, null, null, "sentinel-it",
-                List.of("io.github.nwwarm."), null, null, null, false, null, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null, null, null);
         return new CacheConfig().redissonClient(props);
     }
 

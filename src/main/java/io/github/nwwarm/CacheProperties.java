@@ -34,7 +34,8 @@ public record CacheProperties(
         Resilience resilience,
         boolean logKeys,
         String logKeySalt,
-        StartupProbe startupProbe) {
+        StartupProbe startupProbe,
+        Invalidation invalidation) {
 
     private static final Logger log = LoggerFactory.getLogger(CacheProperties.class);
     private static final Set<String> WARNED_NAMES = ConcurrentHashMap.newKeySet();
@@ -46,6 +47,7 @@ public record CacheProperties(
         if (health == null) health = new Health(Duration.ofMillis(500));
         if (resilience == null) resilience = new Resilience(null);
         if (startupProbe == null) startupProbe = new StartupProbe(false, null, 1, null);
+        if (invalidation == null) invalidation = new Invalidation(false);
         if (defaultSpec == null) {
             defaultSpec = new CacheSpec(
                     Tier.NEAR_CACHE,
@@ -232,6 +234,40 @@ public record CacheProperties(
             if (retryDelay == null) retryDelay = Duration.ofSeconds(1);
         }
     }
+
+    /**
+     * Cross-node invalidation transport tuning.
+     *
+     * <p>The default ({@code shardedPubsub=false}) uses Redisson's
+     * {@code RTopic}, which maps to Redis {@code PUBLISH}/{@code SUBSCRIBE}.
+     * In a Redis Cluster every published message is gossipped to every
+     * node via the cluster bus before delivery, regardless of which shard
+     * owns the channel.
+     *
+     * <p>With {@code shardedPubsub=true} the dispatcher switches to
+     * {@code RShardedTopic} ({@code SPUBLISH}/{@code SSUBSCRIBE}, Redis
+     * 7.0+). The channel is pinned to one shard (chosen by hashing the
+     * channel name), and every subscriber connects to that shard
+     * directly. All nodes still receive every invalidation message —
+     * which is what the library needs — but the cluster-bus
+     * fan-out is eliminated, lowering inter-shard traffic on
+     * deployments with high invalidation rates.
+     *
+     * <p><b>Cluster-only.</b> The flag is rejected at startup on
+     * {@code mode=SINGLE} and {@code mode=SENTINEL} — sharded pub/sub
+     * is a Redis Cluster feature.
+     *
+     * <p><b>Heterogeneous deployments are unsupported.</b> Either every
+     * node uses sharded pub/sub or none do. A mix of {@code RTopic} and
+     * {@code RShardedTopic} subscribers will not see each other's
+     * messages.
+     *
+     * <p><b>No automatic Redis-version probe.</b> If you enable this
+     * against a {@code <}7.0 server, Redisson will surface a clear error
+     * on first publish — adding our own version check would be more
+     * code than it's worth.
+     */
+    public record Invalidation(boolean shardedPubsub) {}
 
     /**
      * Circuit-breaker configuration. Used in two places:

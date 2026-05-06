@@ -414,6 +414,7 @@ Notable log lines and their operational meaning:
 | `cache.startup-probe.timeout` | `5s` | Per-attempt timeout. Total bound on probe time is `(retries + 1) * timeout + retries * retry-delay`. |
 | `cache.startup-probe.retries` | `1` | Additional attempts after the first failure (so two attempts total by default). `0` is valid — single attempt. |
 | `cache.startup-probe.retry-delay` | `1s` | Sleep between attempts. `0` is valid — retry immediately; the per-attempt timeout still paces the loop. |
+| `cache.invalidation.sharded-pubsub` | `false` | Cluster-only opt-in to Redis 7.0+ sharded pub/sub (`SPUBLISH`/`SSUBSCRIBE`, Redisson `RShardedTopic`). All nodes still receive every invalidation, but the channel is pinned to one shard so the cluster bus stays out of the path — useful at high invalidation rates. Rejected at startup on `mode=SINGLE` and `mode=SENTINEL`. Heterogeneous deployments (some nodes sharded, some not) are unsupported and will silently fail to deliver between groups. |
 | `cache.default-spec.tier` | `NEAR_CACHE` | Default tier for caches not explicitly configured. |
 | `cache.default-spec.ttl` | `1h` | Default TTL. |
 | `cache.default-spec.maximum-size` | `10000` | Default L1 maximum entries. |

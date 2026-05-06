@@ -101,7 +101,8 @@ class RedisStartupProbeTest {
                 List.of("io.github.nwwarm."),
                 null, null, null, false, null,
                 new CacheProperties.StartupProbe(true,
-                        Duration.ofSeconds(1), 0, Duration.ZERO));
+                        Duration.ofSeconds(1), 0, Duration.ZERO),
+                null);
 
         RedisStartupProbe probe = new RedisStartupProbe(redisson, props);
         assertThat(catchThrowable(probe::afterPropertiesSet)).isNull();
@@ -134,7 +135,8 @@ class RedisStartupProbeTest {
                 List.of("io.github.nwwarm."),
                 null, null, null, false, null,
                 new CacheProperties.StartupProbe(true,
-                        Duration.ofSeconds(1), 0, Duration.ZERO));
+                        Duration.ofSeconds(1), 0, Duration.ZERO),
+                null);
 
         RedisStartupProbe probe = new RedisStartupProbe(redisson, props);
         assertThat(catchThrowable(probe::afterPropertiesSet)).isNull();
@@ -158,7 +160,8 @@ class RedisStartupProbeTest {
                 null, "node",
                 List.of("io.github.nwwarm."),
                 null, null, null, false, null,
-                new CacheProperties.StartupProbe(true, Duration.ofMillis(50), 0, Duration.ZERO));
+                new CacheProperties.StartupProbe(true, Duration.ofMillis(50), 0, Duration.ZERO),
+                null);
 
         RedisStartupProbe probe = new RedisStartupProbe(redisson, props);
         assertThatThrownBy(probe::afterPropertiesSet)
@@ -183,7 +186,8 @@ class RedisStartupProbeTest {
                 null, "node",
                 List.of("io.github.nwwarm."),
                 null, null, null, false, null,
-                new CacheProperties.StartupProbe(true, Duration.ofMillis(50), 0, Duration.ZERO));
+                new CacheProperties.StartupProbe(true, Duration.ofMillis(50), 0, Duration.ZERO),
+                null);
 
         RedisStartupProbe probe = new RedisStartupProbe(redisson, props);
         assertThatThrownBy(probe::afterPropertiesSet)
@@ -227,7 +231,7 @@ class RedisStartupProbeTest {
                 "node",
                 List.of("io.github.nwwarm."),
                 null, null, null, false, null,
-                probe);
+                probe, null);
     }
 
     private static CacheProperties.Server singleServer() {

@@ -289,7 +289,9 @@ public class CacheConfig {
         String nodeId = properties.nodeId() != null && !properties.nodeId().isBlank()
                 ? properties.nodeId()
                 : UUID.randomUUID().toString();
-        return new InvalidationDispatcher(redisson, nodeId, meterRegistry);
+        boolean shardedPubsub = properties.invalidation() != null
+                && properties.invalidation().shardedPubsub();
+        return new InvalidationDispatcher(redisson, nodeId, meterRegistry, shardedPubsub);
     }
 
     /**

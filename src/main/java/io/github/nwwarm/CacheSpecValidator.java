@@ -69,6 +69,15 @@ import java.util.Map;
  *   <li>E12: {@code permittedNumberOfCallsInHalfOpenState ≥ 1}</li>
  * </ul>
  *
+ * <b>Per invalidation block</b>:
+ * <ul>
+ *   <li>E23: {@code invalidation.shardedPubsub=true} is allowed only when
+ *       {@code cache.server.mode=CLUSTER}. {@code SPUBLISH}/{@code SSUBSCRIBE}
+ *       is a Redis Cluster–only capability; in {@code SINGLE} or
+ *       {@code SENTINEL} the server has no shard concept, and Redisson would
+ *       surface a confusing protocol error per publish at runtime.</li>
+ * </ul>
+ *
  * <b>Per startup-probe block</b> (only checked when
  * {@code cache.startup-probe.enabled=true} — a disabled probe with bogus
  * timings is harmless and we don't want to gate boot on unrelated typos):
@@ -130,10 +139,33 @@ final class CacheSpecValidator {
             validateStartupProbe(properties.startupProbe(), violations);
         }
 
+        // Invalidation transport (sharded pub/sub is a Redis Cluster feature;
+        // SINGLE and SENTINEL deployments must reject it at startup).
+        if (properties.invalidation() != null && properties.invalidation().shardedPubsub()) {
+            validateShardedPubsub(properties, violations);
+        }
+
         if (!violations.isEmpty()) {
             throw new IllegalArgumentException(
                     violations.size() + " cache configuration violation(s):\n  - "
                             + String.join("\n  - ", violations));
+        }
+    }
+
+    private static void validateShardedPubsub(CacheProperties properties,
+                                              List<String> violations) {
+        // E23: sharded pub/sub is a Redis Cluster–only capability. Allowing
+        // it in SINGLE or SENTINEL would silently degrade — Redisson would
+        // try SPUBLISH on a non-cluster server and surface a confusing
+        // protocol error per publish. Fail at startup instead.
+        CacheProperties.Mode mode = properties.server() == null
+                ? null : properties.server().mode();
+        if (mode != CacheProperties.Mode.CLUSTER) {
+            violations.add("invalidation.sharded-pubsub=true requires"
+                    + " cache.server.mode=CLUSTER (got " + mode + ");"
+                    + " sharded pub/sub (SPUBLISH/SSUBSCRIBE) is a Redis"
+                    + " Cluster–only capability and is not available in"
+                    + " single-server or Sentinel deployments");
         }
     }
 
