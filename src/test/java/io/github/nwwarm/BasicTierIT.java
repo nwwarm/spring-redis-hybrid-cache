@@ -50,6 +50,18 @@ class BasicTierIT extends RedisTestBase {
         void getMissReturnsNull() {
             assertThat(cache.get("absent")).isNull();
         }
+
+        @Test
+        void clearImmediateBehavesLikeClear() {
+            // No distributed state to reconcile — clearImmediate must drop
+            // every entry, same as clear(). The promotion of the method to
+            // the HybridCache surface mustn't change behaviour for this tier.
+            cache.put("k1", "v1");
+            cache.put("k2", "v2");
+            cache.clearImmediate();
+            assertThat(cache.get("k1")).isNull();
+            assertThat(cache.get("k2")).isNull();
+        }
     }
 
     @Nested

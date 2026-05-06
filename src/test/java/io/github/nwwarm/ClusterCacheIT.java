@@ -8,6 +8,7 @@ import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.redisson.api.RKeys;
 import org.redisson.api.RedissonClient;
 import org.springframework.cache.caffeine.CaffeineCache;
 import org.testcontainers.containers.ComposeContainer;
@@ -261,6 +262,45 @@ class ClusterCacheIT {
             for (int i = 50; i < 100; i++) {
                 assertThat(cache.get("k" + i, String.class)).isEqualTo("v" + i);
             }
+        } finally {
+            cache.shutdown();
+            client.shutdown();
+        }
+    }
+
+    /**
+     * {@code clearImmediate()} must SCAN every master and UNLINK locally
+     * for each — a single-shard SCAN would silently leave keys behind on
+     * the other 2/3 of the keyspace. Seeding 200 keys spreads across
+     * slots well enough to land on every master with overwhelming
+     * probability ((1 - (2/3)^200) ≈ 1).
+     */
+    @Test
+    void clearImmediate_iteratesAllShards() {
+        RedissonClient client = buildProductionClient();
+        String name = "cluster-clear-imm-" + UUID.randomUUID().toString().substring(0, 8);
+        NearCache cache = newNearCache(name, client, "node-A");
+        try {
+            for (int i = 0; i < 200; i++) {
+                cache.put("k" + i, "v" + i);
+            }
+
+            RKeys keys = client.getKeys();
+            String pattern = "{" + name + ":*}:v:*";
+            long before = 0;
+            for (String ignored : keys.getKeysByPattern(pattern)) before++;
+            assertThat(before)
+                    .as("sanity: 200 keys should materialise across the cluster")
+                    .isGreaterThanOrEqualTo(200);
+
+            cache.clearImmediate();
+
+            long after = 0;
+            for (String ignored : keys.getKeysByPattern(pattern)) after++;
+            assertThat(after)
+                    .as("eager UNLINK must reach every shard, not just the one"
+                            + " owning the originating connection")
+                    .isZero();
         } finally {
             cache.shutdown();
             client.shutdown();

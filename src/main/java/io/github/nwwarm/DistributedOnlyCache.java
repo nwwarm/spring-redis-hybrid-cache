@@ -8,6 +8,7 @@ import io.micrometer.core.instrument.Timer;
 import jakarta.annotation.Nonnull;
 import org.redisson.api.RAtomicLong;
 import org.redisson.api.RBucket;
+import org.redisson.api.RKeys;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.redisson.client.codec.Codec;
@@ -56,7 +57,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * it must fail open. Source systems behind a distributed-only cache must handle
  * full unfiltered load during a Redis incident.
  */
-public class DistributedOnlyCache implements Cache, InvalidationListener {
+public class DistributedOnlyCache implements HybridCache, InvalidationListener {
 
     private static final Logger log = LoggerFactory.getLogger(DistributedOnlyCache.class);
     private static final long GENERATION_REFRESH_NANOS = 1_000_000_000L; // 1s
@@ -307,6 +308,52 @@ public class DistributedOnlyCache implements Cache, InvalidationListener {
         // than waiting up to GENERATION_REFRESH_NANOS for the next poll. The
         // 1s poll remains as a backstop if the message is dropped.
         publishClear();
+    }
+
+    /**
+     * Eager clear: bump generation, then SCAN + UNLINK every old-generation
+     * value bucket on every reachable shard. Stronger than {@link #clear()} —
+     * when this returns, no orphan keys remain in Redis under this cache's
+     * prefix. See {@link HybridCache#clearImmediate()} for the rationale.
+     *
+     * <p>Order matches {@code NearCache.clearImmediate}: bump generation
+     * first (concurrent reads switch to the new prefix immediately), publish
+     * OP_CLEAR (peers refresh their generation pointer ASAP), then UNLINK
+     * old-generation keys via {@link RKeys#unlinkByPattern}, which iterates
+     * every cluster master and pipelines UNLINK in batches.
+     *
+     * <p>Failure handling: if the bump fails the exception propagates and
+     * no UNLINK is attempted. If UNLINK fails mid-iteration the exception
+     * still propagates, but correctness is preserved — the generation is
+     * already bumped, so reads land on a fresh prefix and surviving keys
+     * orphan and decay via TTL.
+     */
+    @Override
+    public void clearImmediate() {
+        long newGen;
+        try {
+            newGen = breaker.executeSupplier(distributedGeneration::incrementAndGet);
+        } catch (RuntimeException e) {
+            failures.increment();
+            log.warn("clearImmediate generation bump failed for cache '{}'", cacheName, e);
+            throw e;
+        }
+        localGeneration.set(newGen);
+        lastRefreshNanos.set(System.nanoTime());
+        long oldGen = newGen - 1;
+
+        publishClear();
+
+        String pattern = CacheKeys.valueKeyPattern(cacheName, oldGen);
+        try {
+            redisson.getKeys().unlinkByPattern(pattern);
+        } catch (RuntimeException e) {
+            failures.increment();
+            log.warn("clearImmediate SCAN/UNLINK failed for cache '{}' pattern '{}';"
+                    + " surviving old-generation keys will expire via TTL",
+                    cacheName, pattern, e);
+            throw e;
+        }
     }
 
     private void publishClear() {

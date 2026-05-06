@@ -10,6 +10,7 @@ import io.micrometer.core.instrument.binder.cache.CaffeineCacheMetrics;
 import jakarta.annotation.Nonnull;
 import org.redisson.api.RAtomicLong;
 import org.redisson.api.RBucket;
+import org.redisson.api.RKeys;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.redisson.client.codec.Codec;
@@ -55,7 +56,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * A cache is by definition allowed to lose data. These tradeoffs prioritize
  * availability over coherence during partial Redis outages.
  */
-public class NearCache implements Cache, InvalidationListener {
+public class NearCache implements HybridCache, InvalidationListener {
 
     private static final Logger log = LoggerFactory.getLogger(NearCache.class);
     private static final long GENERATION_REFRESH_NANOS = 1_000_000_000L; // 1s
@@ -352,6 +353,57 @@ public class NearCache implements Cache, InvalidationListener {
         caffeineCache.clear();
         bumpGeneration();
         publishInvalidation(InvalidationMessage.OP_CLEAR, null);
+    }
+
+    /**
+     * Eager clear: bump generation, then SCAN + UNLINK every old-generation
+     * value bucket on every reachable shard. Stronger than {@link #clear()} —
+     * when this returns, no orphan keys remain in Redis under this cache's
+     * prefix. See {@link HybridCache#clearImmediate()} for the rationale.
+     *
+     * <p>Order is deliberate: the generation bump goes first so concurrent
+     * reads switch to the new prefix before any UNLINK runs — the old keys
+     * are logically invisible the moment the bump succeeds. Then the
+     * invalidation message goes out (peers drop their L1 immediately rather
+     * than waiting up to one second for the generation poll). Finally we
+     * eagerly UNLINK the old-generation keys via {@link RKeys#unlinkByPattern},
+     * which iterates every cluster master and pipelines UNLINK in batches.
+     *
+     * <p>If the bump fails the exception propagates and no UNLINK is
+     * attempted — without a known previous generation we have nothing safe
+     * to delete. If the bump succeeds but UNLINK fails mid-iteration the
+     * exception still propagates, but the cache is correct: surviving keys
+     * are at the old generation and reads will not find them; they expire
+     * via TTL just as they would after a regular {@link #clear()}.
+     */
+    @Override
+    public void clearImmediate() {
+        caffeineCache.clear();
+
+        long newGen;
+        try {
+            newGen = breaker.executeSupplier(distributedGeneration::incrementAndGet);
+        } catch (RuntimeException e) {
+            l2Failures.increment();
+            log.warn("clearImmediate generation bump failed for cache '{}'", cacheName, e);
+            throw e;
+        }
+        localGeneration.set(newGen);
+        lastRefreshNanos.set(System.nanoTime());
+        long oldGen = newGen - 1;
+
+        publishInvalidation(InvalidationMessage.OP_CLEAR, null);
+
+        String pattern = CacheKeys.valueKeyPattern(cacheName, oldGen);
+        try {
+            redisson.getKeys().unlinkByPattern(pattern);
+        } catch (RuntimeException e) {
+            l2Failures.increment();
+            log.warn("clearImmediate SCAN/UNLINK failed for cache '{}' pattern '{}';"
+                    + " surviving old-generation keys will expire via TTL",
+                    cacheName, pattern, e);
+            throw e;
+        }
     }
 
     // ---------- L2 ops, breaker-wrapped ----------

@@ -16,7 +16,7 @@ import java.util.concurrent.Callable;
  * Spring {@link Cache}; the wrapper exists so per-cache metrics labels are
  * applied uniformly across all three tiers.
  */
-public class LocalOnlyCache implements Cache {
+public class LocalOnlyCache implements HybridCache {
 
     private final Cache delegate;
     private final LoaderGate loaderGate;
@@ -91,6 +91,13 @@ public class LocalOnlyCache implements Cache {
 
     @Override
     public void clear() {
+        delegate.clear();
+    }
+
+    @Override
+    public void clearImmediate() {
+        // No distributed state to reconcile — Caffeine.invalidateAll() already
+        // drops every entry synchronously, so there are no orphans to chase.
         delegate.clear();
     }
 }

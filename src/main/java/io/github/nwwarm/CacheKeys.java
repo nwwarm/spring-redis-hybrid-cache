@@ -112,4 +112,32 @@ final class CacheKeys {
     static String generationKey(String cacheName) {
         return cacheName + ":generation";
     }
+
+    /**
+     * Redis MATCH pattern for every value bucket of {@code cacheName} at a
+     * specific {@code generation}. Used by {@code clearImmediate()} as the
+     * argument to SCAN + UNLINK.
+     *
+     * <p>The cache name is glob-escaped so a name containing a wildcard char
+     * (cache names can contain {@code *}, {@code ?}, {@code [}, {@code ]},
+     * {@code \}) is matched literally — without escaping, a cache named
+     * {@code "foo*"} would also catch keys belonging to caches whose names
+     * happen to start with {@code "foo"}. The trailing {@code *} inside the
+     * hash tag is the actual wildcard, matching every user key.
+     */
+    static String valueKeyPattern(String cacheName, long generation) {
+        return "{" + globEscape(cacheName) + ":*}:v:" + generation;
+    }
+
+    private static String globEscape(String s) {
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '*' || c == '?' || c == '[' || c == ']' || c == '\\') {
+                sb.append('\\');
+            }
+            sb.append(c);
+        }
+        return sb.toString();
+    }
 }

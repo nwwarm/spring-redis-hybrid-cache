@@ -140,6 +140,31 @@ class CacheKeysTest {
         assertThat(extractTag(v)).isEqualTo(extractTag(l)).isEqualTo("products:42");
     }
 
+    // ---------- valueKeyPattern (used by clearImmediate SCAN+UNLINK) ----------
+
+    @Test
+    void valueKeyPattern_simpleName_pinsGenerationAndWildcardsKey() {
+        // Pattern matches every value key in the cache at the given gen.
+        assertThat(CacheKeys.valueKeyPattern("products", 7))
+                .isEqualTo("{products:*}:v:7");
+    }
+
+    @Test
+    void valueKeyPattern_globMetaInCacheName_isEscapedLiteral() {
+        // Cache names may contain '*', '?', '[', ']', '\' (only ':', '{',
+        // '}' are validated as forbidden). Without escaping, a name like
+        // "foo*" would match every cache whose name starts with "foo" —
+        // so the SCAN/UNLINK could nuke unrelated caches.
+        assertThat(CacheKeys.valueKeyPattern("foo*", 0))
+                .isEqualTo("{foo\\*:*}:v:0");
+        assertThat(CacheKeys.valueKeyPattern("a?b", 0))
+                .isEqualTo("{a\\?b:*}:v:0");
+        assertThat(CacheKeys.valueKeyPattern("a[bc]d", 0))
+                .isEqualTo("{a\\[bc\\]d:*}:v:0");
+        assertThat(CacheKeys.valueKeyPattern("back\\slash", 0))
+                .isEqualTo("{back\\\\slash:*}:v:0");
+    }
+
     @Test
     void generationKey_isPerCacheAndUnchanged() {
         // Intentionally NOT inside a hash tag — the generation counter is
