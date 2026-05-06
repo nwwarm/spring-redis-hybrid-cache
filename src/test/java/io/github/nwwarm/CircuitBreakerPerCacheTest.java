@@ -146,7 +146,7 @@ class CircuitBreakerPerCacheTest {
                 null,
                 null,
                 null,
-                false, null);
+                false, null, null);
 
         CircuitBreakerRegistry registry = new CacheConfig().redisCacheCircuitBreakerRegistry(props);
 

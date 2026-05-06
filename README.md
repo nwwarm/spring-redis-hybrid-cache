@@ -410,6 +410,10 @@ Notable log lines and their operational meaning:
 | `cache.allowed-packages` | (required for default JSON codec) | Package prefixes allowed for Jackson polymorphic deserialization. Each entry must end with `.` or be a fully-qualified class name. Empty value fails startup. See Security. |
 | `cache.kryo.registered-classes` | `[]` | Fully-qualified class names registered with the Kryo codec. Required (non-empty) when any cache uses `codec: KRYO`. Order matters — appending is safe, reordering breaks the wire format. See Security. |
 | `cache.health.ping-timeout` | `500ms` | Bounds the Redis ping issued by the Actuator health indicator. `/actuator/health` returns within this window even if Redis is unreachable. |
+| `cache.startup-probe.enabled` | `false` | Optional fail-fast Redis reachability probe at application startup. Default behaviour stays "boot lazily and surface failures via the breaker" — the probe is for environments where fail-to-boot is preferred over boot-and-then-500. Skipped automatically when every configured cache is `tier=LOCAL_ONLY` (Redis isn't on the request path). |
+| `cache.startup-probe.timeout` | `5s` | Per-attempt timeout. Total bound on probe time is `(retries + 1) * timeout + retries * retry-delay`. |
+| `cache.startup-probe.retries` | `1` | Additional attempts after the first failure (so two attempts total by default). `0` is valid — single attempt. |
+| `cache.startup-probe.retry-delay` | `1s` | Sleep between attempts. `0` is valid — retry immediately; the per-attempt timeout still paces the loop. |
 | `cache.default-spec.tier` | `NEAR_CACHE` | Default tier for caches not explicitly configured. |
 | `cache.default-spec.ttl` | `1h` | Default TTL. |
 | `cache.default-spec.maximum-size` | `10000` | Default L1 maximum entries. |

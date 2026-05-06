@@ -120,7 +120,7 @@ class ClusterCacheIT {
                 null);
         CacheProperties props = new CacheProperties(
                 server, null, null, "cluster-it",
-                List.of("io.github.nwwarm."), null, null, null, false, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null, null);
         return new CacheConfig().redissonClient(props);
     }
 

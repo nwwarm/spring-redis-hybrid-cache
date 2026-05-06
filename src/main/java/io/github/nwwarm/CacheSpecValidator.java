@@ -69,6 +69,17 @@ import java.util.Map;
  *   <li>E12: {@code permittedNumberOfCallsInHalfOpenState ≥ 1}</li>
  * </ul>
  *
+ * <b>Per startup-probe block</b> (only checked when
+ * {@code cache.startup-probe.enabled=true} — a disabled probe with bogus
+ * timings is harmless and we don't want to gate boot on unrelated typos):
+ * <ul>
+ *   <li>E20: {@code timeout} must be positive. Zero would surface as an
+ *       immediate {@code TimeoutException} on every attempt, indistinguishable
+ *       from "Redis is unreachable."</li>
+ *   <li>E21: {@code retries} must be {@code >= 0}.</li>
+ *   <li>E22: {@code retry-delay} must be {@code >= 0}.</li>
+ * </ul>
+ *
  * <b>Warnings</b> (logged, not thrown):
  * <ul>
  *   <li>W1: circuit-breaker overrides on {@code tier=LOCAL_ONLY} have no effect.</li>
@@ -111,10 +122,40 @@ final class CacheSpecValidator {
             }
         }
 
+        // Startup probe (only validate timing fields when the probe is enabled —
+        // a disabled probe with bogus timings is harmless, and validating them
+        // anyway forces operators to fix unrelated typos before they can boot
+        // with the probe off).
+        if (properties.startupProbe() != null && properties.startupProbe().enabled()) {
+            validateStartupProbe(properties.startupProbe(), violations);
+        }
+
         if (!violations.isEmpty()) {
             throw new IllegalArgumentException(
                     violations.size() + " cache configuration violation(s):\n  - "
                             + String.join("\n  - ", violations));
+        }
+    }
+
+    private static void validateStartupProbe(CacheProperties.StartupProbe probe,
+                                             List<String> violations) {
+        // E20: timeout must be positive (Duration.ZERO would surface as an
+        // immediate TimeoutException on every attempt, which is indistinguishable
+        // from "Redis is unreachable" — i.e. always fails to boot).
+        if (probe.timeout() == null || probe.timeout().isZero() || probe.timeout().isNegative()) {
+            violations.add("startup-probe.timeout must be positive (got " + probe.timeout() + ")");
+        }
+        // E21: retries must be >= 0 (negative is a configuration mistake; 0 is
+        // valid — single attempt, no retries).
+        if (probe.retries() < 0) {
+            violations.add("startup-probe.retries must be >= 0 (got "
+                    + probe.retries() + ")");
+        }
+        // E22: retry-delay must be >= 0 (zero means "retry immediately"; negative
+        // is nonsense).
+        if (probe.retryDelay() == null || probe.retryDelay().isNegative()) {
+            violations.add("startup-probe.retry-delay must be >= 0 (got "
+                    + probe.retryDelay() + ")");
         }
     }
 

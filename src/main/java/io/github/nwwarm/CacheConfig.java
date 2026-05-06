@@ -20,6 +20,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.boot.actuate.health.HealthIndicator;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.EnableCaching;
@@ -262,6 +263,22 @@ public class CacheConfig {
                 TaggedCircuitBreakerMetrics.ofCircuitBreakerRegistry(registry);
         metrics.bindTo(meterRegistry);
         return metrics;
+    }
+
+    /**
+     * Optional fail-fast Redis reachability probe. Loaded only when
+     * {@code cache.startup-probe.enabled=true}; default behaviour is
+     * disabled so the library boots lazily and surfaces failures via the
+     * per-cache circuit breakers (the right behaviour for most deployments).
+     * The probe itself no-ops on LOCAL_ONLY-only deployments — see
+     * {@link RedisStartupProbe} for the rationale.
+     */
+    @Bean
+    @ConditionalOnProperty(name = "cache.startup-probe.enabled", havingValue = "true")
+    @ConditionalOnMissingBean
+    public RedisStartupProbe redisStartupProbe(RedissonClient redisson,
+                                               CacheProperties properties) {
+        return new RedisStartupProbe(redisson, properties);
     }
 
     @Bean

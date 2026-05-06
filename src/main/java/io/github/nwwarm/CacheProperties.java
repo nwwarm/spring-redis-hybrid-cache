@@ -33,7 +33,8 @@ public record CacheProperties(
         Health health,
         Resilience resilience,
         boolean logKeys,
-        String logKeySalt) {
+        String logKeySalt,
+        StartupProbe startupProbe) {
 
     private static final Logger log = LoggerFactory.getLogger(CacheProperties.class);
     private static final Set<String> WARNED_NAMES = ConcurrentHashMap.newKeySet();
@@ -44,6 +45,7 @@ public record CacheProperties(
         if (kryo == null) kryo = new Kryo(List.of());
         if (health == null) health = new Health(Duration.ofMillis(500));
         if (resilience == null) resilience = new Resilience(null);
+        if (startupProbe == null) startupProbe = new StartupProbe(false, null, 1, null);
         if (defaultSpec == null) {
             defaultSpec = new CacheSpec(
                     Tier.NEAR_CACHE,
@@ -189,6 +191,47 @@ public record CacheProperties(
      * a top-level schema change.
      */
     public record Resilience(CircuitBreaker circuitBreaker) {}
+
+    /**
+     * Optional fail-fast Redis reachability check at application startup.
+     *
+     * <p>Default behaviour is disabled — the library otherwise boots lazily
+     * and surfaces Redis incidents via the per-cache circuit breakers, which
+     * is the right behaviour for most deployments (a cache is allowed to
+     * lose data; the application must not refuse to start because of a
+     * dependency further down). Enable this for environments where
+     * <em>fail-to-boot</em> is explicitly preferred over
+     * <em>boot-and-then-fail-requests</em> — for example, blue/green deploys
+     * where a misconfigured slot should never accept traffic.
+     *
+     * <p><b>Skipped on LOCAL_ONLY-only deployments.</b> If every configured
+     * cache (and {@code default-spec}) is {@code tier=LOCAL_ONLY}, Redis
+     * is not on the request path and the probe does not run regardless of
+     * {@link #enabled}. The bean still loads — it just no-ops with an info
+     * log explaining why.
+     *
+     * <p>Total bound on probe time:
+     * {@code (retries + 1) * timeout + retries * retryDelay}. With
+     * defaults: {@code 2 * 5s + 1 * 1s = 11s}.
+     *
+     * @param enabled    enables the probe. Default {@code false}.
+     * @param timeout    per-attempt connection timeout. Default 5s.
+     * @param retries    number of additional attempts after the first
+     *                   failure (so {@code attempts = retries + 1}).
+     *                   Default {@code 1}.
+     * @param retryDelay sleep between attempts. Default 1s.
+     */
+    public record StartupProbe(
+            boolean enabled,
+            Duration timeout,
+            int retries,
+            Duration retryDelay) {
+
+        public StartupProbe {
+            if (timeout == null) timeout = Duration.ofSeconds(5);
+            if (retryDelay == null) retryDelay = Duration.ofSeconds(1);
+        }
+    }
 
     /**
      * Circuit-breaker configuration. Used in two places:

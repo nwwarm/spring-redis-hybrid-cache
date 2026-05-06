@@ -152,7 +152,7 @@ class CacheSpecValidatorTest {
                 server(), Map.of("tokens", kryo), defaultSpec(), null,
                 List.of("io.github.nwwarm."),
                 new CacheProperties.Kryo(List.of("java.lang.String")),
-                null, null, false, null);
+                null, null, false, null, null);
         assertThatNoException().isThrownBy(() -> CacheSpecValidator.validate(props));
     }
 
@@ -243,7 +243,7 @@ class CacheSpecValidatorTest {
         CacheProperties props = new CacheProperties(
                 server(), Map.of(), defaultSpec(), null,
                 List.of("io.github.nwwarm."), null, null,
-                new CacheProperties.Resilience(badGlobal), false, null);
+                new CacheProperties.Resilience(badGlobal), false, null, null);
         assertViolation(props, "global circuit-breaker defaults", "failure-rate-threshold");
     }
 
@@ -437,6 +437,72 @@ class CacheSpecValidatorTest {
     }
 
     // -----------------------------------------------------------------------
+    // E20/E21/E22 — startup-probe constraints (only checked when enabled)
+    // -----------------------------------------------------------------------
+
+    @Test
+    void e20_disabledProbe_skipsTimingValidation() {
+        // A disabled probe with bogus timings must not fail the boot.
+        // Operators should be able to leave broken values in dev configs
+        // without being forced to clean them up before turning the probe on.
+        CacheProperties.StartupProbe disabled = new CacheProperties.StartupProbe(
+                false, Duration.ZERO, -3, Duration.ofMillis(-1));
+        assertThatNoException().isThrownBy(() ->
+                CacheSpecValidator.validate(propertiesWithStartupProbe(disabled)));
+    }
+
+    @Test
+    void e20_zeroTimeout_fails() {
+        CacheProperties.StartupProbe probe = new CacheProperties.StartupProbe(
+                true, Duration.ZERO, 1, Duration.ofSeconds(1));
+        assertViolation(propertiesWithStartupProbe(probe),
+                "startup-probe.timeout", "must be positive");
+    }
+
+    @Test
+    void e20_negativeTimeout_fails() {
+        CacheProperties.StartupProbe probe = new CacheProperties.StartupProbe(
+                true, Duration.ofMillis(-50), 1, Duration.ofSeconds(1));
+        assertViolation(propertiesWithStartupProbe(probe),
+                "startup-probe.timeout", "must be positive");
+    }
+
+    @Test
+    void e21_negativeRetries_fails() {
+        CacheProperties.StartupProbe probe = new CacheProperties.StartupProbe(
+                true, Duration.ofSeconds(5), -1, Duration.ofSeconds(1));
+        assertViolation(propertiesWithStartupProbe(probe),
+                "startup-probe.retries", "must be >= 0");
+    }
+
+    @Test
+    void e21_zeroRetries_isValid() {
+        // Zero retries = single attempt, no retries — perfectly reasonable
+        // for environments where one timeout window is enough.
+        CacheProperties.StartupProbe probe = new CacheProperties.StartupProbe(
+                true, Duration.ofSeconds(5), 0, Duration.ofSeconds(1));
+        assertThatNoException().isThrownBy(() ->
+                CacheSpecValidator.validate(propertiesWithStartupProbe(probe)));
+    }
+
+    @Test
+    void e22_negativeRetryDelay_fails() {
+        CacheProperties.StartupProbe probe = new CacheProperties.StartupProbe(
+                true, Duration.ofSeconds(5), 1, Duration.ofMillis(-1));
+        assertViolation(propertiesWithStartupProbe(probe),
+                "startup-probe.retry-delay", "must be >= 0");
+    }
+
+    @Test
+    void e22_zeroRetryDelay_isValid() {
+        // Retry immediately — valid; the timeout itself paces attempts.
+        CacheProperties.StartupProbe probe = new CacheProperties.StartupProbe(
+                true, Duration.ofSeconds(5), 1, Duration.ZERO);
+        assertThatNoException().isThrownBy(() ->
+                CacheSpecValidator.validate(propertiesWithStartupProbe(probe)));
+    }
+
+    // -----------------------------------------------------------------------
     // Multi-violation test (acceptance criterion: all in one exception)
     // -----------------------------------------------------------------------
 
@@ -505,18 +571,23 @@ class CacheSpecValidatorTest {
 
     private static CacheProperties minimalValidProperties() {
         return new CacheProperties(server(), Map.of(), defaultSpec(), null,
-                List.of("io.github.nwwarm."), null, null, null, false, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null, null);
     }
 
     private static CacheProperties propertiesWithCaches(
             Map<String, CacheProperties.CacheSpec> caches) {
         return new CacheProperties(server(), caches, defaultSpec(), null,
-                List.of("io.github.nwwarm."), null, null, null, false, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null, null);
     }
 
     private static CacheProperties propertiesWithDefaultSpec(CacheProperties.CacheSpec defaultSpec) {
         return new CacheProperties(server(), Map.of(), defaultSpec, null,
-                List.of("io.github.nwwarm."), null, null, null, false, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null, null);
+    }
+
+    private static CacheProperties propertiesWithStartupProbe(CacheProperties.StartupProbe probe) {
+        return new CacheProperties(server(), Map.of(), defaultSpec(), null,
+                List.of("io.github.nwwarm."), null, null, null, false, null, probe);
     }
 
     private static CacheProperties.Server server() {
