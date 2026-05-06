@@ -55,7 +55,8 @@ public record CacheProperties(
                     null,
                     null,
                     null,
-                    0.0);
+                    0.0,
+                    null);
         }
     }
 
@@ -230,7 +231,8 @@ public record CacheProperties(
             CircuitBreaker circuitBreaker,
             Integer maxConcurrentLoaders,
             Duration loaderAcquireTimeout,
-            double ttlJitterRatio) {
+            double ttlJitterRatio,
+            Duration maxIdle) {
 
         public CacheSpec {
             if (tier == null) tier = Tier.NEAR_CACHE;
@@ -247,6 +249,8 @@ public record CacheProperties(
             // ttlJitterRatio defaults to 0.0 (no jitter, pre-0.4.0 byte-identical
             // path). Range/tier validation happens in CacheSpecValidator so the
             // failure surfaces alongside other config violations.
+            // maxIdle defaults to null (no idle eviction). Range/tier validation
+            // also lives in CacheSpecValidator.
         }
     }
 

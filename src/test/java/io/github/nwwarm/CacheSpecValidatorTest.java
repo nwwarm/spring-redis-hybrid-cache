@@ -338,6 +338,105 @@ class CacheSpecValidatorTest {
     }
 
     // -----------------------------------------------------------------------
+    // E17 — max-idle must be positive
+    // -----------------------------------------------------------------------
+
+    @Test
+    void e17_maxIdleZero_fails() {
+        assertViolation(propertiesWithCaches(Map.of("foo",
+                        specWithMaxIdle(CacheProperties.Tier.NEAR_CACHE,
+                                Duration.ofHours(1), Duration.ZERO))),
+                "cache 'foo'", "max-idle must be positive");
+    }
+
+    @Test
+    void e17_maxIdleNegative_fails() {
+        assertViolation(propertiesWithCaches(Map.of("foo",
+                        specWithMaxIdle(CacheProperties.Tier.NEAR_CACHE,
+                                Duration.ofHours(1), Duration.ofSeconds(-5)))),
+                "cache 'foo'", "max-idle must be positive");
+    }
+
+    @Test
+    void e17_maxIdleUnset_isValid() {
+        // Null max-idle means "disabled"; not a violation.
+        assertThatNoException().isThrownBy(() ->
+                CacheSpecValidator.validate(propertiesWithCaches(Map.of("foo",
+                        specWithMaxIdle(CacheProperties.Tier.NEAR_CACHE,
+                                Duration.ofHours(1), null)))));
+    }
+
+    @Test
+    void e17_maxIdlePositive_isValid() {
+        assertThatNoException().isThrownBy(() ->
+                CacheSpecValidator.validate(propertiesWithCaches(Map.of("foo",
+                        specWithMaxIdle(CacheProperties.Tier.NEAR_CACHE,
+                                Duration.ofHours(1), Duration.ofMinutes(5))))));
+    }
+
+    // -----------------------------------------------------------------------
+    // E18 — max-idle incompatible with DISTRIBUTED_ONLY
+    // -----------------------------------------------------------------------
+
+    @Test
+    void e18_maxIdleOnDistributedOnly_fails() {
+        Throwable t = catchViolation(propertiesWithCaches(Map.of("sessions",
+                specWithMaxIdle(CacheProperties.Tier.DISTRIBUTED_ONLY,
+                        Duration.ofHours(1), Duration.ofMinutes(5)))));
+        assertThat(t.getMessage())
+                .contains("cache 'sessions'")
+                .contains("max-idle has no effect")
+                .contains("DISTRIBUTED_ONLY")
+                .contains("no L1");
+    }
+
+    @Test
+    void e18_maxIdleOnLocalOnly_isValid() {
+        assertThatNoException().isThrownBy(() ->
+                CacheSpecValidator.validate(propertiesWithCaches(Map.of("rl",
+                        specWithMaxIdle(CacheProperties.Tier.LOCAL_ONLY,
+                                Duration.ofHours(1), Duration.ofMinutes(5))))));
+    }
+
+    @Test
+    void e18_maxIdleOnNearCache_isValid() {
+        assertThatNoException().isThrownBy(() ->
+                CacheSpecValidator.validate(propertiesWithCaches(Map.of("products",
+                        specWithMaxIdle(CacheProperties.Tier.NEAR_CACHE,
+                                Duration.ofHours(1), Duration.ofMinutes(5))))));
+    }
+
+    // -----------------------------------------------------------------------
+    // E19 — max-idle > ttl is a no-op
+    // -----------------------------------------------------------------------
+
+    @Test
+    void e19_maxIdleGreaterThanTtl_fails() {
+        assertViolation(propertiesWithCaches(Map.of("foo",
+                        specWithMaxIdle(CacheProperties.Tier.NEAR_CACHE,
+                                Duration.ofMinutes(1), Duration.ofMinutes(5)))),
+                "cache 'foo'", "max-idle (PT5M) must be <= ttl (PT1M)");
+    }
+
+    @Test
+    void e19_maxIdleEqualToTtl_isValid() {
+        // max-idle == ttl is allowed: equivalent to "expire ttl after the
+        // most recent access," a useful sliding-TTL semantic.
+        assertThatNoException().isThrownBy(() ->
+                CacheSpecValidator.validate(propertiesWithCaches(Map.of("foo",
+                        specWithMaxIdle(CacheProperties.Tier.NEAR_CACHE,
+                                Duration.ofMinutes(5), Duration.ofMinutes(5))))));
+    }
+
+    @Test
+    void e19_maxIdleLessThanTtl_isValid() {
+        assertThatNoException().isThrownBy(() ->
+                CacheSpecValidator.validate(propertiesWithCaches(Map.of("foo",
+                        specWithMaxIdle(CacheProperties.Tier.NEAR_CACHE,
+                                Duration.ofHours(1), Duration.ofMinutes(5))))));
+    }
+
+    // -----------------------------------------------------------------------
     // Multi-violation test (acceptance criterion: all in one exception)
     // -----------------------------------------------------------------------
 
@@ -357,16 +456,21 @@ class CacheSpecValidatorTest {
                 cbWith(0.0f, null, null, null, null, null, null)); // failure-rate=0
         CacheProperties.CacheSpec badJitter = specWithJitter(
                 CacheProperties.Tier.NEAR_CACHE, 0.7);
+        CacheProperties.CacheSpec badMaxIdle = specWithMaxIdle(
+                CacheProperties.Tier.NEAR_CACHE,
+                Duration.ofMinutes(1), Duration.ofMinutes(5)); // > ttl
 
         Throwable t = catchViolation(propertiesWithCaches(
-                Map.of("a", zeroTtl, "b", badLock, "c", badCb, "d", badJitter)));
+                Map.of("a", zeroTtl, "b", badLock, "c", badCb,
+                        "d", badJitter, "e", badMaxIdle)));
 
         assertThat(t.getMessage())
-                .contains("4 cache configuration violation(s)")
+                .contains("5 cache configuration violation(s)")
                 .contains("cache 'a'").contains("ttl must be positive")
                 .contains("cache 'b'").contains("lock-lease")
                 .contains("cache 'c'").contains("failure-rate-threshold")
-                .contains("cache 'd'").contains("ttl-jitter-ratio");
+                .contains("cache 'd'").contains("ttl-jitter-ratio")
+                .contains("cache 'e'").contains("max-idle");
     }
 
     // -----------------------------------------------------------------------
@@ -425,7 +529,7 @@ class CacheSpecValidatorTest {
         return new CacheProperties.CacheSpec(
                 CacheProperties.Tier.NEAR_CACHE, Duration.ofHours(1), 10_000,
                 Duration.ofSeconds(5), Duration.ofSeconds(30),
-                CacheProperties.Codec.JSON, null, null, null, 0.0);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null);
     }
 
     private static CacheProperties.CacheSpec spec(
@@ -433,7 +537,7 @@ class CacheSpecValidatorTest {
             Duration lockWait, Duration lockLease,
             CacheProperties.Codec codec, CacheProperties.CircuitBreaker cb) {
         return new CacheProperties.CacheSpec(
-                tier, ttl, 10_000, lockWait, lockLease, codec, cb, null, null, 0.0);
+                tier, ttl, 10_000, lockWait, lockLease, codec, cb, null, null, 0.0, null);
     }
 
     private static CacheProperties.CacheSpec specWithJitter(
@@ -441,7 +545,15 @@ class CacheSpecValidatorTest {
         return new CacheProperties.CacheSpec(
                 tier, Duration.ofHours(1), 10_000,
                 Duration.ofSeconds(5), Duration.ofSeconds(30),
-                CacheProperties.Codec.JSON, null, null, null, ratio);
+                CacheProperties.Codec.JSON, null, null, null, ratio, null);
+    }
+
+    private static CacheProperties.CacheSpec specWithMaxIdle(
+            CacheProperties.Tier tier, Duration ttl, Duration maxIdle) {
+        return new CacheProperties.CacheSpec(
+                tier, ttl, 10_000,
+                Duration.ofSeconds(5), Duration.ofSeconds(30),
+                CacheProperties.Codec.JSON, null, null, null, 0.0, maxIdle);
     }
 
     private static CacheProperties.CacheSpec specWithCb(CacheProperties.CircuitBreaker cb) {

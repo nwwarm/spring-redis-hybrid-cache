@@ -105,14 +105,41 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
         Caffeine<Object, Object> builder = Caffeine.newBuilder()
                 .maximumSize(spec.maximumSize())
                 .recordStats();
-        // ratio == 0 keeps the original expireAfterWrite path so the
-        // zero-ratio behaviour is byte-identical to pre-0.4.0. Caffeine
-        // forbids combining expireAfterWrite with expireAfter(Expiry),
-        // so the choice has to happen at builder-construction time.
-        if (spec.ttlJitterRatio() == 0.0) {
-            builder.expireAfterWrite(spec.ttl());
+        // Four-way branch over (ttlJitterRatio, maxIdle):
+        //   neither       → expireAfterWrite(ttl)               (pre-0.4.0 byte-identical)
+        //   maxIdle only  → expireAfterWrite(ttl) + expireAfterAccess(maxIdle)
+        //   jitter only   → expireAfter(JitteredExpiry)
+        //   both          → expireAfter(JitteredMaxIdleExpiry) + removalListener
+        //
+        // Caffeine forbids combining expireAfter(Expiry) with either
+        // expireAfterWrite(Duration) or expireAfterAccess(Duration), and
+        // the order of method calls on the builder doesn't change that —
+        // the choice has to be made up-front per spec.
+        boolean jittering = spec.ttlJitterRatio() > 0.0;
+        boolean maxIdling = spec.maxIdle() != null;
+        if (jittering && maxIdling) {
+            JitteredMaxIdleExpiry expiry = new JitteredMaxIdleExpiry(
+                    spec.ttl().toNanos(),
+                    spec.ttlJitterRatio(),
+                    spec.maxIdle().toNanos());
+            // Skip REPLACED: expireAfterUpdate has just written a fresh
+            // deadline, and removing it here would race that write. Every
+            // other cause (EXPIRED, EXPLICIT, SIZE, COLLECTED) leaves no
+            // further write to the sidecar, so cleanup is unconditional.
+            builder.expireAfter(expiry)
+                    .removalListener((k, v, cause) -> {
+                        if (k != null && cause != com.github.benmanes.caffeine.cache.RemovalCause.REPLACED) {
+                            expiry.onRemoval(k);
+                        }
+                    });
+        } else if (jittering) {
+            builder.expireAfter(new JitteredExpiry(
+                    spec.ttl().toNanos(), spec.ttlJitterRatio()));
+        } else if (maxIdling) {
+            builder.expireAfterWrite(spec.ttl())
+                    .expireAfterAccess(spec.maxIdle());
         } else {
-            builder.expireAfter(new JitteredExpiry(spec.ttl().toNanos(), spec.ttlJitterRatio()));
+            builder.expireAfterWrite(spec.ttl());
         }
         com.github.benmanes.caffeine.cache.Cache<Object, Object> nativeCache = builder.build();
         return new CaffeineCache(name, nativeCache, true);

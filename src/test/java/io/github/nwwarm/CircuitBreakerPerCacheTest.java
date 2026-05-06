@@ -128,13 +128,13 @@ class CircuitBreakerPerCacheTest {
                 Duration.ofMinutes(10), 1000,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
                 CacheProperties.Codec.JSON,
-                fooOverride, null, null, 0.0);
+                fooOverride, null, null, 0.0, null);
         CacheProperties.CacheSpec barSpec = new CacheProperties.CacheSpec(
                 CacheProperties.Tier.NEAR_CACHE,
                 Duration.ofMinutes(10), 1000,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
                 CacheProperties.Codec.JSON,
-                null, null, null, 0.0);
+                null, null, null, 0.0, null);
         CacheProperties props = new CacheProperties(
                 new CacheProperties.Server(
                         CacheProperties.Mode.SINGLE, "redis://localhost:6379",
@@ -188,7 +188,7 @@ class CircuitBreakerPerCacheTest {
                 Duration.ofMinutes(10), 100,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
                 CacheProperties.Codec.JSON,
-                null, null, null, 0.0);
+                null, null, null, 0.0, null);
         return new NearCache(springCache, spec, null, redisson, breaker, dispatcher,
                 new SimpleMeterRegistry(), new KeyLogFormatter(false, "test"));
     }

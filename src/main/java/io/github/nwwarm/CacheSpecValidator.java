@@ -42,6 +42,14 @@ import java.util.Map;
  *       {@code tier=DISTRIBUTED_ONLY}. Jitter only applies to the local
  *       Caffeine layer, and {@code DISTRIBUTED_ONLY} has no L1 — there is
  *       nothing for the value to apply to.</li>
+ *   <li>E17: {@code maxIdle}, when set, must be positive. Zero or
+ *       negative values express no useful semantic.</li>
+ *   <li>E18: {@code maxIdle} is rejected on {@code tier=DISTRIBUTED_ONLY}.
+ *       Same rationale as E16 — idle eviction acts on the L1 layer, and
+ *       {@code DISTRIBUTED_ONLY} has no L1.</li>
+ *   <li>E19: {@code maxIdle &gt; ttl} is rejected. A cold entry would
+ *       expire on TTL before max-idle could ever fire, so the field is a
+ *       no-op and almost certainly misconfiguration.</li>
  * </ul>
  *
  * <b>Per circuit-breaker block</b> (applies to
@@ -185,6 +193,37 @@ final class CacheSpecValidator {
                     + " jittering would have nothing to apply to. Either set"
                     + " ttl-jitter-ratio to 0.0 or change the tier to NEAR_CACHE"
                     + " or LOCAL_ONLY.");
+        }
+
+        // E17: max-idle, when set, must be positive.
+        if (spec.maxIdle() != null
+                && (spec.maxIdle().isZero() || spec.maxIdle().isNegative())) {
+            violations.add(label + ": max-idle must be positive when set"
+                    + " (got " + spec.maxIdle() + "); leave unset to disable"
+                    + " idle eviction");
+        }
+
+        // E18: max-idle only meaningful on tiers with an L1 layer.
+        if (spec.maxIdle() != null
+                && spec.tier() == CacheProperties.Tier.DISTRIBUTED_ONLY) {
+            violations.add(label + ": max-idle has no effect on"
+                    + " tier=DISTRIBUTED_ONLY. Idle eviction acts on the local"
+                    + " Caffeine (L1) layer; DISTRIBUTED_ONLY has no L1, so"
+                    + " there is nothing for max-idle to evict from. Either"
+                    + " unset max-idle or change the tier to NEAR_CACHE or"
+                    + " LOCAL_ONLY.");
+        }
+
+        // E19: max-idle > ttl is a no-op (TTL fires first on a cold entry)
+        // and almost certainly misconfiguration. Fail loudly at startup.
+        if (spec.maxIdle() != null && spec.ttl() != null
+                && !spec.maxIdle().isZero() && !spec.maxIdle().isNegative()
+                && !spec.ttl().isZero() && !spec.ttl().isNegative()
+                && spec.maxIdle().compareTo(spec.ttl()) > 0) {
+            violations.add(label + ": max-idle (" + spec.maxIdle()
+                    + ") must be <= ttl (" + spec.ttl() + "); a cold entry"
+                    + " expires on ttl before max-idle could ever fire, so"
+                    + " the field would be a no-op as configured");
         }
 
         // W1
