@@ -248,7 +248,97 @@ class CacheSpecValidatorTest {
     }
 
     // -----------------------------------------------------------------------
-    // Multi-violation test (acceptance criterion: all three in one exception)
+    // E15 — ttl-jitter-ratio range
+    // -----------------------------------------------------------------------
+
+    @Test
+    void e15_jitterRatioNegative_fails() {
+        assertViolation(
+                propertiesWithCaches(Map.of("foo",
+                        specWithJitter(CacheProperties.Tier.NEAR_CACHE, -0.1))),
+                "cache 'foo'", "ttl-jitter-ratio must be in [0.0, 0.5]");
+    }
+
+    @Test
+    void e15_jitterRatioAboveHalf_fails() {
+        assertViolation(
+                propertiesWithCaches(Map.of("foo",
+                        specWithJitter(CacheProperties.Tier.NEAR_CACHE, 0.51))),
+                "cache 'foo'", "ttl-jitter-ratio must be in [0.0, 0.5]");
+    }
+
+    @Test
+    void e15_jitterRatioZero_isValid() {
+        assertThatNoException().isThrownBy(() ->
+                CacheSpecValidator.validate(propertiesWithCaches(Map.of("foo",
+                        specWithJitter(CacheProperties.Tier.NEAR_CACHE, 0.0)))));
+    }
+
+    @Test
+    void e15_jitterRatioHalf_isValid() {
+        assertThatNoException().isThrownBy(() ->
+                CacheSpecValidator.validate(propertiesWithCaches(Map.of("foo",
+                        specWithJitter(CacheProperties.Tier.NEAR_CACHE, 0.5)))));
+    }
+
+    @Test
+    void e15_jitterRatioMidRange_isValid() {
+        assertThatNoException().isThrownBy(() ->
+                CacheSpecValidator.validate(propertiesWithCaches(Map.of("foo",
+                        specWithJitter(CacheProperties.Tier.NEAR_CACHE, 0.2)))));
+    }
+
+    @Test
+    void e15_onDefaultSpec_failsWithDefaultSpecLabel() {
+        CacheProperties.CacheSpec bad = specWithJitter(CacheProperties.Tier.NEAR_CACHE, 0.6);
+        assertViolation(propertiesWithDefaultSpec(bad),
+                "default-spec", "ttl-jitter-ratio must be in [0.0, 0.5]");
+    }
+
+    // -----------------------------------------------------------------------
+    // E16 — ttl-jitter-ratio > 0 incompatible with DISTRIBUTED_ONLY
+    // -----------------------------------------------------------------------
+
+    @Test
+    void e16_jitterOnDistributedOnly_fails() {
+        // DISTRIBUTED_ONLY has no L1 layer for jitter to apply to. The
+        // message has to explain the constraint, not just say "invalid",
+        // so an operator who set ttl-jitter-ratio on a session cache
+        // understands why the library is rejecting it.
+        Throwable t = catchViolation(propertiesWithCaches(Map.of("sessions",
+                specWithJitter(CacheProperties.Tier.DISTRIBUTED_ONLY, 0.2))));
+        assertThat(t.getMessage())
+                .contains("cache 'sessions'")
+                .contains("ttl-jitter-ratio > 0")
+                .contains("DISTRIBUTED_ONLY")
+                .contains("no L1");
+    }
+
+    @Test
+    void e16_jitterOnDistributedOnlyWithRatioZero_isValid() {
+        // ratio=0 is the no-op path — DISTRIBUTED_ONLY tolerates it because
+        // the value is the implicit default, not an operator declaring intent.
+        assertThatNoException().isThrownBy(() ->
+                CacheSpecValidator.validate(propertiesWithCaches(Map.of("sessions",
+                        specWithJitter(CacheProperties.Tier.DISTRIBUTED_ONLY, 0.0)))));
+    }
+
+    @Test
+    void e16_jitterOnLocalOnly_isValid() {
+        assertThatNoException().isThrownBy(() ->
+                CacheSpecValidator.validate(propertiesWithCaches(Map.of("rl",
+                        specWithJitter(CacheProperties.Tier.LOCAL_ONLY, 0.2)))));
+    }
+
+    @Test
+    void e16_jitterOnNearCache_isValid() {
+        assertThatNoException().isThrownBy(() ->
+                CacheSpecValidator.validate(propertiesWithCaches(Map.of("products",
+                        specWithJitter(CacheProperties.Tier.NEAR_CACHE, 0.2)))));
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-violation test (acceptance criterion: all in one exception)
     // -----------------------------------------------------------------------
 
     @Test
@@ -265,15 +355,18 @@ class CacheSpecValidatorTest {
                 CacheProperties.Codec.JSON, null);
         CacheProperties.CacheSpec badCb = specWithCb(
                 cbWith(0.0f, null, null, null, null, null, null)); // failure-rate=0
+        CacheProperties.CacheSpec badJitter = specWithJitter(
+                CacheProperties.Tier.NEAR_CACHE, 0.7);
 
         Throwable t = catchViolation(propertiesWithCaches(
-                Map.of("a", zeroTtl, "b", badLock, "c", badCb)));
+                Map.of("a", zeroTtl, "b", badLock, "c", badCb, "d", badJitter)));
 
         assertThat(t.getMessage())
-                .contains("3 cache configuration violation(s)")
+                .contains("4 cache configuration violation(s)")
                 .contains("cache 'a'").contains("ttl must be positive")
                 .contains("cache 'b'").contains("lock-lease")
-                .contains("cache 'c'").contains("failure-rate-threshold");
+                .contains("cache 'c'").contains("failure-rate-threshold")
+                .contains("cache 'd'").contains("ttl-jitter-ratio");
     }
 
     // -----------------------------------------------------------------------
@@ -332,7 +425,7 @@ class CacheSpecValidatorTest {
         return new CacheProperties.CacheSpec(
                 CacheProperties.Tier.NEAR_CACHE, Duration.ofHours(1), 10_000,
                 Duration.ofSeconds(5), Duration.ofSeconds(30),
-                CacheProperties.Codec.JSON, null, null, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0);
     }
 
     private static CacheProperties.CacheSpec spec(
@@ -340,7 +433,15 @@ class CacheSpecValidatorTest {
             Duration lockWait, Duration lockLease,
             CacheProperties.Codec codec, CacheProperties.CircuitBreaker cb) {
         return new CacheProperties.CacheSpec(
-                tier, ttl, 10_000, lockWait, lockLease, codec, cb, null, null);
+                tier, ttl, 10_000, lockWait, lockLease, codec, cb, null, null, 0.0);
+    }
+
+    private static CacheProperties.CacheSpec specWithJitter(
+            CacheProperties.Tier tier, double ratio) {
+        return new CacheProperties.CacheSpec(
+                tier, Duration.ofHours(1), 10_000,
+                Duration.ofSeconds(5), Duration.ofSeconds(30),
+                CacheProperties.Codec.JSON, null, null, null, ratio);
     }
 
     private static CacheProperties.CacheSpec specWithCb(CacheProperties.CircuitBreaker cb) {

@@ -54,7 +54,8 @@ public record CacheProperties(
                     Codec.JSON,
                     null,
                     null,
-                    null);
+                    null,
+                    0.0);
         }
     }
 
@@ -228,7 +229,8 @@ public record CacheProperties(
             Codec codec,
             CircuitBreaker circuitBreaker,
             Integer maxConcurrentLoaders,
-            Duration loaderAcquireTimeout) {
+            Duration loaderAcquireTimeout,
+            double ttlJitterRatio) {
 
         public CacheSpec {
             if (tier == null) tier = Tier.NEAR_CACHE;
@@ -242,6 +244,9 @@ public record CacheProperties(
             // maxConcurrentLoaders get a sensible wait without an extra knob,
             // but the two are independently overridable.
             if (loaderAcquireTimeout == null) loaderAcquireTimeout = lockWait;
+            // ttlJitterRatio defaults to 0.0 (no jitter, pre-0.4.0 byte-identical
+            // path). Range/tier validation happens in CacheSpecValidator so the
+            // failure surfaces alongside other config violations.
         }
     }
 

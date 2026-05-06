@@ -34,6 +34,14 @@ import java.util.Map;
  *       {@code cache.kryo.registered-classes} to be non-empty. Kryo without
  *       class registration accepts arbitrary class names from the wire —
  *       the same threat model as Jackson's permissive default typing.</li>
+ *   <li>E15: {@code ttlJitterRatio ∈ [0.0, 0.5]}. Negative ratios make no
+ *       physical sense; ratios above 0.5 produce expiries that can fall
+ *       below half the configured TTL, which stops being "spread the spike"
+ *       and starts being "halve the cache lifetime."</li>
+ *   <li>E16: {@code ttlJitterRatio > 0} is rejected on
+ *       {@code tier=DISTRIBUTED_ONLY}. Jitter only applies to the local
+ *       Caffeine layer, and {@code DISTRIBUTED_ONLY} has no L1 — there is
+ *       nothing for the value to apply to.</li>
  * </ul>
  *
  * <b>Per circuit-breaker block</b> (applies to
@@ -158,6 +166,25 @@ final class CacheSpecValidator {
                     || spec.loaderAcquireTimeout().isNegative())) {
             violations.add(label + ": loader-acquire-timeout must be positive when"
                     + " max-concurrent-loaders is set (got " + spec.loaderAcquireTimeout() + ")");
+        }
+
+        // E15: ttl-jitter-ratio must be in [0.0, 0.5].
+        double ratio = spec.ttlJitterRatio();
+        if (ratio < 0.0 || ratio > 0.5) {
+            violations.add(label + ": ttl-jitter-ratio must be in [0.0, 0.5]"
+                    + " (got " + ratio + "); 0.0 disables jitter, 0.5 is the upper"
+                    + " bound — beyond that, expiries can fall below half the"
+                    + " configured TTL and the value stops behaving like jitter");
+        }
+
+        // E16: ttl-jitter-ratio > 0 only meaningful on tiers with an L1 layer.
+        if (ratio > 0.0 && spec.tier() == CacheProperties.Tier.DISTRIBUTED_ONLY) {
+            violations.add(label + ": ttl-jitter-ratio > 0 has no effect on"
+                    + " tier=DISTRIBUTED_ONLY. Jitter applies only to the local"
+                    + " Caffeine (L1) layer; DISTRIBUTED_ONLY has no L1, so"
+                    + " jittering would have nothing to apply to. Either set"
+                    + " ttl-jitter-ratio to 0.0 or change the tier to NEAR_CACHE"
+                    + " or LOCAL_ONLY.");
         }
 
         // W1

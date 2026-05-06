@@ -412,6 +412,7 @@ Notable log lines and their operational meaning:
 | `cache.default-spec.lock-wait` | `5s` | How long to wait for the cross-node lock before falling through. |
 | `cache.default-spec.lock-lease` | `30s` | Lock holder's lease before automatic release. Must exceed worst-case loader latency. |
 | `cache.default-spec.codec` | `JSON` | L2 wire format. `JSON` (debuggable) or `KRYO` (compact, faster). |
+| `cache.default-spec.ttl-jitter-ratio` | `0.0` | Per-entry random spread on the L1 (Caffeine) TTL. Each entry's effective expiry is `ttl ± uniform(ttl·ratio)`, sampled at insert/update. Spreads coordinated reload spikes when many entries expire together. Range `[0.0, 0.5]`; `0.0` disables jitter. Applies only to L1 — L2 TTLs are unchanged. Rejected on `tier=DISTRIBUTED_ONLY` (no L1 to apply it to). |
 | `cache.caches.<name>.*` | inherits default-spec | Per-cache overrides. |
 
 ---

@@ -102,11 +102,19 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
     }
 
     private CaffeineCache buildCaffeineCache(String name, CacheProperties.CacheSpec spec) {
-        com.github.benmanes.caffeine.cache.Cache<Object, Object> nativeCache = Caffeine.newBuilder()
-                .expireAfterWrite(spec.ttl())
+        Caffeine<Object, Object> builder = Caffeine.newBuilder()
                 .maximumSize(spec.maximumSize())
-                .recordStats()
-                .build();
+                .recordStats();
+        // ratio == 0 keeps the original expireAfterWrite path so the
+        // zero-ratio behaviour is byte-identical to pre-0.4.0. Caffeine
+        // forbids combining expireAfterWrite with expireAfter(Expiry),
+        // so the choice has to happen at builder-construction time.
+        if (spec.ttlJitterRatio() == 0.0) {
+            builder.expireAfterWrite(spec.ttl());
+        } else {
+            builder.expireAfter(new JitteredExpiry(spec.ttl().toNanos(), spec.ttlJitterRatio()));
+        }
+        com.github.benmanes.caffeine.cache.Cache<Object, Object> nativeCache = builder.build();
         return new CaffeineCache(name, nativeCache, true);
     }
 
