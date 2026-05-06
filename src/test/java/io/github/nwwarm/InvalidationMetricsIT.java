@@ -129,7 +129,7 @@ class InvalidationMetricsIT extends RedisTestBase {
                     CacheProperties.Tier.DISTRIBUTED_ONLY,
                     Duration.ofMinutes(10), 10_000,
                     Duration.ofSeconds(2), Duration.ofSeconds(10),
-                    CacheProperties.Codec.JSON, null, null, null, 0.0, null);
+                    CacheProperties.Codec.JSON, null, null, null, 0.0, null, null);
             InvalidationDispatcher dispatcher = new InvalidationDispatcher(
                     redisson, "node-A", registry);
             DistributedOnlyCache cache = new DistributedOnlyCache(

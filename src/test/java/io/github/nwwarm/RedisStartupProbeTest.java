@@ -92,7 +92,7 @@ class RedisStartupProbeTest {
                 CacheProperties.Tier.LOCAL_ONLY,
                 Duration.ofMinutes(10), 10_000,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
-                CacheProperties.Codec.JSON, null, null, null, 0.0, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null);
         CacheProperties props = new CacheProperties(
                 singleServer(),
                 Map.of("a", localOnly, "b", localOnly),
@@ -102,7 +102,7 @@ class RedisStartupProbeTest {
                 null, null, null, false, null,
                 new CacheProperties.StartupProbe(true,
                         Duration.ofSeconds(1), 0, Duration.ZERO),
-                null);
+                null, null);
 
         RedisStartupProbe probe = new RedisStartupProbe(redisson, props);
         assertThat(catchThrowable(probe::afterPropertiesSet)).isNull();
@@ -121,12 +121,12 @@ class RedisStartupProbeTest {
                 CacheProperties.Tier.LOCAL_ONLY,
                 Duration.ofMinutes(10), 10_000,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
-                CacheProperties.Codec.JSON, null, null, null, 0.0, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null);
         CacheProperties.CacheSpec nearCache = new CacheProperties.CacheSpec(
                 CacheProperties.Tier.NEAR_CACHE,
                 Duration.ofMinutes(10), 10_000,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
-                CacheProperties.Codec.JSON, null, null, null, 0.0, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null);
         CacheProperties props = new CacheProperties(
                 singleServer(),
                 Map.of("hot", nearCache),    // one cache uses Redis
@@ -136,7 +136,7 @@ class RedisStartupProbeTest {
                 null, null, null, false, null,
                 new CacheProperties.StartupProbe(true,
                         Duration.ofSeconds(1), 0, Duration.ZERO),
-                null);
+                null, null);
 
         RedisStartupProbe probe = new RedisStartupProbe(redisson, props);
         assertThat(catchThrowable(probe::afterPropertiesSet)).isNull();
@@ -161,7 +161,7 @@ class RedisStartupProbeTest {
                 List.of("io.github.nwwarm."),
                 null, null, null, false, null,
                 new CacheProperties.StartupProbe(true, Duration.ofMillis(50), 0, Duration.ZERO),
-                null);
+                null, null);
 
         RedisStartupProbe probe = new RedisStartupProbe(redisson, props);
         assertThatThrownBy(probe::afterPropertiesSet)
@@ -187,7 +187,7 @@ class RedisStartupProbeTest {
                 List.of("io.github.nwwarm."),
                 null, null, null, false, null,
                 new CacheProperties.StartupProbe(true, Duration.ofMillis(50), 0, Duration.ZERO),
-                null);
+                null, null);
 
         RedisStartupProbe probe = new RedisStartupProbe(redisson, props);
         assertThatThrownBy(probe::afterPropertiesSet)
@@ -223,7 +223,7 @@ class RedisStartupProbeTest {
                 tier,
                 Duration.ofMinutes(10), 10_000,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
-                CacheProperties.Codec.JSON, null, null, null, 0.0, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null);
         return new CacheProperties(
                 singleServer(),
                 Map.of(),
@@ -231,7 +231,7 @@ class RedisStartupProbeTest {
                 "node",
                 List.of("io.github.nwwarm."),
                 null, null, null, false, null,
-                probe, null);
+                probe, null, null);
     }
 
     private static CacheProperties.Server singleServer() {

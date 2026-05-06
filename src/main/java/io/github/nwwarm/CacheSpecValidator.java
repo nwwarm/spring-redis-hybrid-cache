@@ -69,6 +69,20 @@ import java.util.Map;
  *   <li>E12: {@code permittedNumberOfCallsInHalfOpenState ≥ 1}</li>
  * </ul>
  *
+ * <b>Per preloader block</b> (only checked when {@code enabled=true},
+ * mirroring the startup-probe philosophy):
+ * <ul>
+ *   <li>E24: {@code preloader.enabled=true} requires {@code tier=NEAR_CACHE}.
+ *       Rejected on {@code LOCAL_ONLY} (no L2 to prefetch from) and
+ *       {@code DISTRIBUTED_ONLY} (no L1 to populate).</li>
+ *   <li>E25: {@code store-interval}, {@code store-initial-delay}, and
+ *       {@code prefetch-timeout} must each be positive.</li>
+ *   <li>E26: {@code prefetch-concurrency} must be {@code >= 1}.</li>
+ *   <li>E27: directory creatability is checked at {@code PreloaderCoordinator.start()},
+ *       not in this validator — the validator does not touch the filesystem.</li>
+ *   <li>E28: {@code max-stored-keys}, when set, must be {@code >= 1}. {@code null} means unbounded.</li>
+ * </ul>
+ *
  * <b>Per invalidation block</b>:
  * <ul>
  *   <li>E23: {@code invalidation.shardedPubsub=true} is allowed only when
@@ -149,6 +163,60 @@ final class CacheSpecValidator {
             throw new IllegalArgumentException(
                     violations.size() + " cache configuration violation(s):\n  - "
                             + String.join("\n  - ", violations));
+        }
+    }
+
+    private static void validatePreloader(String label,
+                                          CacheProperties.CacheSpec spec,
+                                          List<String> violations) {
+        CacheProperties.Preloader p = spec.preloader();
+
+        // E24: NEAR_CACHE-only. LOCAL_ONLY has no L2 to prefetch from;
+        // DISTRIBUTED_ONLY has no L1 to populate. Either reject is loud.
+        if (spec.tier() != CacheProperties.Tier.NEAR_CACHE) {
+            violations.add(label + ": preloader.enabled=true requires"
+                    + " tier=NEAR_CACHE (got " + spec.tier() + "). LOCAL_ONLY"
+                    + " has no L2 to prefetch from; DISTRIBUTED_ONLY has no"
+                    + " L1 to populate.");
+        }
+
+        // E25: every Duration must be positive. Zero is the no-useful-semantic
+        // case (e.g. zero store-interval = scheduled-fixed-delay rejection).
+        if (p.storeInterval() == null || p.storeInterval().isZero() || p.storeInterval().isNegative()) {
+            violations.add(label + ": preloader.store-interval must be positive"
+                    + " (got " + p.storeInterval() + ")");
+        }
+        if (p.storeInitialDelay() == null
+                || p.storeInitialDelay().isZero()
+                || p.storeInitialDelay().isNegative()) {
+            violations.add(label + ": preloader.store-initial-delay must be positive"
+                    + " (got " + p.storeInitialDelay() + ")");
+        }
+        if (p.prefetchTimeout() == null
+                || p.prefetchTimeout().isZero()
+                || p.prefetchTimeout().isNegative()) {
+            violations.add(label + ": preloader.prefetch-timeout must be positive"
+                    + " (got " + p.prefetchTimeout() + ")");
+        }
+
+        // E26: prefetch-concurrency must be >= 1.
+        if (p.prefetchConcurrency() < 1) {
+            violations.add(label + ": preloader.prefetch-concurrency must be >= 1"
+                    + " (got " + p.prefetchConcurrency() + ")");
+        }
+
+        // E27 (directory creatability): NOT enforced here. The validator does
+        // not touch the filesystem — that would side-effect from a unit-tested
+        // class. The check lives in PreloaderCoordinator.start(): if the
+        // directory cannot be created or is unwritable, that bean's start()
+        // throws and Spring fails context refresh. Same "fail at startup, not
+        // on first store" guarantee, just one layer up.
+
+        // E28: max-stored-keys, when set, must be >= 1. null = unbounded.
+        if (p.maxStoredKeys() != null && p.maxStoredKeys() < 1) {
+            violations.add(label + ": preloader.max-stored-keys must be >= 1"
+                    + " when set (got " + p.maxStoredKeys()
+                    + "); leave unset for unbounded");
         }
     }
 
@@ -297,6 +365,12 @@ final class CacheSpecValidator {
                     + ") must be <= ttl (" + spec.ttl() + "); a cold entry"
                     + " expires on ttl before max-idle could ever fire, so"
                     + " the field would be a no-op as configured");
+        }
+
+        // Preloader (only validated when enabled — disabled-with-bogus-values
+        // mirrors the startup-probe philosophy: no gating on unrelated typos).
+        if (spec.preloader() != null && spec.preloader().enabled()) {
+            validatePreloader(label, spec, violations);
         }
 
         // W1

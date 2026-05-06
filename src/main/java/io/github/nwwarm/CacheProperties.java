@@ -35,7 +35,8 @@ public record CacheProperties(
         boolean logKeys,
         String logKeySalt,
         StartupProbe startupProbe,
-        Invalidation invalidation) {
+        Invalidation invalidation,
+        PreloaderGlobal preloader) {
 
     private static final Logger log = LoggerFactory.getLogger(CacheProperties.class);
     private static final Set<String> WARNED_NAMES = ConcurrentHashMap.newKeySet();
@@ -48,6 +49,7 @@ public record CacheProperties(
         if (resilience == null) resilience = new Resilience(null);
         if (startupProbe == null) startupProbe = new StartupProbe(false, null, 1, null);
         if (invalidation == null) invalidation = new Invalidation(false);
+        if (preloader == null) preloader = new PreloaderGlobal(4);
         if (defaultSpec == null) {
             defaultSpec = new CacheSpec(
                     Tier.NEAR_CACHE,
@@ -60,6 +62,7 @@ public record CacheProperties(
                     null,
                     null,
                     0.0,
+                    null,
                     null);
         }
     }
@@ -270,6 +273,96 @@ public record CacheProperties(
     public record Invalidation(boolean shardedPubsub) {}
 
     /**
+     * Global preloader knobs. The per-cache configuration lives on
+     * {@link CacheSpec#preloader()}; this record carries settings that span
+     * every preloader-enabled cache.
+     *
+     * @param schedulerPoolSize threads in the shared scheduler that runs
+     *        <em>periodic stores only</em>. Sized for steady-state idle work
+     *        (every cache stores once per {@code store-interval}, default
+     *        10m), not for the boot prefetch burst — the burst runs on a
+     *        separate executor, sized by the sum of per-cache
+     *        {@code prefetch-concurrency}, that exists only until prefetch
+     *        deadlines fire. Default {@code 4}; see
+     *        {@code docs/preloader-design.md} §7 for rationale.
+     */
+    public record PreloaderGlobal(int schedulerPoolSize) {
+        public PreloaderGlobal {
+            if (schedulerPoolSize <= 0) schedulerPoolSize = 4;
+        }
+    }
+
+    /**
+     * Per-cache near-cache preloader configuration.
+     *
+     * <p>When {@link #enabled} is {@code true} on a {@code NEAR_CACHE} tier,
+     * the library persists the L1 key set to a snapshot file on disk every
+     * {@link #storeInterval}; on startup the file is loaded and a bounded
+     * prefetch fan-out re-populates L1 from L2 — closing the cold-start
+     * latency gap for applications with predictable working sets.
+     *
+     * <p><b>L2-only prefetch.</b> At startup the cache is repopulated from
+     * L2 only. Keys whose values have already expired in L2 stay cold until
+     * first access; the loader runs through the normal {@code @Cacheable}
+     * path. There is no knob to opt into loader-driven warmup — invoking
+     * the loader during startup would create a thundering-herd against the
+     * source-of-truth at exactly the worst moment.
+     *
+     * <p><b>Tiers.</b> Allowed only on {@code NEAR_CACHE}. Rejected on
+     * {@code LOCAL_ONLY} (no L2 to prefetch from) and
+     * {@code DISTRIBUTED_ONLY} (no L1 to populate).
+     *
+     * <p>See {@code docs/preloader-design.md} for the full design.
+     *
+     * @param enabled            opt-in. Default {@code false}.
+     * @param directory          where the snapshot file lives. {@code null}
+     *                           defaults to
+     *                           {@code ${java.io.tmpdir}/hybrid-cache/<application-name>/<cache-name>}.
+     *                           Library creates it if missing, owner-only on
+     *                           POSIX ({@code 0700} directory, {@code 0600}
+     *                           file). On Windows, snapshot file permissions
+     *                           are not enforced; the snapshot inherits the
+     *                           parent directory's ACL. Operators concerned
+     *                           about disk-resident key sets should choose a
+     *                           {@code directory} whose ACL restricts access
+     *                           appropriately.
+     * @param storeInterval      how often the key set is written. Default
+     *                           {@code 10m}.
+     * @param storeInitialDelay  delay before the first store. Default
+     *                           {@code 1m}. Avoids a write storm during
+     *                           warm-up.
+     * @param prefetchConcurrency bounded concurrency for the startup
+     *                           prefetch fan-out, per cache. Default
+     *                           {@code 16}.
+     * @param prefetchTimeout    cap on total prefetch time at startup;
+     *                           remaining keys are skipped after the
+     *                           deadline. Default {@code 30s}.
+     * @param maxStoredKeys      hard cap on lines written per snapshot.
+     *                           {@code null} (default) means no cap beyond
+     *                           {@code maximum-size}. <b>Truncation order
+     *                           is not guaranteed</b> — the library does
+     *                           not promise any particular order when the
+     *                           cap is hit.
+     */
+    public record Preloader(
+            boolean enabled,
+            String directory,
+            Duration storeInterval,
+            Duration storeInitialDelay,
+            int prefetchConcurrency,
+            Duration prefetchTimeout,
+            Integer maxStoredKeys) {
+
+        public Preloader {
+            if (storeInterval == null) storeInterval = Duration.ofMinutes(10);
+            if (storeInitialDelay == null) storeInitialDelay = Duration.ofMinutes(1);
+            if (prefetchConcurrency <= 0) prefetchConcurrency = 16;
+            if (prefetchTimeout == null) prefetchTimeout = Duration.ofSeconds(30);
+            // maxStoredKeys: null = unbounded (beyond maximum-size)
+        }
+    }
+
+    /**
      * Circuit-breaker configuration. Used in two places:
      *
      * <ul>
@@ -311,7 +404,8 @@ public record CacheProperties(
             Integer maxConcurrentLoaders,
             Duration loaderAcquireTimeout,
             double ttlJitterRatio,
-            Duration maxIdle) {
+            Duration maxIdle,
+            Preloader preloader) {
 
         public CacheSpec {
             if (tier == null) tier = Tier.NEAR_CACHE;
@@ -330,6 +424,8 @@ public record CacheProperties(
             // failure surfaces alongside other config violations.
             // maxIdle defaults to null (no idle eviction). Range/tier validation
             // also lives in CacheSpecValidator.
+            // preloader defaults to null = disabled. Tier validation
+            // (NEAR_CACHE-only) also lives in CacheSpecValidator.
         }
     }
 

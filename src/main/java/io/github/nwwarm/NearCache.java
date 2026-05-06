@@ -493,6 +493,17 @@ public class NearCache implements HybridCache, InvalidationListener {
 
     // ---------- Generation counter ----------
 
+    /**
+     * Package-private accessor for the locally cached generation. Used by
+     * {@code NearCachePreloader} to stamp the snapshot header without
+     * paying for a fresh Redis round-trip on every store. Returns the
+     * exact value {@link #currentGeneration()} would return without
+     * triggering its refresh-due path.
+     */
+    long localGeneration() {
+        return localGeneration.get();
+    }
+
     private long currentGeneration() {
         long observed = lastRefreshNanos.get();
         long now = System.nanoTime();

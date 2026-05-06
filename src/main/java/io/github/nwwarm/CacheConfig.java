@@ -367,6 +367,19 @@ public class CacheConfig {
     }
 
     @Bean
+    @ConditionalOnMissingBean
+    public PreloaderCoordinator preloaderCoordinator(CacheProperties properties,
+                                                     MeterRegistry meterRegistry) {
+        // Registered unconditionally. If no caches enable the preloader the
+        // coordinator's start() spins up a 4-thread daemon scheduler that
+        // sits idle for the lifetime of the JVM — cheap. Conditional
+        // registration would require a custom Condition that scans every
+        // configured cache for preloader.enabled=true; not worth the
+        // complexity for a sub-millisecond startup tax.
+        return new PreloaderCoordinator(properties, meterRegistry);
+    }
+
+    @Bean
     @ConditionalOnMissingBean(CacheManager.class)
     public HybridCacheManager cacheManager(CacheProperties properties,
                                            RedissonClient redisson,
@@ -374,7 +387,8 @@ public class CacheConfig {
                                            InvalidationDispatcher invalidationDispatcher,
                                            MeterRegistry meterRegistry,
                                            CodecResolver codecResolver,
-                                           KeyLogFormatter keyLogFormatter) {
+                                           KeyLogFormatter keyLogFormatter,
+                                           PreloaderCoordinator preloaderCoordinator) {
         return new HybridCacheManager(
                 properties,
                 redisson,
@@ -382,7 +396,8 @@ public class CacheConfig {
                 invalidationDispatcher,
                 meterRegistry,
                 codecResolver,
-                keyLogFormatter);
+                keyLogFormatter,
+                preloaderCoordinator);
     }
 
     /**

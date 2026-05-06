@@ -41,6 +41,7 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
     private final MeterRegistry meterRegistry;
     private final CodecResolver codecResolver;
     private final KeyLogFormatter keyLogFormatter;
+    private final PreloaderCoordinator preloaderCoordinator;
 
     private final List<NearCache> nearCaches = new CopyOnWriteArrayList<>();
     private final List<DistributedOnlyCache> distributedCaches = new CopyOnWriteArrayList<>();
@@ -52,6 +53,18 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
                               MeterRegistry meterRegistry,
                               CodecResolver codecResolver,
                               KeyLogFormatter keyLogFormatter) {
+        this(properties, redisson, circuitBreakerRegistry, dispatcher,
+                meterRegistry, codecResolver, keyLogFormatter, null);
+    }
+
+    public HybridCacheManager(CacheProperties properties,
+                              RedissonClient redisson,
+                              CircuitBreakerRegistry circuitBreakerRegistry,
+                              InvalidationDispatcher dispatcher,
+                              MeterRegistry meterRegistry,
+                              CodecResolver codecResolver,
+                              KeyLogFormatter keyLogFormatter,
+                              PreloaderCoordinator preloaderCoordinator) {
         // Fail fast on configured cache names that contain ':'. Names that
         // fall through to defaultSpec (i.e., not listed in cache.caches.*)
         // are validated lazily in getMissingCache.
@@ -63,6 +76,7 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
         this.meterRegistry = meterRegistry;
         this.codecResolver = codecResolver;
         this.keyLogFormatter = keyLogFormatter;
+        this.preloaderCoordinator = preloaderCoordinator;
     }
 
     @Override
@@ -96,6 +110,17 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
                         buildCaffeineCache(name, spec),
                         spec, bucketCodec, redisson, breaker, dispatcher, meterRegistry, keyLogFormatter);
                 nearCaches.add(near);
+                // Preloader registration runs *after* the cache is fully
+                // built and the dispatcher has registered the listener
+                // (NearCache constructor does the latter). The order
+                // matters: any invalidation messages received during
+                // prefetch land on a cache whose dispatcher subscription
+                // is already in place. See design doc §4 ("Lifecycle").
+                if (preloaderCoordinator != null
+                        && spec.preloader() != null
+                        && spec.preloader().enabled()) {
+                    preloaderCoordinator.register(name, near, spec.preloader());
+                }
                 yield near;
             }
         };
