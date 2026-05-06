@@ -267,11 +267,12 @@ public class CacheConfig {
     @Bean
     @ConditionalOnMissingBean
     InvalidationDispatcher invalidationDispatcher(RedissonClient redisson,
-                                                  CacheProperties properties) {
+                                                  CacheProperties properties,
+                                                  MeterRegistry meterRegistry) {
         String nodeId = properties.nodeId() != null && !properties.nodeId().isBlank()
                 ? properties.nodeId()
                 : UUID.randomUUID().toString();
-        return new InvalidationDispatcher(redisson, nodeId);
+        return new InvalidationDispatcher(redisson, nodeId, meterRegistry);
     }
 
     /**

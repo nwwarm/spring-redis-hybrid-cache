@@ -83,6 +83,14 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener {
     private final Counter breakerOpen;
     private final Timer getLatency;
     private final LoaderGate loaderGate;
+    /**
+     * cache.invalidations.published{cache, op=clear}. DistributedOnlyCache
+     * publishes only on clear/clearImmediate — there is no L1 to keep
+     * coherent on per-key writes, so put/evict do not publish and have no
+     * counter. The metric name and tag scheme match NearCache so dashboards
+     * can union across tiers.
+     */
+    private final Counter publishedClear;
 
     public DistributedOnlyCache(String cacheName,
                                 CacheProperties.CacheSpec spec,
@@ -122,6 +130,8 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener {
                 .tag("cache", cacheName).register(meterRegistry);
         this.loaderGate = new LoaderGate(cacheName,
                 spec.maxConcurrentLoaders(), spec.loaderAcquireTimeout(), meterRegistry);
+        this.publishedClear = Counter.builder("cache.invalidations.published")
+                .tag("cache", cacheName).tag("op", "clear").register(meterRegistry);
     }
 
     @Override
@@ -363,7 +373,9 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener {
                             dispatcher.getNodeId(), cacheName, InvalidationMessage.OP_CLEAR, null)));
         } catch (Exception e) {
             // Suppressed — peers will catch up via the 1s generation poll.
+            return;
         }
+        publishedClear.increment();
     }
 
     /**

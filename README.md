@@ -335,6 +335,10 @@ The library exposes the following Micrometer metrics, tagged by cache name:
 | `cache.l2.get.latency{cache}` | timer | L2 read latency. Watch p99 — sustained increase signals Redis or network degradation. |
 | `cache.l2.failures{cache}` | counter | Exceptions during L2 operations. |
 | `cache.l2.breaker.open{cache}` | counter | Number of L2 calls rejected by an open breaker. |
+| `cache.invalidations.published{cache, op=put\|evict\|clear}` | counter | Successful pub/sub publishes. Increments after `RTopic.publish()` returns; not incremented on breaker-open or transient publish failure. |
+| `cache.invalidations.received{cache, op=invalidate\|clear}` | counter | Messages received from peers (after self-skip). Wire op `OP_INVALIDATE` covers both `put` and `evict`, hence `invalidate` as the receiver-side label. |
+| `cache.invalidations.received.unknown{cache, op}` | counter | Messages received for cache names this node doesn't host. A non-zero value means deployment drift — one node has a cache the other doesn't, or a forged/stale message is on the topic. |
+| `cache.invalidations.suppressed.cold_load{cache}` | counter | Cold-load completions that intentionally did not publish (peer L1 has nothing stale to drop). Different question from the publish/receive pair — leaves the publish path quieter than naive write-through would. |
 | `resilience4j.circuitbreaker.state{name=redis-cache}` | gauge | Breaker state. 0=closed, 1=half-open, 2=open. |
 | `cache.size{cache}` | gauge | Current Caffeine entry count. |
 

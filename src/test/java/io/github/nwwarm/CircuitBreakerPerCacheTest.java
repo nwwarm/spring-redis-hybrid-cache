@@ -59,7 +59,7 @@ class CircuitBreakerPerCacheTest {
         // The dispatcher is package-private and used by NearCache. With deep
         // stubs, redisson.getTopic(...).addListener(...) returns 0 (int default)
         // — sufficient for these tests since we never publish.
-        dispatcher = new InvalidationDispatcher(redisson, "test-node");
+        dispatcher = new InvalidationDispatcher(redisson, "test-node", new SimpleMeterRegistry());
     }
 
     @Test

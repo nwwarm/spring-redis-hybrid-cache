@@ -444,7 +444,7 @@ class LoaderConcurrencyCapIT extends RedisTestBase {
                 .recordStats()
                 .build();
         CaffeineCache springCache = new CaffeineCache(name, nativeCache, true);
-        InvalidationDispatcher dispatcher = new InvalidationDispatcher(client, "node-" + name);
+        InvalidationDispatcher dispatcher = new InvalidationDispatcher(client, "node-" + name, meters);
         return new NearCache(springCache, spec, null, client, breaker, dispatcher,
                 meters, new KeyLogFormatter(false, "test"));
     }

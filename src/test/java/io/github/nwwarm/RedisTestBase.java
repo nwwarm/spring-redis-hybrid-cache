@@ -139,7 +139,7 @@ public abstract class RedisTestBase {
                 .recordStats()
                 .build();
         CaffeineCache springCache = new CaffeineCache(name, caffeineNative, true);
-        InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, nodeId);
+        InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, nodeId, meterRegistry);
         return new NearCache(springCache, spec, resolveTestCodec(codec), redisson,
                 breaker, dispatcher, meterRegistry, new KeyLogFormatter(false, "test"));
     }
@@ -159,9 +159,10 @@ public abstract class RedisTestBase {
                 Duration.ofMinutes(10), 10_000,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
                 CacheProperties.Codec.JSON, null, null, null, 0.0, null);
-        InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, nodeId);
+        MeterRegistry meterRegistry = new SimpleMeterRegistry();
+        InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, nodeId, meterRegistry);
         return new DistributedOnlyCache(name, spec, resolveTestCodec(spec.codec()),
-                redisson, breaker, dispatcher, new SimpleMeterRegistry(),
+                redisson, breaker, dispatcher, meterRegistry,
                 new KeyLogFormatter(false, "test"));
     }
 

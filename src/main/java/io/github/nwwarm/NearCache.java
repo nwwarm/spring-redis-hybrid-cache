@@ -85,6 +85,14 @@ public class NearCache implements HybridCache, InvalidationListener {
     private final Counter l2BreakerOpen;
     private final Timer l2GetLatency;
     private final Counter invalidationsSuppressedColdLoad;
+    // cache.invalidations.published{cache, op} — counts only successful
+    // RTopic.publish() calls. The published-vs-received delta on a healthy
+    // cluster should be (sources × peers); a divergence flags pub/sub or
+    // breaker issues. Three pre-registered counters because tag values are
+    // a small fixed set; pre-registration avoids per-publish lookup.
+    private final Counter publishedPut;
+    private final Counter publishedEvict;
+    private final Counter publishedClear;
 
     public NearCache(Cache caffeineCache,
                      CacheProperties.CacheSpec spec,
@@ -122,6 +130,12 @@ public class NearCache implements HybridCache, InvalidationListener {
                 .tag("cache", cacheName).register(meterRegistry);
         this.invalidationsSuppressedColdLoad = Counter.builder("cache.invalidations.suppressed.cold_load")
                 .tag("cache", cacheName).register(meterRegistry);
+        this.publishedPut = Counter.builder("cache.invalidations.published")
+                .tag("cache", cacheName).tag("op", "put").register(meterRegistry);
+        this.publishedEvict = Counter.builder("cache.invalidations.published")
+                .tag("cache", cacheName).tag("op", "evict").register(meterRegistry);
+        this.publishedClear = Counter.builder("cache.invalidations.published")
+                .tag("cache", cacheName).tag("op", "clear").register(meterRegistry);
 
         Object native_ = caffeineCache.getNativeCache();
         if (native_ instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineNative) {
@@ -329,7 +343,7 @@ public class NearCache implements HybridCache, InvalidationListener {
         // then remote, then publish so other nodes invalidate and lazy-load.
         caffeineCache.put(stringKey, value);
         writeToL2(stringKey, value);
-        publishInvalidation(InvalidationMessage.OP_INVALIDATE, stringKey);
+        publishInvalidation(InvalidationMessage.OP_INVALIDATE, "put", stringKey);
     }
 
     @Override
@@ -343,7 +357,7 @@ public class NearCache implements HybridCache, InvalidationListener {
         // coherence is bounded by TTL when the L2 evict failed).
         boolean l2Deleted = deleteFromL2(stringKey);
         if (l2Deleted) {
-            publishInvalidation(InvalidationMessage.OP_INVALIDATE, stringKey);
+            publishInvalidation(InvalidationMessage.OP_INVALIDATE, "evict", stringKey);
         }
         caffeineCache.evict(stringKey);
     }
@@ -352,7 +366,7 @@ public class NearCache implements HybridCache, InvalidationListener {
     public void clear() {
         caffeineCache.clear();
         bumpGeneration();
-        publishInvalidation(InvalidationMessage.OP_CLEAR, null);
+        publishInvalidation(InvalidationMessage.OP_CLEAR, "clear", null);
     }
 
     /**
@@ -392,7 +406,7 @@ public class NearCache implements HybridCache, InvalidationListener {
         lastRefreshNanos.set(System.nanoTime());
         long oldGen = newGen - 1;
 
-        publishInvalidation(InvalidationMessage.OP_CLEAR, null);
+        publishInvalidation(InvalidationMessage.OP_CLEAR, "clear", null);
 
         String pattern = CacheKeys.valueKeyPattern(cacheName, oldGen);
         try {
@@ -511,12 +525,33 @@ public class NearCache implements HybridCache, InvalidationListener {
 
     // ---------- Pub/sub ----------
 
-    private void publishInvalidation(String op, String key) {
+    /**
+     * Publishes an invalidation message and increments
+     * {@code cache.invalidations.published{cache, op=metricOp}} only if the
+     * publish completed without exception.
+     *
+     * @param wireOp   the on-the-wire op code ({@link InvalidationMessage#OP_INVALIDATE}
+     *                 or {@link InvalidationMessage#OP_CLEAR})
+     * @param metricOp the operation that triggered the publish, used as the
+     *                 {@code op} metric tag — one of {@code put}, {@code evict},
+     *                 {@code clear}. Distinguishes the two callers that share
+     *                 {@code OP_INVALIDATE} on the wire.
+     */
+    private void publishInvalidation(String wireOp, String metricOp, String key) {
         try {
             breaker.executeRunnable(() ->
-                    dispatcher.publish(new InvalidationMessage(dispatcher.getNodeId(), cacheName, op, key)));
+                    dispatcher.publish(new InvalidationMessage(dispatcher.getNodeId(), cacheName, wireOp, key)));
         } catch (Exception e) {
             // Suppressed — invalidation failure is bounded by TTL on remote nodes.
+            return;
+        }
+        // Only after the breaker-wrapped publish returns normally: the message
+        // reached RTopic.publish() and we treat it as published.
+        switch (metricOp) {
+            case "put" -> publishedPut.increment();
+            case "evict" -> publishedEvict.increment();
+            case "clear" -> publishedClear.increment();
+            default -> log.warn("Unknown publish metric op '{}' on cache '{}'", metricOp, cacheName);
         }
     }
 

@@ -155,7 +155,7 @@ class SentinelCacheIT {
                 .recordStats()
                 .build();
         CaffeineCache springCache = new CaffeineCache(name, caffeineNative, true);
-        InvalidationDispatcher dispatcher = new InvalidationDispatcher(client, nodeId);
+        InvalidationDispatcher dispatcher = new InvalidationDispatcher(client, nodeId, new SimpleMeterRegistry());
         CircuitBreaker breaker = CircuitBreakerRegistry.ofDefaults()
                 .circuitBreaker("sentinel-test-" + System.nanoTime());
         return new NearCache(springCache, spec, null, client, breaker, dispatcher,

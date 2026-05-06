@@ -81,7 +81,7 @@ class GenerationRefreshConcurrencyTest {
     @RepeatedTest(100)
     void nearCache_exactlyOneGenerationRead_whenRefreshDue() throws Exception {
         CircuitBreaker breaker = CircuitBreakerRegistry.ofDefaults().circuitBreaker("test");
-        InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, "node");
+        InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, "node", new SimpleMeterRegistry());
 
         NearCache cache = new NearCache(
                 caffeineCache("near-test"),
@@ -106,7 +106,7 @@ class GenerationRefreshConcurrencyTest {
     void distributedOnlyCache_exactlyOneGenerationRead_whenRefreshDue() throws Exception {
         CircuitBreaker breaker = CircuitBreakerRegistry.ofDefaults().circuitBreaker("test-dist");
 
-        InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, "test-node");
+        InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, "test-node", new SimpleMeterRegistry());
         DistributedOnlyCache cache = new DistributedOnlyCache(
                 "dist-test", spec(), null, redisson, breaker, dispatcher, new SimpleMeterRegistry(),
                 new KeyLogFormatter(false, "test"));

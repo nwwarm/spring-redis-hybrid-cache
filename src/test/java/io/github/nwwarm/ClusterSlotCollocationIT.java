@@ -163,7 +163,7 @@ class ClusterSlotCollocationIT {
             HybridCacheManager manager = new HybridCacheManager(
                     props, client,
                     io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry.ofDefaults(),
-                    new InvalidationDispatcher(client, "cluster-it"),
+                    new InvalidationDispatcher(client, "cluster-it", new io.micrometer.core.instrument.simple.SimpleMeterRegistry()),
                     new io.micrometer.core.instrument.simple.SimpleMeterRegistry(),
                     new CodecResolver(null),
                     new KeyLogFormatter(false, "test"));

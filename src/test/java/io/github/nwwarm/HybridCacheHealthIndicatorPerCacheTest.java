@@ -32,7 +32,7 @@ class HybridCacheHealthIndicatorPerCacheTest {
         CircuitBreakerFactory factory = new CircuitBreakerFactory(registry);
 
         // Two caches with their own breakers.
-        InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, "test-node");
+        InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, "test-node", new SimpleMeterRegistry());
         NearCache aCache = newNearCache("a", redisson, factory.resolve("a", null), dispatcher);
         NearCache bCache = newNearCache("b", redisson, factory.resolve("b", null), dispatcher);
 
