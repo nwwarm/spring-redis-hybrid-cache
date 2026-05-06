@@ -8,7 +8,7 @@ Drop-in replacement for the typical `@Cacheable` + Redis setup that addresses th
 <dependency>
   <groupId>io.github.nwwarm</groupId>
   <artifactId>hybrid-cache-spring-boot-starter</artifactId>
-  <version>0.3.0</version>
+  <version>0.4.0</version>
 </dependency>
 ```
 
