@@ -582,18 +582,14 @@ Spring Boot uses Lettuce by default, but this library intentionally relies on Re
 ### Package layout
 
 ```
-io.github.nwwarm
-  CacheConfig                   — Spring auto-configuration
-  CacheProperties               — @ConfigurationProperties + Tier, Codec, Kryo, Health
-  CacheKeys                     — key stringification + cache-name and key validation
-  HybridCacheManager            — tier-aware Spring CacheManager; per-name dispatch
-  InvalidationDispatcher        — single RTopic subscription; self-skip + name routing
-  InvalidationMessage           — wire format (key is String — see CacheKeys)
-  CodecResolver                 — maps codec enum to Redisson codec instance
-  NearCache                     — L1 + L2; publishes/handles invalidations via the dispatcher
-  LocalOnlyCache                — Caffeine-only wrapper with metrics
-  DistributedOnlyCache          — Redis-only with two-tier single-flight, breaker, generation
-  HybridCacheHealthIndicator    — Actuator HealthIndicator (breaker + Redis ping + per-cache stats)
+io.github.nwwarm.hybridcache
+├── config/        Auto-configuration, properties, validator
+├── core/          Cache implementations (NearCache, DistributedOnlyCache, LocalOnlyCache)
+├── invalidation/  Pub/sub dispatcher and message protocol
+├── metrics/       Health indicator and Micrometer wiring
+├── preloader/     Snapshot-and-prefetch on startup
+├── probe/         Optional Redis startup probe
+└── testfixtures/  Shared test infrastructure (test sources only — not on the runtime classpath)
 ```
 
 
