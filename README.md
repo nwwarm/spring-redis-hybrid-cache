@@ -181,7 +181,7 @@ This is the section that distinguishes a production cache from a demo. Every sce
 <dependency>
   <groupId>io.github.nwwarm</groupId>
   <artifactId>hybrid-cache-spring-boot-starter</artifactId>
-  <version>0.1.0</version>
+  <version>0.4.0</version>
 </dependency>
 ```
 
