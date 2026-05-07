@@ -214,7 +214,10 @@ public class InvalidationDispatcher implements MessageListener<InvalidationMessa
             return;
         }
         receivedCounter(msg.cacheName(), msg.op()).increment();
-        cache.handleInvalidation(msg.op(), msg.key());
+        // seq is forwarded unconditionally; listeners that don't participate
+        // in reconciliation ignore it. 0 is the "no seq" sentinel (publisher
+        // has reconciliation disabled, or message came from a 0.4.0 node).
+        cache.handleInvalidation(msg.op(), msg.key(), msg.seq());
     }
 
     /**

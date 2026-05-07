@@ -45,6 +45,7 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
     private final CodecResolver codecResolver;
     private final KeyLogFormatter keyLogFormatter;
     private final PreloaderCoordinator preloaderCoordinator;
+    private final ReconciliationCoordinator reconciliationCoordinator;
 
     private final List<NearCache> nearCaches = new CopyOnWriteArrayList<>();
     private final List<DistributedOnlyCache> distributedCaches = new CopyOnWriteArrayList<>();
@@ -57,7 +58,7 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
                               CodecResolver codecResolver,
                               KeyLogFormatter keyLogFormatter) {
         this(properties, redisson, circuitBreakerRegistry, dispatcher,
-                meterRegistry, codecResolver, keyLogFormatter, null);
+                meterRegistry, codecResolver, keyLogFormatter, null, null);
     }
 
     public HybridCacheManager(CacheProperties properties,
@@ -68,6 +69,20 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
                               CodecResolver codecResolver,
                               KeyLogFormatter keyLogFormatter,
                               PreloaderCoordinator preloaderCoordinator) {
+        this(properties, redisson, circuitBreakerRegistry, dispatcher,
+                meterRegistry, codecResolver, keyLogFormatter,
+                preloaderCoordinator, null);
+    }
+
+    public HybridCacheManager(CacheProperties properties,
+                              RedissonClient redisson,
+                              CircuitBreakerRegistry circuitBreakerRegistry,
+                              InvalidationDispatcher dispatcher,
+                              MeterRegistry meterRegistry,
+                              CodecResolver codecResolver,
+                              KeyLogFormatter keyLogFormatter,
+                              PreloaderCoordinator preloaderCoordinator,
+                              ReconciliationCoordinator reconciliationCoordinator) {
         // Fail fast on configured cache names that contain ':'. Names that
         // fall through to defaultSpec (i.e., not listed in cache.caches.*)
         // are validated lazily in getMissingCache.
@@ -80,6 +95,7 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
         this.codecResolver = codecResolver;
         this.keyLogFormatter = keyLogFormatter;
         this.preloaderCoordinator = preloaderCoordinator;
+        this.reconciliationCoordinator = reconciliationCoordinator;
     }
 
     @Override
@@ -105,6 +121,11 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
                 DistributedOnlyCache distributed = new DistributedOnlyCache(
                         name, spec, bucketCodec, redisson, breaker, dispatcher, meterRegistry, keyLogFormatter);
                 distributedCaches.add(distributed);
+                if (reconciliationCoordinator != null
+                        && spec.reconciliation() != null
+                        && spec.reconciliation().enabled()) {
+                    reconciliationCoordinator.register(distributed, spec.reconciliation());
+                }
                 yield distributed;
             }
             case NEAR_CACHE -> {
@@ -123,6 +144,14 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
                         && spec.preloader() != null
                         && spec.preloader().enabled()) {
                     preloaderCoordinator.register(name, near, spec.preloader());
+                }
+                // Reconciliation registration mirrors preloader registration
+                // — runs after dispatcher.register so any in-flight messages
+                // observed during the cycle land on the listener already.
+                if (reconciliationCoordinator != null
+                        && spec.reconciliation() != null
+                        && spec.reconciliation().enabled()) {
+                    reconciliationCoordinator.register(near, spec.reconciliation());
                 }
                 yield near;
             }
@@ -175,6 +204,10 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
 
     @Override
     public void destroy() {
+        if (reconciliationCoordinator != null) {
+            nearCaches.forEach(c -> reconciliationCoordinator.deregister(c.getName()));
+            distributedCaches.forEach(c -> reconciliationCoordinator.deregister(c.getName()));
+        }
         nearCaches.forEach(NearCache::shutdown);
         nearCaches.clear();
         distributedCaches.forEach(DistributedOnlyCache::shutdown);

@@ -114,6 +114,18 @@ public final class CacheKeys {
     }
 
     /**
+     * Per-cache reconciliation publish-sequence counter. Routed exactly the
+     * same way {@link #generationKey(String)} is — {@code <cache>:seq} with
+     * no hash tag — so the counter sits per-cache rather than scattering
+     * across every key's slot. Adding hash tags here would defeat the whole
+     * point of the counter, which is to be readable and {@code INCR}able as
+     * a single per-cache fact.
+     */
+    public static String seqKey(String cacheName) {
+        return cacheName + ":seq";
+    }
+
+    /**
      * Redis MATCH pattern for every value bucket of {@code cacheName} at a
      * specific {@code generation}. Used by {@code clearImmediate()} as the
      * argument to SCAN + UNLINK.

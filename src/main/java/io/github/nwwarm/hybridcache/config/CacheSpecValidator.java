@@ -69,6 +69,26 @@ import java.util.Map;
  *   <li>E12: {@code permittedNumberOfCallsInHalfOpenState ≥ 1}</li>
  * </ul>
  *
+ * <b>Per reconciliation block</b> (only checked when {@code enabled=true},
+ * mirroring the startup-probe philosophy):
+ * <ul>
+ *   <li>E29: {@code reconciliation.interval} must be positive. Zero would
+ *       schedule the cycle at zero delay = continuous loop = the cache
+ *       hammers Redis with GETs and the application starves; negative is
+ *       nonsense.</li>
+ *   <li>E30: {@code reconciliation.miss-tolerance} must be {@code >= 0}.
+ *       Zero is valid (operators who want maximum sensitivity); negative
+ *       inverts the comparison and would declare a miss on every cycle
+ *       where the local seq slightly exceeded the canonical (impossible
+ *       in steady state but possible during regression — see seq.regressions
+ *       counter).</li>
+ *   <li>E31: {@code reconciliation.enabled=true} requires {@code tier=NEAR_CACHE}
+ *       or {@code tier=DISTRIBUTED_ONLY}. Rejected on {@code LOCAL_ONLY} —
+ *       per-node by design, no cross-node coherence problem to reconcile
+ *       against, and the {@code <cache>:seq} counter would never advance
+ *       on a single-node cache.</li>
+ * </ul>
+ *
  * <b>Per preloader block</b> (only checked when {@code enabled=true},
  * mirroring the startup-probe philosophy):
  * <ul>
@@ -217,6 +237,38 @@ final class CacheSpecValidator {
             violations.add(label + ": preloader.max-stored-keys must be >= 1"
                     + " when set (got " + p.maxStoredKeys()
                     + "); leave unset for unbounded");
+        }
+    }
+
+    private static void validateReconciliation(String label,
+                                                CacheProperties.CacheSpec spec,
+                                                List<String> violations) {
+        CacheProperties.Reconciliation r = spec.reconciliation();
+
+        // E29: interval must be positive.
+        if (r.interval() == null || r.interval().isZero() || r.interval().isNegative()) {
+            violations.add(label + ": reconciliation.interval must be positive"
+                    + " (got " + r.interval() + "); zero would schedule the cycle at"
+                    + " zero delay (continuous loop, hammering Redis with GETs)");
+        }
+
+        // E30: miss-tolerance must be >= 0.
+        if (r.missTolerance() < 0) {
+            violations.add(label + ": reconciliation.miss-tolerance must be >= 0"
+                    + " (got " + r.missTolerance() + "); a negative tolerance inverts"
+                    + " the comparison and would declare a miss on every cycle");
+        }
+
+        // E31: not allowed on LOCAL_ONLY. NEAR_CACHE and DISTRIBUTED_ONLY both
+        // participate; LOCAL_ONLY has no cross-node coherence to reconcile.
+        if (spec.tier() == CacheProperties.Tier.LOCAL_ONLY) {
+            violations.add(label + ": reconciliation.enabled=true is not allowed on"
+                    + " tier=LOCAL_ONLY. Reconciliation recovers cross-node missed"
+                    + " invalidations, and LOCAL_ONLY caches have no peers to fall"
+                    + " behind — the <cache>:seq counter would never advance and the"
+                    + " cycle would do nothing useful while still consuming a Redis"
+                    + " GET per interval. Either disable reconciliation or change the"
+                    + " tier to NEAR_CACHE or DISTRIBUTED_ONLY.");
         }
     }
 
@@ -371,6 +423,11 @@ final class CacheSpecValidator {
         // mirrors the startup-probe philosophy: no gating on unrelated typos).
         if (spec.preloader() != null && spec.preloader().enabled()) {
             validatePreloader(label, spec, violations);
+        }
+
+        // Reconciliation (only validated when enabled — same philosophy).
+        if (spec.reconciliation() != null && spec.reconciliation().enabled()) {
+            validateReconciliation(label, spec, violations);
         }
 
         // W1

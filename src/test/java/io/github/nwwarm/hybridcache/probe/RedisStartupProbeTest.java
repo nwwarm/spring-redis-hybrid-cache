@@ -88,7 +88,7 @@ class RedisStartupProbeTest {
                 CacheProperties.Tier.LOCAL_ONLY,
                 Duration.ofMinutes(10), 10_000,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
-                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null, null);
         CacheProperties props = new CacheProperties(
                 singleServer(),
                 Map.of("a", localOnly, "b", localOnly),
@@ -116,12 +116,12 @@ class RedisStartupProbeTest {
                 CacheProperties.Tier.LOCAL_ONLY,
                 Duration.ofMinutes(10), 10_000,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
-                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null, null);
         CacheProperties.CacheSpec nearCache = new CacheProperties.CacheSpec(
                 CacheProperties.Tier.NEAR_CACHE,
                 Duration.ofMinutes(10), 10_000,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
-                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null, null);
         CacheProperties props = new CacheProperties(
                 singleServer(),
                 Map.of("hot", nearCache),    // one cache uses Redis
@@ -216,7 +216,7 @@ class RedisStartupProbeTest {
                 tier,
                 Duration.ofMinutes(10), 10_000,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
-                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null, null);
         return new CacheProperties(
                 singleServer(),
                 Map.of(),

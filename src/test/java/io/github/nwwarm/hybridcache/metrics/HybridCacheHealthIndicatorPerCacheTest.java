@@ -104,7 +104,7 @@ class HybridCacheHealthIndicatorPerCacheTest {
                 Duration.ofMinutes(10), 100,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
                 CacheProperties.Codec.JSON,
-                null, null, null, 0.0, null, null);
+                null, null, null, 0.0, null, null, null);
         return new NearCache(springCache, spec, null, redisson, breaker, dispatcher,
                 new SimpleMeterRegistry(), new KeyLogFormatter(false, "test"));
     }

@@ -63,6 +63,7 @@ public record CacheProperties(
                     null,
                     0.0,
                     null,
+                    null,
                     null);
         }
     }
@@ -363,6 +364,60 @@ public record CacheProperties(
     }
 
     /**
+     * Per-cache reconciliation tuning (0.5.0).
+     *
+     * <p>Pub/sub is at-most-once. A subscriber that drops an
+     * {@code OP_INVALIDATE} or {@code OP_CLEAR} message currently serves
+     * stale L1 entries until TTL. Reconciliation closes that gap by having
+     * each subscriber periodically read the per-cache publish-sequence
+     * counter ({@code <cache>:seq}) and compare it against the locally
+     * observed maximum from received messages. When
+     * {@code redisSeq − lastObservedSeq > miss-tolerance}, the cache
+     * declares a missed-message event and runs the per-tier recovery
+     * action (clear local L1 on {@code NEAR_CACHE}; force a generation
+     * pointer refresh on {@code DISTRIBUTED_ONLY}).
+     *
+     * <p><b>Tier rules.</b> Allowed on {@code NEAR_CACHE} (the headline
+     * case — recovers missed per-key invalidations) and
+     * {@code DISTRIBUTED_ONLY} (recovers missed {@code OP_CLEAR}).
+     * Rejected on {@code LOCAL_ONLY} — there is no cross-node coherence
+     * problem to reconcile against, and the {@code <cache>:seq} counter
+     * would never advance on a single-node cache.
+     *
+     * <p><b>Cost on the publish path.</b> Each successful publish gains
+     * one extra Redis op ({@code INCR <cache>:seq}) and ~16 bytes
+     * additional payload (the {@code seq} long on the
+     * {@link io.github.nwwarm.hybridcache.invalidation.InvalidationMessage}). Cold-load completions do not publish,
+     * so they do not {@code INCR}; the cold-load suppression semantics
+     * from 0.3.0 are preserved.
+     *
+     * @param enabled        opt-in. Default {@code false}.
+     * @param interval       period between cycles. Default {@code 60s} —
+     *                       matches Hazelcast's
+     *                       {@code hazelcast.invalidation.reconciliation.interval.seconds}
+     *                       default. Validator rule: {@code > 0}.
+     * @param missTolerance  threshold below which a delta between
+     *                       canonical and locally-observed seq is treated
+     *                       as in-flight noise rather than a miss. Default
+     *                       {@code 5}. Higher values forgive larger
+     *                       in-flight bursts; lower values catch losses
+     *                       sooner. Validator rule: {@code >= 0}.
+     */
+    public record Reconciliation(
+            boolean enabled,
+            Duration interval,
+            int missTolerance) {
+
+        public Reconciliation {
+            if (interval == null) interval = Duration.ofSeconds(60);
+            // missTolerance: 0 is valid — operators who genuinely want to
+            // catch every gap can set it to 0 and accept the false-positive
+            // exposure during in-flight bursts. Negative is rejected by the
+            // validator, not coerced here.
+        }
+    }
+
+    /**
      * Circuit-breaker configuration. Used in two places:
      *
      * <ul>
@@ -405,7 +460,8 @@ public record CacheProperties(
             Duration loaderAcquireTimeout,
             double ttlJitterRatio,
             Duration maxIdle,
-            Preloader preloader) {
+            Preloader preloader,
+            Reconciliation reconciliation) {
 
         public CacheSpec {
             if (tier == null) tier = Tier.NEAR_CACHE;
@@ -426,6 +482,8 @@ public record CacheProperties(
             // also lives in CacheSpecValidator.
             // preloader defaults to null = disabled. Tier validation
             // (NEAR_CACHE-only) also lives in CacheSpecValidator.
+            // reconciliation defaults to null = disabled. Tier validation
+            // (no LOCAL_ONLY) lives in CacheSpecValidator.
         }
     }
 

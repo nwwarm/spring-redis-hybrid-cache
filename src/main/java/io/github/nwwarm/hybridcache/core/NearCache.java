@@ -56,7 +56,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * A cache is by definition allowed to lose data. These tradeoffs prioritize
  * availability over coherence during partial Redis outages.
  */
-public class NearCache implements HybridCache, InvalidationListener {
+public class NearCache implements HybridCache, InvalidationListener, Reconciler {
 
     private static final Logger log = LoggerFactory.getLogger(NearCache.class);
     private static final long GENERATION_REFRESH_NANOS = 1_000_000_000L; // 1s
@@ -70,6 +70,7 @@ public class NearCache implements HybridCache, InvalidationListener {
     private final Codec bucketCodec;
     private final KeyLogFormatter keyLogFormatter;
     private final LoaderGate loaderGate;
+    private final MeterRegistry meterRegistry;
 
     // Generation counter for O(1) clear
     private final RAtomicLong distributedGeneration;
@@ -77,6 +78,14 @@ public class NearCache implements HybridCache, InvalidationListener {
     // CAS-guarded: the first thread past the staleness check wins the right
     // to refresh; all others return the cached local generation.
     private final AtomicLong lastRefreshNanos = new AtomicLong(0);
+
+    // Reconciliation (0.5.0). distributedSeq is null when reconciliation is
+    // disabled for this cache; reconciliationEnabled gates the INCR-and-carry
+    // path on publish so disabled caches pay zero cost (no Redis op, seq=0
+    // on the wire, receivers see no advance).
+    private final boolean reconciliationEnabled;
+    private final RAtomicLong distributedSeq;
+    private final AtomicLong lastObservedSeq = new AtomicLong(0);
 
     // Metrics
     private final Counter l2Hits;
@@ -110,11 +119,24 @@ public class NearCache implements HybridCache, InvalidationListener {
         this.dispatcher = dispatcher;
         this.bucketCodec = bucketCodec;
         this.keyLogFormatter = keyLogFormatter;
+        this.meterRegistry = meterRegistry;
         this.loaderGate = new LoaderGate(cacheName,
                 spec.maxConcurrentLoaders(), spec.loaderAcquireTimeout(), meterRegistry);
 
         this.distributedGeneration = redisson.getAtomicLong(CacheKeys.generationKey(cacheName));
         initializeGeneration();
+
+        // Reconciliation: bind the per-cache <cache>:seq counter only when
+        // enabled. The Redisson handle is cheap to obtain (no IO until first
+        // op), so even when disabled keeping the field non-null would not
+        // cost much — but the boolean is what controls the INCR-and-carry
+        // hot path on every publish, and a clean null on disabled gives the
+        // metrics binding a single source of truth.
+        this.reconciliationEnabled = spec.reconciliation() != null
+                && spec.reconciliation().enabled();
+        this.distributedSeq = reconciliationEnabled
+                ? redisson.getAtomicLong(CacheKeys.seqKey(cacheName))
+                : null;
 
         dispatcher.register(this);
 
@@ -541,6 +563,16 @@ public class NearCache implements HybridCache, InvalidationListener {
      * {@code cache.invalidations.published{cache, op=metricOp}} only if the
      * publish completed without exception.
      *
+     * <p>When reconciliation is enabled for this cache, the order is
+     * deliberately <b>SET → INCR → publish(msg{seq: just-INCR'd value})</b>.
+     * Item 2 of the {@code # implementation guardrails / ## Reconciliation}
+     * block in {@code DESIGN.md} pins this ordering: {@code INCR} before
+     * the canonical write would advance the seq for a publish that may
+     * never reach peers (false-positive miss); {@code INCR} after publish
+     * would carry a stale seq on the wire (guaranteed false-positive miss
+     * since {@code lastObservedSeq} would never see the new value while
+     * the canonical advanced).
+     *
      * @param wireOp   the on-the-wire op code ({@link InvalidationMessage#OP_INVALIDATE}
      *                 or {@link InvalidationMessage#OP_CLEAR})
      * @param metricOp the operation that triggered the publish, used as the
@@ -549,11 +581,42 @@ public class NearCache implements HybridCache, InvalidationListener {
      *                 {@code OP_INVALIDATE} on the wire.
      */
     private void publishInvalidation(String wireOp, String metricOp, String key) {
+        long seq = 0L;
+        if (reconciliationEnabled) {
+            try {
+                seq = breaker.executeSupplier(distributedSeq::incrementAndGet);
+            } catch (CallNotPermittedException e) {
+                l2BreakerOpen.increment();
+                // Without an INCR we have no honest seq to put on the wire.
+                // Skip the publish entirely: peers' L1 ages out via TTL,
+                // and the next reconciliation cycle on each peer will
+                // catch up against the canonical (which did NOT advance
+                // since INCR didn't run).
+                return;
+            } catch (Exception e) {
+                l2Failures.increment();
+                log.warn("Reconciliation INCR failed for cache '{}'; skipping publish",
+                        cacheName, e);
+                return;
+            }
+            // Bump our own watermark to match the just-INCR'd canonical.
+            // The dispatcher self-skips messages we sent, so without this
+            // self-bump our lastObservedSeq would lag behind the canonical
+            // by exactly the number of publishes we've issued — turning
+            // every reconciliation cycle on a publishing node into a
+            // false-positive miss declaration. This is the dual of the
+            // "receivers update on receive" rule: publishers update on
+            // publish.
+            lastObservedSeq.accumulateAndGet(seq, Math::max);
+        }
+        final long publishedSeq = seq;
         try {
             breaker.executeRunnable(() ->
-                    dispatcher.publish(new InvalidationMessage(dispatcher.getNodeId(), cacheName, wireOp, key)));
+                    dispatcher.publish(new InvalidationMessage(
+                            dispatcher.getNodeId(), cacheName, wireOp, key, publishedSeq)));
         } catch (Exception e) {
-            // Suppressed — invalidation failure is bounded by TTL on remote nodes.
+            // Suppressed — invalidation failure is bounded by TTL on remote nodes,
+            // or by the next reconciliation cycle when reconciliation is enabled.
             return;
         }
         // Only after the breaker-wrapped publish returns normally: the message
@@ -568,7 +631,12 @@ public class NearCache implements HybridCache, InvalidationListener {
 
     /** Invoked by {@link InvalidationDispatcher} after self-skip and name routing. */
     @Override
-    public void handleInvalidation(String op, String key) {
+    public void handleInvalidation(String op, String key, long seq) {
+        // Update the watermark FIRST: even if the per-op action below throws,
+        // we have observed this peer's publish and the local seq must reflect
+        // it. accumulateAndGet keeps the watermark monotonic under cluster
+        // reroutes (out-of-order delivery is possible) — see guardrail item 3.
+        if (seq > 0L) onMessageObserved(seq);
         switch (op) {
             case InvalidationMessage.OP_INVALIDATE -> caffeineCache.evict(key);
             case InvalidationMessage.OP_CLEAR -> {
@@ -578,6 +646,118 @@ public class NearCache implements HybridCache, InvalidationListener {
             }
             default -> log.warn("Unknown invalidation op '{}' on cache '{}'", op, cacheName);
         }
+    }
+
+    @Override
+    public void onMessageObserved(long seq) {
+        // Math.max via accumulateAndGet — pub/sub messages can arrive out of
+        // order with respect to publish order under cluster reroutes; a plain
+        // set() would walk the watermark backwards then forwards then back,
+        // generating spurious miss declarations on the next cycle.
+        lastObservedSeq.accumulateAndGet(seq, Math::max);
+    }
+
+    /**
+     * Per-cycle reconciliation work. Single GET on {@code <cache>:seq}, one
+     * comparison, one of three outcomes — recorded by the metric tag set
+     * declared in §6 of {@code DESIGN.md}:
+     * <ul>
+     *   <li>{@code redisSeq <= lastObservedSeq + tolerance} → no miss; cycle
+     *       counter increments and we return.</li>
+     *   <li>{@code redisSeq > lastObservedSeq + tolerance} → miss; clear local
+     *       Caffeine, jump {@code lastObservedSeq} to {@code redisSeq} so the
+     *       next cycle does not re-fire on the same gap, increment misses
+     *       counter, log INFO.</li>
+     *   <li>{@code redisSeq < lastObservedSeq} → regression (operator-driven —
+     *       counter manually deleted, FLUSHALL, etc.); reset
+     *       {@code lastObservedSeq} to {@code redisSeq}, increment regression
+     *       counter, log WARN.</li>
+     * </ul>
+     *
+     * <p>Every Redis op is breaker-wrapped. Breaker-open and any other
+     * exception increments the appropriate {@code skipped} counter and
+     * returns; nothing escapes (item 1 of the reconciliation guardrails).
+     */
+    @Override
+    public void reconcile() {
+        if (!reconciliationEnabled) return;
+        Counter cyclesCompleted = Counter.builder("cache.reconciliation.cycles.completed")
+                .tag("cache", cacheName).register(meterRegistry);
+        Timer cycleDuration = Timer.builder("cache.reconciliation.cycle.duration")
+                .tag("cache", cacheName).register(meterRegistry);
+        Timer.Sample sample = Timer.start();
+        try {
+            long redisSeq;
+            try {
+                redisSeq = breaker.executeSupplier(distributedSeq::get);
+            } catch (CallNotPermittedException e) {
+                Counter.builder("cache.reconciliation.skipped")
+                        .tag("cache", cacheName).tag("reason", "breaker-open")
+                        .register(meterRegistry).increment();
+                return;
+            } catch (Exception e) {
+                Counter.builder("cache.reconciliation.skipped")
+                        .tag("cache", cacheName).tag("reason", "exception")
+                        .register(meterRegistry).increment();
+                log.warn("Reconciliation cycle exception for cache '{}'; skipping",
+                        cacheName, e);
+                return;
+            }
+            long observed = lastObservedSeq.get();
+            int tolerance = spec.reconciliation().missTolerance();
+            ReconciliationDecision decision =
+                    ReconciliationDecision.classify(redisSeq, observed, tolerance);
+
+            switch (decision) {
+                case REGRESSION -> {
+                    // Operator-driven (manual DEL, FLUSHALL). Reset the
+                    // watermark; do NOT treat as a miss — see §10 0.5.0
+                    // decision log on regression handling.
+                    Counter.builder("cache.reconciliation.seq.regressions")
+                            .tag("cache", cacheName).register(meterRegistry).increment();
+                    log.warn("Reconciliation seq regressed on cache '{}': redisSeq={}, "
+                            + "lastObservedSeq={}. Counter likely deleted by operator;"
+                            + " resetting watermark.", cacheName, redisSeq, observed);
+                    lastObservedSeq.set(redisSeq);
+                }
+                case MISS -> {
+                    // Clear local L1 and jump the watermark. Do NOT publish.
+                    // Item 4 of the guardrails: reconciliation is repair-mode,
+                    // not initiation; publishing would force every healthy peer
+                    // to also clear when only we missed.
+                    Counter.builder("cache.reconciliation.misses.detected")
+                            .tag("cache", cacheName).register(meterRegistry).increment();
+                    log.info("Reconciliation declared miss on cache '{}': redisSeq={},"
+                            + " lastObservedSeq={}, delta={}, tolerance={}. Clearing"
+                            + " local L1.", cacheName, redisSeq, observed,
+                            redisSeq - observed, tolerance);
+                    caffeineCache.clear();
+                    lastObservedSeq.set(redisSeq);
+                }
+                case NO_MISS -> { /* nothing to do */ }
+            }
+        } catch (Throwable t) {
+            // Defense-in-depth — we caught the expected branches above. If
+            // anything else escapes, swallow it: the scheduler must keep
+            // running. Item 1 of the reconciliation guardrails.
+            Counter.builder("cache.reconciliation.skipped")
+                    .tag("cache", cacheName).tag("reason", "exception")
+                    .register(meterRegistry).increment();
+            log.warn("Reconciliation cycle threw unexpected error on cache '{}'", cacheName, t);
+        } finally {
+            sample.stop(cycleDuration);
+            cyclesCompleted.increment();
+        }
+    }
+
+    /** Test seam: returns the locally observed seq watermark. */
+    public long lastObservedSeq() {
+        return lastObservedSeq.get();
+    }
+
+    /** Test seam: true iff this cache participates in reconciliation. */
+    public boolean isReconciliationEnabled() {
+        return reconciliationEnabled;
     }
 
     // ---------- Lifecycle ----------

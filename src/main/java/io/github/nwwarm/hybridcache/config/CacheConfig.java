@@ -8,6 +8,7 @@ import io.github.nwwarm.hybridcache.core.CircuitBreakerFactory;
 import io.github.nwwarm.hybridcache.core.CodecResolver;
 import io.github.nwwarm.hybridcache.core.HybridCacheManager;
 import io.github.nwwarm.hybridcache.core.KeyLogFormatter;
+import io.github.nwwarm.hybridcache.core.ReconciliationCoordinator;
 import io.github.nwwarm.hybridcache.invalidation.InvalidationDispatcher;
 import io.github.nwwarm.hybridcache.metrics.HybridCacheHealthIndicator;
 import io.github.nwwarm.hybridcache.preloader.PreloaderCoordinator;
@@ -374,6 +375,21 @@ public class CacheConfig {
         return new KeyLogFormatter(properties.logKeys(), properties.logKeySalt());
     }
 
+    /**
+     * Reconciliation coordinator. Registered unconditionally (same shape as
+     * the preloader coordinator) — if no cache opts in to reconciliation,
+     * the bean's scheduler thread sits idle for the lifetime of the JVM,
+     * which is cheap. Conditional registration would require a custom
+     * Spring {@code Condition} that scans every configured cache for
+     * {@code reconciliation.enabled=true}; not worth the complexity for
+     * the sub-millisecond startup tax of an idle 2-thread daemon scheduler.
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    public ReconciliationCoordinator reconciliationCoordinator(MeterRegistry meterRegistry) {
+        return new ReconciliationCoordinator(meterRegistry);
+    }
+
     @Bean
     @ConditionalOnMissingBean
     public PreloaderCoordinator preloaderCoordinator(CacheProperties properties,
@@ -396,7 +412,8 @@ public class CacheConfig {
                                            MeterRegistry meterRegistry,
                                            CodecResolver codecResolver,
                                            KeyLogFormatter keyLogFormatter,
-                                           PreloaderCoordinator preloaderCoordinator) {
+                                           PreloaderCoordinator preloaderCoordinator,
+                                           ReconciliationCoordinator reconciliationCoordinator) {
         return new HybridCacheManager(
                 properties,
                 redisson,
@@ -405,7 +422,8 @@ public class CacheConfig {
                 meterRegistry,
                 codecResolver,
                 keyLogFormatter,
-                preloaderCoordinator);
+                preloaderCoordinator,
+                reconciliationCoordinator);
     }
 
     /**

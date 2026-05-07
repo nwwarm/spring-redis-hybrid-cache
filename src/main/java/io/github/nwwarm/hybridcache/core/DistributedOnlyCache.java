@@ -50,7 +50,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * it must fail open. Source systems behind a distributed-only cache must handle
  * full unfiltered load during a Redis incident.
  */
-public class DistributedOnlyCache implements HybridCache, InvalidationListener {
+public class DistributedOnlyCache implements HybridCache, InvalidationListener, Reconciler {
 
     private static final Logger log = LoggerFactory.getLogger(DistributedOnlyCache.class);
     private static final long GENERATION_REFRESH_NANOS = 1_000_000_000L; // 1s
@@ -62,10 +62,19 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener {
     private final Codec bucketCodec;
     private final KeyLogFormatter keyLogFormatter;
     private final InvalidationDispatcher dispatcher;
+    private final MeterRegistry meterRegistry;
 
     private final RAtomicLong distributedGeneration;
     private final AtomicLong localGeneration = new AtomicLong(0);
     private final AtomicLong lastRefreshNanos = new AtomicLong(0);
+
+    // Reconciliation (0.5.0). Same shape as NearCache — see that class's
+    // field comment. The recovery action differs: there is no L1 to clear,
+    // so the cache forces a generation-pointer refresh, which is the same
+    // path handleInvalidation(OP_CLEAR, ...) already takes.
+    private final boolean reconciliationEnabled;
+    private final RAtomicLong distributedSeq;
+    private final AtomicLong lastObservedSeq = new AtomicLong(0);
 
     /** In-flight loads, used for local single-flight when there is no L1 to lean on. */
     private final ConcurrentMap<Object, CompletableFuture<Object>> inflight = new ConcurrentHashMap<>();
@@ -100,6 +109,7 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener {
         this.bucketCodec = bucketCodec;
         this.keyLogFormatter = keyLogFormatter;
         this.dispatcher = dispatcher;
+        this.meterRegistry = meterRegistry;
         this.distributedGeneration = redisson.getAtomicLong(CacheKeys.generationKey(cacheName));
 
         try {
@@ -108,6 +118,12 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener {
         } catch (Exception e) {
             log.warn("Failed to initialize generation for cache '{}'", cacheName, e);
         }
+
+        this.reconciliationEnabled = spec.reconciliation() != null
+                && spec.reconciliation().enabled();
+        this.distributedSeq = reconciliationEnabled
+                ? redisson.getAtomicLong(CacheKeys.seqKey(cacheName))
+                : null;
 
         dispatcher.register(this);
 
@@ -360,12 +376,33 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener {
     }
 
     private void publishClear() {
+        long seq = 0L;
+        if (reconciliationEnabled) {
+            try {
+                seq = breaker.executeSupplier(distributedSeq::incrementAndGet);
+            } catch (CallNotPermittedException e) {
+                breakerOpen.increment();
+                return;
+            } catch (Exception e) {
+                failures.increment();
+                log.warn("Reconciliation INCR failed on clear for cache '{}'; skipping publish",
+                        cacheName, e);
+                return;
+            }
+            // Self-bump local watermark — dispatcher self-skips our own
+            // message so without this our lastObservedSeq would lag.
+            // See NearCache.publishInvalidation for the full rationale.
+            lastObservedSeq.accumulateAndGet(seq, Math::max);
+        }
+        final long publishedSeq = seq;
         try {
             breaker.executeRunnable(() ->
                     dispatcher.publish(new InvalidationMessage(
-                            dispatcher.getNodeId(), cacheName, InvalidationMessage.OP_CLEAR, null)));
+                            dispatcher.getNodeId(), cacheName,
+                            InvalidationMessage.OP_CLEAR, null, publishedSeq)));
         } catch (Exception e) {
-            // Suppressed — peers will catch up via the 1s generation poll.
+            // Suppressed — peers will catch up via the 1s generation poll
+            // or the next reconciliation cycle when reconciliation is enabled.
             return;
         }
         publishedClear.increment();
@@ -380,7 +417,11 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener {
      * removed the entry from L2.
      */
     @Override
-    public void handleInvalidation(String op, String key) {
+    public void handleInvalidation(String op, String key, long seq) {
+        // Update watermark before per-op action (see NearCache.handleInvalidation
+        // for the rationale — even if the action below throws, we have observed
+        // the publish and the local seq must reflect it).
+        if (seq > 0L) onMessageObserved(seq);
         switch (op) {
             case InvalidationMessage.OP_CLEAR -> {
                 lastRefreshNanos.set(0);
@@ -391,6 +432,95 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener {
                     cacheName, keyLogFormatter.format(key));
             default -> log.warn("Unknown invalidation op '{}' on cache '{}'", op, cacheName);
         }
+    }
+
+    @Override
+    public void onMessageObserved(long seq) {
+        lastObservedSeq.accumulateAndGet(seq, Math::max);
+    }
+
+    /**
+     * Per-cycle reconciliation work for distributed-only caches. Same shape
+     * as {@code NearCache.reconcile()}: read {@code <cache>:seq}, compare,
+     * one of three outcomes. The recovery action differs — there is no L1
+     * to clear, so on a miss the cache forces a generation-pointer refresh,
+     * the same path {@code handleInvalidation(OP_CLEAR, ...)} already takes.
+     * That repairs the locally-cached generation, which is the actual state
+     * a missed {@code OP_CLEAR} would have left stale.
+     */
+    @Override
+    public void reconcile() {
+        if (!reconciliationEnabled) return;
+        Counter cyclesCompleted = Counter.builder("cache.reconciliation.cycles.completed")
+                .tag("cache", cacheName).register(meterRegistry);
+        Timer cycleDuration = Timer.builder("cache.reconciliation.cycle.duration")
+                .tag("cache", cacheName).register(meterRegistry);
+        Timer.Sample sample = Timer.start();
+        try {
+            long redisSeq;
+            try {
+                redisSeq = breaker.executeSupplier(distributedSeq::get);
+            } catch (CallNotPermittedException e) {
+                Counter.builder("cache.reconciliation.skipped")
+                        .tag("cache", cacheName).tag("reason", "breaker-open")
+                        .register(meterRegistry).increment();
+                return;
+            } catch (Exception e) {
+                Counter.builder("cache.reconciliation.skipped")
+                        .tag("cache", cacheName).tag("reason", "exception")
+                        .register(meterRegistry).increment();
+                log.warn("Reconciliation cycle exception for cache '{}'; skipping",
+                        cacheName, e);
+                return;
+            }
+            long observed = lastObservedSeq.get();
+            int tolerance = spec.reconciliation().missTolerance();
+            ReconciliationDecision decision =
+                    ReconciliationDecision.classify(redisSeq, observed, tolerance);
+
+            switch (decision) {
+                case REGRESSION -> {
+                    Counter.builder("cache.reconciliation.seq.regressions")
+                            .tag("cache", cacheName).register(meterRegistry).increment();
+                    log.warn("Reconciliation seq regressed on cache '{}': redisSeq={}, "
+                            + "lastObservedSeq={}. Counter likely deleted by operator;"
+                            + " resetting watermark.", cacheName, redisSeq, observed);
+                    lastObservedSeq.set(redisSeq);
+                }
+                case MISS -> {
+                    Counter.builder("cache.reconciliation.misses.detected")
+                            .tag("cache", cacheName).register(meterRegistry).increment();
+                    log.info("Reconciliation declared miss on cache '{}': redisSeq={},"
+                            + " lastObservedSeq={}, delta={}, tolerance={}. Forcing"
+                            + " generation refresh.", cacheName, redisSeq, observed,
+                            redisSeq - observed, tolerance);
+                    // No L1 to clear; force generation refresh — repairs a
+                    // possibly-stale locally-cached generation.
+                    lastRefreshNanos.set(0);
+                    currentGeneration();
+                    lastObservedSeq.set(redisSeq);
+                }
+                case NO_MISS -> { /* nothing to do */ }
+            }
+        } catch (Throwable t) {
+            Counter.builder("cache.reconciliation.skipped")
+                    .tag("cache", cacheName).tag("reason", "exception")
+                    .register(meterRegistry).increment();
+            log.warn("Reconciliation cycle threw unexpected error on cache '{}'", cacheName, t);
+        } finally {
+            sample.stop(cycleDuration);
+            cyclesCompleted.increment();
+        }
+    }
+
+    /** Test seam: returns the locally observed seq watermark. */
+    public long lastObservedSeq() {
+        return lastObservedSeq.get();
+    }
+
+    /** Test seam: true iff this cache participates in reconciliation. */
+    public boolean isReconciliationEnabled() {
+        return reconciliationEnabled;
     }
 
     /** Called by the cache manager during context shutdown. Idempotent. */

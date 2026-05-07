@@ -135,9 +135,24 @@ public abstract class RedisTestBase {
                                      Duration ttl,
                                      Duration lockWait,
                                      Duration lockLease) {
+        return newNearCache(name, redisson, breaker, nodeId, codec, meterRegistry,
+                ttl, lockWait, lockLease, null);
+    }
+
+    protected NearCache newNearCache(String name,
+                                     RedissonClient redisson,
+                                     CircuitBreaker breaker,
+                                     String nodeId,
+                                     CacheProperties.Codec codec,
+                                     MeterRegistry meterRegistry,
+                                     Duration ttl,
+                                     Duration lockWait,
+                                     Duration lockLease,
+                                     CacheProperties.Reconciliation reconciliation) {
         CacheProperties.CacheSpec spec = new CacheProperties.CacheSpec(
                 CacheProperties.Tier.NEAR_CACHE,
-                ttl, 10_000, lockWait, lockLease, codec, null, null, null, 0.0, null, null);
+                ttl, 10_000, lockWait, lockLease, codec, null, null, null, 0.0, null, null,
+                reconciliation);
 
         com.github.benmanes.caffeine.cache.Cache<Object, Object> caffeineNative = Caffeine.newBuilder()
                 .expireAfterWrite(ttl)
@@ -148,6 +163,26 @@ public abstract class RedisTestBase {
         InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, nodeId, meterRegistry);
         return new NearCache(springCache, spec, resolveTestCodec(codec), redisson,
                 breaker, dispatcher, meterRegistry, new KeyLogFormatter(false, "test"));
+    }
+
+    /**
+     * Same shape as the simpler {@link #newNearCache(String, RedissonClient, CircuitBreaker, String)}
+     * helper, but with reconciliation pre-enabled at the supplied
+     * interval and miss-tolerance. Used by the reconciliation IT suite.
+     */
+    protected NearCache newReconcilingNearCache(String name,
+                                                RedissonClient redisson,
+                                                CircuitBreaker breaker,
+                                                String nodeId,
+                                                MeterRegistry meterRegistry,
+                                                Duration interval,
+                                                int missTolerance) {
+        return newNearCache(name, redisson, breaker, nodeId,
+                CacheProperties.Codec.JSON, meterRegistry,
+                Duration.ofMinutes(10),       // ttl — long, so TTL doesn't mask reconciliation effects
+                Duration.ofSeconds(2),         // lockWait
+                Duration.ofSeconds(10),        // lockLease
+                new CacheProperties.Reconciliation(true, interval, missTolerance));
     }
 
     protected DistributedOnlyCache newDistributedCache(String name,
@@ -164,7 +199,7 @@ public abstract class RedisTestBase {
                 CacheProperties.Tier.DISTRIBUTED_ONLY,
                 Duration.ofMinutes(10), 10_000,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
-                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null, null);
         MeterRegistry meterRegistry = new SimpleMeterRegistry();
         InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, nodeId, meterRegistry);
         return new DistributedOnlyCache(name, spec, resolveTestCodec(spec.codec()),
