@@ -53,8 +53,7 @@ class SentinelCacheIT {
     @BeforeAll
     static void startSentinelTopology() throws InterruptedException {
         COMPOSE = new ComposeContainer(
-                new File("src/test/resources/sentinel/docker-compose.yml"))
-                .withLocalCompose(true);
+                new File("src/test/resources/sentinel/docker-compose.yml"));
         COMPOSE.start();
         // Wait for the master to be reachable AND for at least one sentinel
         // to be reporting the master as a known monitor target. Without this

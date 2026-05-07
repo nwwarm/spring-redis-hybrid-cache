@@ -54,8 +54,7 @@ class ClusterSlotCollocationIT {
     @BeforeAll
     static void startCluster() {
         COMPOSE = new ComposeContainer(
-                new File("src/test/resources/cluster/docker-compose.yml"))
-                .withLocalCompose(true);
+                new File("src/test/resources/cluster/docker-compose.yml"));
         COMPOSE.start();
         Awaitility.await()
                 .atMost(Duration.ofSeconds(60))

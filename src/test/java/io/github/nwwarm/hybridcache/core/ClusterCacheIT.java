@@ -54,8 +54,7 @@ class ClusterCacheIT {
     @BeforeAll
     static void startCluster() {
         COMPOSE = new ComposeContainer(
-                new File("src/test/resources/cluster/docker-compose.yml"))
-                .withLocalCompose(true);
+                new File("src/test/resources/cluster/docker-compose.yml"));
         COMPOSE.start();
         // Poll until every node agrees the cluster is OK and reports 3 masters.
         // Waiting on a single node's `cluster_state:ok` is racy: the bootstrap
