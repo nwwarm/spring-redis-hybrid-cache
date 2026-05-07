@@ -1,6 +1,7 @@
 package io.github.nwwarm.hybridcache.core;
 
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.RemovalCause;
 import io.github.nwwarm.hybridcache.config.CacheProperties;
 import io.github.nwwarm.hybridcache.invalidation.InvalidationDispatcher;
 import io.github.nwwarm.hybridcache.preloader.PreloaderCoordinator;
@@ -46,6 +47,7 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
     private final KeyLogFormatter keyLogFormatter;
     private final PreloaderCoordinator preloaderCoordinator;
     private final ReconciliationCoordinator reconciliationCoordinator;
+    private final RefreshExecutor refreshExecutor;
 
     private final List<NearCache> nearCaches = new CopyOnWriteArrayList<>();
     private final List<DistributedOnlyCache> distributedCaches = new CopyOnWriteArrayList<>();
@@ -83,6 +85,21 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
                               KeyLogFormatter keyLogFormatter,
                               PreloaderCoordinator preloaderCoordinator,
                               ReconciliationCoordinator reconciliationCoordinator) {
+        this(properties, redisson, circuitBreakerRegistry, dispatcher,
+                meterRegistry, codecResolver, keyLogFormatter,
+                preloaderCoordinator, reconciliationCoordinator, null);
+    }
+
+    public HybridCacheManager(CacheProperties properties,
+                              RedissonClient redisson,
+                              CircuitBreakerRegistry circuitBreakerRegistry,
+                              InvalidationDispatcher dispatcher,
+                              MeterRegistry meterRegistry,
+                              CodecResolver codecResolver,
+                              KeyLogFormatter keyLogFormatter,
+                              PreloaderCoordinator preloaderCoordinator,
+                              ReconciliationCoordinator reconciliationCoordinator,
+                              RefreshExecutor refreshExecutor) {
         // Fail fast on configured cache names that contain ':'. Names that
         // fall through to defaultSpec (i.e., not listed in cache.caches.*)
         // are validated lazily in getMissingCache.
@@ -96,6 +113,7 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
         this.keyLogFormatter = keyLogFormatter;
         this.preloaderCoordinator = preloaderCoordinator;
         this.reconciliationCoordinator = reconciliationCoordinator;
+        this.refreshExecutor = refreshExecutor;
     }
 
     @Override
@@ -114,8 +132,22 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
         CacheProperties.CacheSpec spec = properties.specFor(name);
         org.redisson.client.codec.Codec bucketCodec = codecResolver.resolve(spec.codec());
         return switch (spec.tier()) {
-            case LOCAL_ONLY -> new LocalOnlyCache(buildCaffeineCache(name, spec),
-                    spec.maxConcurrentLoaders(), spec.loaderAcquireTimeout(), meterRegistry);
+            case LOCAL_ONLY -> {
+                // LOCAL_ONLY caches do not have a circuit breaker (no L2
+                // to guard); pass null to the sidecar — refresh dispatch
+                // proceeds without the breaker-open gate.
+                SwrSidecar localSidecar = (spec.swr() != null)
+                        ? new SwrSidecar(name,
+                                spec.swr().freshFor().toNanos(),
+                                refreshExecutor,
+                                null,
+                                meterRegistry)
+                        : null;
+                yield new LocalOnlyCache(
+                        buildCaffeineCache(name, spec, localSidecar),
+                        spec.maxConcurrentLoaders(), spec.loaderAcquireTimeout(),
+                        meterRegistry, localSidecar);
+            }
             case DISTRIBUTED_ONLY -> {
                 CircuitBreaker breaker = breakerFactory.resolve(name, spec.circuitBreaker());
                 DistributedOnlyCache distributed = new DistributedOnlyCache(
@@ -130,9 +162,21 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
             }
             case NEAR_CACHE -> {
                 CircuitBreaker breaker = breakerFactory.resolve(name, spec.circuitBreaker());
+                // Construct SWR sidecar BEFORE the Caffeine cache so the
+                // RemovalListener can call its onRemoval callback directly.
+                // Validator already enforced spec.swr() preconditions; we
+                // only need to translate freshFor to nanos here.
+                SwrSidecar swrSidecar = (spec.swr() != null)
+                        ? new SwrSidecar(name,
+                                spec.swr().freshFor().toNanos(),
+                                refreshExecutor,
+                                breaker,
+                                meterRegistry)
+                        : null;
                 NearCache near = new NearCache(
-                        buildCaffeineCache(name, spec),
-                        spec, bucketCodec, redisson, breaker, dispatcher, meterRegistry, keyLogFormatter);
+                        buildCaffeineCache(name, spec, swrSidecar),
+                        spec, bucketCodec, redisson, breaker, dispatcher,
+                        meterRegistry, keyLogFormatter, swrSidecar);
                 nearCaches.add(near);
                 // Preloader registration runs *after* the cache is fully
                 // built and the dispatcher has registered the listener
@@ -159,36 +203,48 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
     }
 
     private CaffeineCache buildCaffeineCache(String name, CacheProperties.CacheSpec spec) {
+        return buildCaffeineCache(name, spec, null);
+    }
+
+    /**
+     * Builds the underlying Caffeine cache. Branches on which of
+     * (jitter, maxIdle, swr) are configured. SWR is layered as the
+     * highest-precedence physical-eviction control: when the spec opts
+     * in, {@code expireAfterWrite} is set to {@code swr.stale-for}
+     * regardless of the jitter ratio, and the SWR fresh-until deadline
+     * is exact (the integration test pins this — jitter must not skew
+     * SWR deadlines).
+     *
+     * <p>The {@link com.github.benmanes.caffeine.cache.RemovalListener}
+     * is composed: it fires both {@link JitteredMaxIdleExpiry#onRemoval}
+     * (when present) and {@link SwrSidecar#onRemoval} (when present),
+     * skipping {@code REPLACED} for both reasons (the sidecar write the
+     * caller has just performed must not be cleaned up — guardrail
+     * item 1 of the SWR section + the existing jittered-max-idle race).
+     */
+    private CaffeineCache buildCaffeineCache(String name,
+                                             CacheProperties.CacheSpec spec,
+                                             SwrSidecar swrSidecar) {
         Caffeine<Object, Object> builder = Caffeine.newBuilder()
                 .maximumSize(spec.maximumSize())
                 .recordStats();
-        // Four-way branch over (ttlJitterRatio, maxIdle):
-        //   neither       → expireAfterWrite(ttl)               (pre-0.4.0 byte-identical)
-        //   maxIdle only  → expireAfterWrite(ttl) + expireAfterAccess(maxIdle)
-        //   jitter only   → expireAfter(JitteredExpiry)
-        //   both          → expireAfter(JitteredMaxIdleExpiry) + removalListener
-        //
-        // Caffeine forbids combining expireAfter(Expiry) with either
-        // expireAfterWrite(Duration) or expireAfterAccess(Duration), and
-        // the order of method calls on the builder doesn't change that —
-        // the choice has to be made up-front per spec.
         boolean jittering = spec.ttlJitterRatio() > 0.0;
         boolean maxIdling = spec.maxIdle() != null;
-        if (jittering && maxIdling) {
-            JitteredMaxIdleExpiry expiry = new JitteredMaxIdleExpiry(
+        boolean swrEnabled = swrSidecar != null;
+
+        // SWR overrides the L1 expiry: stale-for is the physical eviction
+        // boundary, regardless of jitter or max-idle. Jitter is
+        // intentionally inert in SWR mode (the test pins this — fresh-for
+        // and stale-for stay exact).
+        JitteredMaxIdleExpiry jmiExpiry = null;
+        if (swrEnabled) {
+            builder.expireAfterWrite(spec.swr().staleFor());
+        } else if (jittering && maxIdling) {
+            jmiExpiry = new JitteredMaxIdleExpiry(
                     spec.ttl().toNanos(),
                     spec.ttlJitterRatio(),
                     spec.maxIdle().toNanos());
-            // Skip REPLACED: expireAfterUpdate has just written a fresh
-            // deadline, and removing it here would race that write. Every
-            // other cause (EXPIRED, EXPLICIT, SIZE, COLLECTED) leaves no
-            // further write to the sidecar, so cleanup is unconditional.
-            builder.expireAfter(expiry)
-                    .removalListener((k, v, cause) -> {
-                        if (k != null && cause != com.github.benmanes.caffeine.cache.RemovalCause.REPLACED) {
-                            expiry.onRemoval(k);
-                        }
-                    });
+            builder.expireAfter(jmiExpiry);
         } else if (jittering) {
             builder.expireAfter(new JitteredExpiry(
                     spec.ttl().toNanos(), spec.ttlJitterRatio()));
@@ -198,6 +254,30 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
         } else {
             builder.expireAfterWrite(spec.ttl());
         }
+
+        // Composite removal listener: fires the jittered-max-idle cleanup
+        // and the SWR sidecar cleanup, both skipping REPLACED. The two
+        // are independent — REPLACED races a fresh deadline write in both
+        // cases, every other cause is a strict eviction with no further
+        // write to clean up.
+        //
+        // Caffeine dispatches removal notifications via its executor, which
+        // defaults to ForkJoinPool.commonPool() (async). We force synchronous
+        // dispatch with executor(Runnable::run) so SWR's reconciliation
+        // contract — "caffeineCache.clear() drains the sidecar before it
+        // returns" (DESIGN §2 SWR / Reconciliation interaction) — actually
+        // holds. There is no AsyncLoadingCache in use, so synchronous
+        // executor has no downside on the cache's hot path.
+        if (jmiExpiry != null || swrEnabled) {
+            final JitteredMaxIdleExpiry jmiFinal = jmiExpiry;
+            builder.executor(Runnable::run)
+                    .removalListener((k, v, cause) -> {
+                        if (k == null || cause == RemovalCause.REPLACED) return;
+                        if (jmiFinal != null) jmiFinal.onRemoval(k);
+                        if (swrSidecar != null) swrSidecar.onRemoval(k.toString());
+                    });
+        }
+
         com.github.benmanes.caffeine.cache.Cache<Object, Object> nativeCache = builder.build();
         return new CaffeineCache(name, nativeCache, true);
     }

@@ -150,7 +150,7 @@ class CacheSpecValidatorTest {
                 server(), Map.of("tokens", kryo), defaultSpec(), null,
                 List.of("io.github.nwwarm."),
                 new CacheProperties.Kryo(List.of("java.lang.String")),
-                null, null, false, null, null, null, null);
+                null, null, false, null, null, null, null, null);
         assertThatNoException().isThrownBy(() -> CacheSpecValidator.validate(props));
     }
 
@@ -241,7 +241,7 @@ class CacheSpecValidatorTest {
         CacheProperties props = new CacheProperties(
                 server(), Map.of(), defaultSpec(), null,
                 List.of("io.github.nwwarm."), null, null,
-                new CacheProperties.Resilience(badGlobal), false, null, null, null, null);
+                new CacheProperties.Resilience(badGlobal), false, null, null, null, null, null);
         assertViolation(props, "global circuit-breaker defaults", "failure-rate-threshold");
     }
 
@@ -737,35 +737,35 @@ class CacheSpecValidatorTest {
 
     private static CacheProperties minimalValidProperties() {
         return new CacheProperties(server(), Map.of(), defaultSpec(), null,
-                List.of("io.github.nwwarm."), null, null, null, false, null, null, null, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null, null, null, null, null);
     }
 
     private static CacheProperties propertiesWithCaches(
             Map<String, CacheProperties.CacheSpec> caches) {
         return new CacheProperties(server(), caches, defaultSpec(), null,
-                List.of("io.github.nwwarm."), null, null, null, false, null, null, null, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null, null, null, null, null);
     }
 
     private static CacheProperties propertiesWithDefaultSpec(CacheProperties.CacheSpec defaultSpec) {
         return new CacheProperties(server(), Map.of(), defaultSpec, null,
-                List.of("io.github.nwwarm."), null, null, null, false, null, null, null, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null, null, null, null, null);
     }
 
     private static CacheProperties propertiesWithStartupProbe(CacheProperties.StartupProbe probe) {
         return new CacheProperties(server(), Map.of(), defaultSpec(), null,
-                List.of("io.github.nwwarm."), null, null, null, false, null, probe, null, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null, probe, null, null, null);
     }
 
     private static CacheProperties propertiesWithInvalidation(
             CacheProperties.Server server, CacheProperties.Invalidation invalidation) {
         return new CacheProperties(server, Map.of(), defaultSpec(), null,
-                List.of("io.github.nwwarm."), null, null, null, false, null, null, invalidation, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null, null, invalidation, null, null);
     }
 
     private static CacheProperties propertiesWithCacheSpec(
             String name, CacheProperties.CacheSpec spec) {
         return new CacheProperties(server(), Map.of(name, spec), defaultSpec(), null,
-                List.of("io.github.nwwarm."), null, null, null, false, null, null, null, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null, null, null, null, null);
     }
 
     private static CacheProperties.Server server() {
@@ -778,7 +778,7 @@ class CacheSpecValidatorTest {
         return new CacheProperties.CacheSpec(
                 CacheProperties.Tier.NEAR_CACHE, Duration.ofHours(1), 10_000,
                 Duration.ofSeconds(5), Duration.ofSeconds(30),
-                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null, null, null);
     }
 
     private static CacheProperties.CacheSpec spec(
@@ -786,7 +786,7 @@ class CacheSpecValidatorTest {
             Duration lockWait, Duration lockLease,
             CacheProperties.Codec codec, CacheProperties.CircuitBreaker cb) {
         return new CacheProperties.CacheSpec(
-                tier, ttl, 10_000, lockWait, lockLease, codec, cb, null, null, 0.0, null, null, null);
+                tier, ttl, 10_000, lockWait, lockLease, codec, cb, null, null, 0.0, null, null, null, null);
     }
 
     private static CacheProperties.CacheSpec specWithJitter(
@@ -794,7 +794,7 @@ class CacheSpecValidatorTest {
         return new CacheProperties.CacheSpec(
                 tier, Duration.ofHours(1), 10_000,
                 Duration.ofSeconds(5), Duration.ofSeconds(30),
-                CacheProperties.Codec.JSON, null, null, null, ratio, null, null, null);
+                CacheProperties.Codec.JSON, null, null, null, ratio, null, null, null, null);
     }
 
     private static CacheProperties.CacheSpec specWithMaxIdle(
@@ -802,7 +802,7 @@ class CacheSpecValidatorTest {
         return new CacheProperties.CacheSpec(
                 tier, ttl, 10_000,
                 Duration.ofSeconds(5), Duration.ofSeconds(30),
-                CacheProperties.Codec.JSON, null, null, null, 0.0, maxIdle, null, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, maxIdle, null, null, null);
     }
 
     static CacheProperties.CacheSpec specWithPreloader(
@@ -810,7 +810,7 @@ class CacheSpecValidatorTest {
         return new CacheProperties.CacheSpec(
                 tier, Duration.ofHours(1), 10_000,
                 Duration.ofSeconds(5), Duration.ofSeconds(30),
-                CacheProperties.Codec.JSON, null, null, null, 0.0, null, preloader, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null, preloader, null, null);
     }
 
     private static CacheProperties.CacheSpec specWithCb(CacheProperties.CircuitBreaker cb) {

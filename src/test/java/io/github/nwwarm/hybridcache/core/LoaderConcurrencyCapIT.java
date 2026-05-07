@@ -436,7 +436,7 @@ class LoaderConcurrencyCapIT extends RedisTestBase {
                 Duration.ofMinutes(10), 10_000,
                 lockWait, Duration.ofSeconds(10),
                 CacheProperties.Codec.JSON, null,
-                maxConcurrentLoaders, loaderAcquireTimeout, 0.0, null, null, null);
+                maxConcurrentLoaders, loaderAcquireTimeout, 0.0, null, null, null, null);
         com.github.benmanes.caffeine.cache.Cache<Object, Object> nativeCache = Caffeine.newBuilder()
                 .expireAfterWrite(spec.ttl())
                 .maximumSize(spec.maximumSize())

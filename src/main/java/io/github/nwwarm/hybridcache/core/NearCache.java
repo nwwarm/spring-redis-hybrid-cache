@@ -71,6 +71,8 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
     private final KeyLogFormatter keyLogFormatter;
     private final LoaderGate loaderGate;
     private final MeterRegistry meterRegistry;
+    /** Non-null only when {@code spec.swr() != null} — SWR opts in via configuration. */
+    private final SwrSidecar swrSidecar;
 
     // Generation counter for O(1) clear
     private final RAtomicLong distributedGeneration;
@@ -111,6 +113,27 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
                      InvalidationDispatcher dispatcher,
                      MeterRegistry meterRegistry,
                      KeyLogFormatter keyLogFormatter) {
+        this(caffeineCache, spec, bucketCodec, redisson, breaker, dispatcher,
+                meterRegistry, keyLogFormatter, null);
+    }
+
+    /**
+     * Constructor with SWR support (0.5.0). The {@code swrSidecar} may
+     * be {@code null} when {@code spec.swr() == null}; the caller
+     * ({@link io.github.nwwarm.hybridcache.core.HybridCacheManager})
+     * builds the sidecar before this constructor so the Caffeine
+     * {@code RemovalListener} can wire {@link SwrSidecar#onRemoval(String)}
+     * directly.
+     */
+    public NearCache(Cache caffeineCache,
+                     CacheProperties.CacheSpec spec,
+                     Codec bucketCodec,
+                     RedissonClient redisson,
+                     CircuitBreaker breaker,
+                     InvalidationDispatcher dispatcher,
+                     MeterRegistry meterRegistry,
+                     KeyLogFormatter keyLogFormatter,
+                     SwrSidecar swrSidecar) {
         this.caffeineCache = caffeineCache;
         this.cacheName = caffeineCache.getName();
         this.spec = spec;
@@ -122,6 +145,7 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
         this.meterRegistry = meterRegistry;
         this.loaderGate = new LoaderGate(cacheName,
                 spec.maxConcurrentLoaders(), spec.loaderAcquireTimeout(), meterRegistry);
+        this.swrSidecar = swrSidecar;
 
         this.distributedGeneration = redisson.getAtomicLong(CacheKeys.generationKey(cacheName));
         initializeGeneration();
@@ -192,11 +216,23 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
     public ValueWrapper get(@Nonnull Object key) {
         String stringKey = CacheKeys.stringify(cacheName, key);
         ValueWrapper wrapper = caffeineCache.get(stringKey);
-        if (wrapper != null) return wrapper;
+        if (wrapper != null) {
+            // SWR classification fires only on L1 hits — past stale-until,
+            // Caffeine has physically evicted and we never reach this branch.
+            // Plain get(key) (no loader) cannot dispatch a refresh — there
+            // is nothing to call. Return the wrapper regardless of fresh /
+            // stale; the next loader-aware caller will trigger refresh.
+            return wrapper;
+        }
 
         Object distValue = readFromL2(stringKey);
         if (distValue == null) return null;
 
+        // Sidecar must be written BEFORE the value becomes visible —
+        // guardrail item 2. A reader landing between the put and the
+        // sidecar write would see the value with no fresh deadline,
+        // classify as stale, and dispatch a redundant refresh.
+        if (swrSidecar != null) swrSidecar.recordWrite(stringKey);
         caffeineCache.put(stringKey, distValue);
         return caffeineCache.get(stringKey);  // delegate so CaffeineCache wraps NullValue correctly
     }
@@ -244,12 +280,20 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
 
         // Fast path: already cached in L1 or L2.
         ValueWrapper wrapper = caffeineCache.get(stringKey);
-        if (wrapper == null) {
-            Object distValue = readFromL2(stringKey);
-            if (distValue != null) {
-                caffeineCache.put(stringKey, distValue);
-                wrapper = caffeineCache.get(stringKey);
-            }
+        if (wrapper != null) {
+            // L1 hit — branch on SWR classification. Inside the fresh
+            // window, return synchronously and skip the rest of the
+            // method. Inside the stale window, return synchronously and
+            // dispatch an async refresh for next time.
+            maybeFireSwrRefresh(stringKey, valueLoader);
+            return (T) wrapper.get();
+        }
+        Object distValue = readFromL2(stringKey);
+        if (distValue != null) {
+            // Sidecar write before put — guardrail item 2.
+            if (swrSidecar != null) swrSidecar.recordWrite(stringKey);
+            caffeineCache.put(stringKey, distValue);
+            wrapper = caffeineCache.get(stringKey);
         }
         if (wrapper != null) return (T) wrapper.get();
 
@@ -260,10 +304,16 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
             Object stored = nativeCaffeine.get(stringKey, k -> {
                 // Caffeine guarantees only one thread per JVM enters this lambda for key k.
                 // We may have lost a race with another node since the outer get() — re-check L2.
-                Object distValue = readFromL2((String) k);
-                if (distValue != null) return distValue;
+                Object recheck = readFromL2((String) k);
+                if (recheck != null) {
+                    // Sidecar deadline pre-write before Caffeine's compute
+                    // returns and the value becomes visible (guardrail #2).
+                    if (swrSidecar != null) swrSidecar.recordWrite((String) k);
+                    return recheck;
+                }
 
                 Object loaded = loadWithDistributedLock((String) k, valueLoader);
+                if (swrSidecar != null) swrSidecar.recordWrite((String) k);
                 // Translate null to NullValue so Caffeine actually caches negative results.
                 return loaded == null ? NullValue.INSTANCE : loaded;
             });
@@ -271,6 +321,34 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
         } catch (LoaderException e) {
             throw new ValueRetrievalException(key, valueLoader, e.getCause());
         }
+    }
+
+    /**
+     * SWR helper: classifies the L1-hit wrapper against the dual deadlines
+     * and dispatches a refresh on stale. Loader-aware — only the
+     * {@code get(key, valueLoader)} path uses this; plain {@code get(key)}
+     * has no loader to call.
+     *
+     * <p>The refresh task body wraps the loader through the same
+     * {@link LoaderGate} the synchronous path uses (guardrail #5) and
+     * writes the result via {@link #put(Object, Object)} so L2 and the
+     * cross-node invalidation publish (guardrail #6) both happen — a
+     * direct Caffeine write would update only this node's L1 and leave
+     * peers serving stale until their own {@code stale-until}.
+     */
+    private <T> void maybeFireSwrRefresh(String stringKey, Callable<T> valueLoader) {
+        if (swrSidecar == null) return;
+        if (swrSidecar.classify(stringKey) != SwrSidecar.Classification.STALE) return;
+        Callable<Object> refreshTask = () -> {
+            // loaderGate.run guarantees the per-cache concurrency cap is
+            // respected for refresh-driven loads — guardrail item 5. Going
+            // through put() (rather than caffeineCache.put directly)
+            // ensures L2 + invalidation propagate to peers (guardrail #6).
+            Object value = loaderGate.run(stringKey, valueLoader);
+            put(stringKey, value);
+            return value;
+        };
+        swrSidecar.maybeDispatchRefresh(stringKey, refreshTask);
     }
 
     /**
@@ -361,6 +439,12 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
     @Override
     public void put(@Nonnull Object key, Object value) {
         String stringKey = CacheKeys.stringify(cacheName, key);
+        // SWR sidecar write goes BEFORE the value becomes visible to readers
+        // (guardrail item 2). A reader landing between caffeineCache.put and
+        // a subsequent sidecar write would see the new value with no fresh
+        // deadline, classify as stale, and dispatch a refresh against a value
+        // that was just written and is fresh by definition.
+        if (swrSidecar != null) swrSidecar.recordWrite(stringKey);
         // Order on writes: local first (so this node sees its own write immediately),
         // then remote, then publish so other nodes invalidate and lazy-load.
         caffeineCache.put(stringKey, value);
@@ -781,5 +865,14 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
 
     public CircuitBreaker getBreaker() {
         return breaker;
+    }
+
+    /**
+     * Test seam: returns the SWR sidecar when configured, {@code null}
+     * otherwise. Tests use this to assert sidecar size, dispatch counts,
+     * and the in-flight collapse without poking at private state.
+     */
+    public SwrSidecar swrSidecar() {
+        return swrSidecar;
     }
 }

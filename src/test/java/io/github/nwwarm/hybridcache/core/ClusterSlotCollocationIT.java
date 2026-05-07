@@ -162,7 +162,7 @@ class ClusterSlotCollocationIT {
                     null,
                     "cluster-it",
                     List.of("io.github.nwwarm."),
-                    null, null, null, false, null, null, null, null);
+                    null, null, null, false, null, null, null, null, null);
             HybridCacheManager manager = new HybridCacheManager(
                     props, client,
                     io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry.ofDefaults(),
@@ -186,7 +186,7 @@ class ClusterSlotCollocationIT {
                 null, null, null);
         CacheProperties props = new CacheProperties(
                 server, null, null, "cluster-it",
-                List.of("io.github.nwwarm."), null, null, null, false, null, null, null, null);
+                List.of("io.github.nwwarm."), null, null, null, false, null, null, null, null, null);
         return new CacheConfig().redissonClient(props);
     }
 }

@@ -36,7 +36,8 @@ public record CacheProperties(
         String logKeySalt,
         StartupProbe startupProbe,
         Invalidation invalidation,
-        PreloaderGlobal preloader) {
+        PreloaderGlobal preloader,
+        Refresh refresh) {
 
     private static final Logger log = LoggerFactory.getLogger(CacheProperties.class);
     private static final Set<String> WARNED_NAMES = ConcurrentHashMap.newKeySet();
@@ -50,6 +51,7 @@ public record CacheProperties(
         if (startupProbe == null) startupProbe = new StartupProbe(false, null, 1, null);
         if (invalidation == null) invalidation = new Invalidation(false);
         if (preloader == null) preloader = new PreloaderGlobal(4);
+        if (refresh == null) refresh = new Refresh(4);
         if (defaultSpec == null) {
             defaultSpec = new CacheSpec(
                     Tier.NEAR_CACHE,
@@ -62,6 +64,7 @@ public record CacheProperties(
                     null,
                     null,
                     0.0,
+                    null,
                     null,
                     null,
                     null);
@@ -294,6 +297,24 @@ public record CacheProperties(
     }
 
     /**
+     * Shared refresh-executor sizing (0.5.0).
+     *
+     * <p>Single fixed-size pool that drains SWR stale-window dispatches,
+     * RA probabilistic dispatches, and async-loader hops off the Netty
+     * event loop. Sized to absorb a small burst of concurrent refreshes;
+     * sustained queueing on {@code cache.refresh.queue.size} is the
+     * signal to tune up.
+     *
+     * @param schedulerPoolSize threads. Default {@code 4}; minimum 1
+     *                          (zero or negative coerces to default).
+     */
+    public record Refresh(int schedulerPoolSize) {
+        public Refresh {
+            if (schedulerPoolSize <= 0) schedulerPoolSize = 4;
+        }
+    }
+
+    /**
      * Per-cache near-cache preloader configuration.
      *
      * <p>When {@link #enabled} is {@code true} on a {@code NEAR_CACHE} tier,
@@ -362,6 +383,36 @@ public record CacheProperties(
             // maxStoredKeys: null = unbounded (beyond maximum-size)
         }
     }
+
+    /**
+     * Per-cache stale-while-revalidate tuning (0.5.0).
+     *
+     * <p>L1 entries gain two deadlines: <b>fresh-until</b>
+     * ({@code now + freshFor}) and <b>stale-until</b> ({@code now + staleFor},
+     * also the Caffeine {@code expireAfterWrite}). Reads inside
+     * {@code [write, fresh-until)} return synchronously and do nothing
+     * extra. Reads inside {@code [fresh-until, stale-until)} return the
+     * stale value <em>and</em> dispatch an async refresh on the shared
+     * refresh executor. Reads past {@code stale-until} miss L1, fall
+     * through to L2, then to the loader.
+     *
+     * <p><b>Tier rules.</b> Allowed on {@code NEAR_CACHE} and
+     * {@code LOCAL_ONLY}. Rejected on {@code DISTRIBUTED_ONLY} (no L1
+     * to apply dual deadlines to).
+     *
+     * <p><b>Per-call configuration was dropped from 0.5.0.</b> SWR is
+     * configured per cache, not per call. Operators who need both modes
+     * for the same logical data configure two cache names. See §10
+     * decision log for the rationale (custom annotations rejected by §9).
+     *
+     * @param freshFor in-window where reads return synchronously without
+     *                 dispatching a refresh. Validator rule: {@code > 0} and
+     *                 {@code < staleFor}.
+     * @param staleFor outer window — reads past this fall through to L2 and
+     *                 the loader. Equals the Caffeine {@code expireAfterWrite}.
+     *                 Validator rule: {@code > freshFor} and {@code <= ttl}.
+     */
+    public record Swr(Duration freshFor, Duration staleFor) {}
 
     /**
      * Per-cache reconciliation tuning (0.5.0).
@@ -461,7 +512,8 @@ public record CacheProperties(
             double ttlJitterRatio,
             Duration maxIdle,
             Preloader preloader,
-            Reconciliation reconciliation) {
+            Reconciliation reconciliation,
+            Swr swr) {
 
         public CacheSpec {
             if (tier == null) tier = Tier.NEAR_CACHE;
@@ -484,6 +536,8 @@ public record CacheProperties(
             // (NEAR_CACHE-only) also lives in CacheSpecValidator.
             // reconciliation defaults to null = disabled. Tier validation
             // (no LOCAL_ONLY) lives in CacheSpecValidator.
+            // swr defaults to null = disabled. Validator enforces
+            // 0 < freshFor < staleFor <= ttl and rejects DISTRIBUTED_ONLY.
         }
     }
 

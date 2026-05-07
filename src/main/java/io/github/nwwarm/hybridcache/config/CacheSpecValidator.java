@@ -3,6 +3,7 @@ package io.github.nwwarm.hybridcache.config;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -87,6 +88,22 @@ import java.util.Map;
  *       per-node by design, no cross-node coherence problem to reconcile
  *       against, and the {@code <cache>:seq} counter would never advance
  *       on a single-node cache.</li>
+ * </ul>
+ *
+ * <b>Per swr block</b> (only checked when {@code spec.swr()} is non-null —
+ * SWR opts in by being configured at all, no separate {@code enabled} flag):
+ * <ul>
+ *   <li>E32: {@code swr.*} is not allowed on {@code tier=DISTRIBUTED_ONLY}.
+ *       Dual-deadline tracking lives on Caffeine L1; without an L1 there
+ *       is nothing for it to apply to. Allowed on {@code NEAR_CACHE} and
+ *       {@code LOCAL_ONLY}.</li>
+ *   <li>E33: {@code swr.fresh-for} must be positive.</li>
+ *   <li>E34: {@code swr.stale-for} must be positive.</li>
+ *   <li>E35: {@code swr.fresh-for &lt; swr.stale-for}. Equality is a
+ *       degenerate "no stale window"; greater is nonsense.</li>
+ *   <li>E36: {@code swr.stale-for &lt;= ttl}. The Caffeine
+ *       {@code expireAfterWrite} is set to {@code swr.stale-for}, so a
+ *       larger value would let an L1 entry outlive its L2 source.</li>
  * </ul>
  *
  * <b>Per preloader block</b> (only checked when {@code enabled=true},
@@ -272,6 +289,65 @@ final class CacheSpecValidator {
         }
     }
 
+    private static void validateSwr(String label,
+                                     CacheProperties.CacheSpec spec,
+                                     List<String> violations) {
+        CacheProperties.Swr s = spec.swr();
+
+        // E32: tier rule — SWR requires an L1 to apply dual deadlines to.
+        // DISTRIBUTED_ONLY is rejected; LOCAL_ONLY and NEAR_CACHE both
+        // have a Caffeine L1, so both are allowed.
+        if (spec.tier() == CacheProperties.Tier.DISTRIBUTED_ONLY) {
+            violations.add(label + ": swr.* is not allowed on tier=DISTRIBUTED_ONLY."
+                    + " SWR's dual-deadline tracking lives on the Caffeine L1 layer,"
+                    + " and DISTRIBUTED_ONLY has no L1 — there is nothing for the"
+                    + " fresh-until / stale-until pair to apply to. Either remove"
+                    + " swr.* or change the tier to NEAR_CACHE or LOCAL_ONLY.");
+            // Don't continue with field validation — the rejection here makes
+            // any field-level failure noise.
+            return;
+        }
+
+        // E33: fresh-for must be positive.
+        Duration fresh = s.freshFor();
+        if (fresh == null || fresh.isZero() || fresh.isNegative()) {
+            violations.add(label + ": swr.fresh-for must be positive (got " + fresh + ")");
+        }
+
+        // E34: stale-for must be positive.
+        Duration stale = s.staleFor();
+        if (stale == null || stale.isZero() || stale.isNegative()) {
+            violations.add(label + ": swr.stale-for must be positive (got " + stale + ")");
+        }
+
+        // Field comparisons require both to be non-null and positive — skip if
+        // either failed the basic check, otherwise the message would be
+        // confusingly redundant.
+        if (fresh == null || stale == null) return;
+        if (fresh.isZero() || fresh.isNegative()) return;
+        if (stale.isZero() || stale.isNegative()) return;
+
+        // E35: fresh-for < stale-for. Equality means there is no stale window —
+        // a degenerate case identical to "no SWR"; reject so misconfiguration
+        // surfaces at boot rather than as "SWR configured but never fires."
+        if (fresh.compareTo(stale) >= 0) {
+            violations.add(label + ": swr.fresh-for (" + fresh + ") must be <"
+                    + " swr.stale-for (" + stale + "); equal means an empty stale"
+                    + " window (SWR never fires); greater is nonsense.");
+        }
+
+        // E36: stale-for <= ttl. The Caffeine expireAfterWrite is set to
+        // stale-for, so stale-for > ttl would let L1 entries outlive their
+        // L2 source. The validator pins the upper bound at startup.
+        if (spec.ttl() != null && !spec.ttl().isZero() && !spec.ttl().isNegative()
+                && stale.compareTo(spec.ttl()) > 0) {
+            violations.add(label + ": swr.stale-for (" + stale + ") must be <="
+                    + " ttl (" + spec.ttl() + "). stale-for is the Caffeine"
+                    + " expireAfterWrite ceiling on L1; exceeding ttl would let"
+                    + " an L1 entry outlive its L2 source.");
+        }
+    }
+
     private static void validateShardedPubsub(CacheProperties properties,
                                               List<String> violations) {
         // E23: sharded pub/sub is a Redis Cluster–only capability. Allowing
@@ -428,6 +504,11 @@ final class CacheSpecValidator {
         // Reconciliation (only validated when enabled — same philosophy).
         if (spec.reconciliation() != null && spec.reconciliation().enabled()) {
             validateReconciliation(label, spec, violations);
+        }
+
+        // SWR (only validated when configured — null means disabled).
+        if (spec.swr() != null) {
+            validateSwr(label, spec, violations);
         }
 
         // W1

@@ -215,7 +215,7 @@ class ReconciliationFailureModesIT extends RedisTestBase {
                 io.github.nwwarm.hybridcache.config.CacheProperties.Codec.JSON,
                 null, null, null, 0.0, null, null,
                 new io.github.nwwarm.hybridcache.config.CacheProperties.Reconciliation(
-                        true, interval, missTolerance));
+                        true, interval, missTolerance), null);
         var dispatcher = new io.github.nwwarm.hybridcache.invalidation.InvalidationDispatcher(
                 r, nodeId, mr);
         return new DistributedOnlyCache(name, spec, null, r, breaker, dispatcher, mr,
