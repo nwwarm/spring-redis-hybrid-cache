@@ -106,6 +106,30 @@ import java.util.Map;
  *       larger value would let an L1 entry outlive its L2 source.</li>
  * </ul>
  *
+ * <b>Per refresh-ahead block</b> (only checked when
+ * {@code refresh-ahead.enabled=true}, mirroring the startup-probe
+ * philosophy — disabled-with-bogus-values is harmless):
+ * <ul>
+ *   <li>E37: {@code refresh-ahead.enabled=true} is not allowed on
+ *       {@code tier=DISTRIBUTED_ONLY}. Same rationale as E32 — RA evaluates
+ *       the XFetch predicate inside the L1 fresh window; without an L1 there
+ *       is no fresh window.</li>
+ *   <li>E38: {@code refresh-ahead.enabled=true} requires {@code swr.fresh-for}
+ *       and {@code swr.stale-for} to be configured for the same cache.
+ *       Refresh-ahead is implemented as a probabilistic firing mode of SWR
+ *       (see §10 0.5.0 decision log); the SWR fresh window IS the predicate's
+ *       evaluation domain. RA without SWR has nothing to evaluate against
+ *       and never fires — the validator catches it at boot rather than
+ *       letting it surface as runtime "RA configured but never fires."</li>
+ *   <li>E39: {@code refresh-ahead.beta} must be strictly positive. β=0
+ *       degenerates the XFetch predicate to "now − lastWrite ≥ freshFor"
+ *       (equivalent to "the entry is already stale" — fires nothing extra).
+ *       Operators who want RA disabled set
+ *       {@code refresh-ahead.enabled=false}; β=0 is a misconfiguration we
+ *       catch at boot. See {@code # implementation guardrails / ## Refresh-ahead}
+ *       guardrail item 3.</li>
+ * </ul>
+ *
  * <b>Per preloader block</b> (only checked when {@code enabled=true},
  * mirroring the startup-probe philosophy):
  * <ul>
@@ -348,6 +372,58 @@ final class CacheSpecValidator {
         }
     }
 
+    private static void validateRefreshAhead(String label,
+                                              CacheProperties.CacheSpec spec,
+                                              List<String> violations) {
+        CacheProperties.RefreshAhead ra = spec.refreshAhead();
+
+        // E37: tier rule — RA's XFetch predicate evaluates inside the L1
+        // fresh window. DISTRIBUTED_ONLY has no L1, so there is no fresh
+        // window to evaluate against. NEAR_CACHE and LOCAL_ONLY both
+        // qualify (same set as SWR — RA is a SWR mode).
+        if (spec.tier() == CacheProperties.Tier.DISTRIBUTED_ONLY) {
+            violations.add(label + ": refresh-ahead.enabled=true is not allowed"
+                    + " on tier=DISTRIBUTED_ONLY. Refresh-ahead evaluates the"
+                    + " XFetch predicate inside the L1 fresh window;"
+                    + " DISTRIBUTED_ONLY has no L1, so there is no fresh"
+                    + " window to evaluate against. Either disable"
+                    + " refresh-ahead or change the tier to NEAR_CACHE or"
+                    + " LOCAL_ONLY.");
+            // Skip remaining checks — the rejection here makes any field-level
+            // failure noise.
+            return;
+        }
+
+        // E38: RA requires SWR. RA is a probabilistic firing mode of SWR (see
+        // §10 0.5.0 decision log); the SWR fresh window is the predicate's
+        // evaluation domain. RA without SWR has nothing to evaluate against
+        // and would never fire — fail at boot, not silently at runtime.
+        if (spec.swr() == null) {
+            violations.add(label + ": refresh-ahead.enabled=true requires"
+                    + " swr.fresh-for and swr.stale-for to be configured for"
+                    + " the same cache. Refresh-ahead is implemented as a"
+                    + " probabilistic firing mode of SWR — its predicate"
+                    + " evaluates inside the SWR fresh window. Without SWR"
+                    + " there is no fresh window to evaluate against and RA"
+                    + " would never fire. Configure swr.* alongside"
+                    + " refresh-ahead.* or disable refresh-ahead.");
+        }
+
+        // E39: beta > 0. β=0 makes the XFetch predicate degenerate
+        // (now − lastWrite + 0 ≥ freshFor, equivalent to "expired"). β=0
+        // is rejected as misconfiguration — operators who want RA off set
+        // refresh-ahead.enabled=false. See implementation-guardrail item 3.
+        if (ra.beta() <= 0.0) {
+            violations.add(label + ": refresh-ahead.beta must be > 0 (got "
+                    + ra.beta() + "). β=0 makes the XFetch predicate"
+                    + " degenerate (the only way to fire becomes"
+                    + " now − lastWrite ≥ freshFor, equivalent to 'already"
+                    + " stale'). To disable refresh-ahead, set"
+                    + " refresh-ahead.enabled=false; β=0 is a misconfiguration,"
+                    + " not a disable switch.");
+        }
+    }
+
     private static void validateShardedPubsub(CacheProperties properties,
                                               List<String> violations) {
         // E23: sharded pub/sub is a Redis Cluster–only capability. Allowing
@@ -509,6 +585,12 @@ final class CacheSpecValidator {
         // SWR (only validated when configured — null means disabled).
         if (spec.swr() != null) {
             validateSwr(label, spec, violations);
+        }
+
+        // Refresh-ahead (only validated when enabled — disabled-with-bogus-values
+        // mirrors the startup-probe philosophy: no gating on unrelated typos).
+        if (spec.refreshAhead() != null && spec.refreshAhead().enabled()) {
+            validateRefreshAhead(label, spec, violations);
         }
 
         // W1

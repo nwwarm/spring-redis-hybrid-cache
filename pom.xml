@@ -224,6 +224,45 @@
                     </execution>
                 </executions>
             </plugin>
+
+            <!--
+              PIT mutation testing for the refresh-ahead surface (0.5.0).
+              Scoped to the new classes so the run is fast and the kill
+              rate ≥ 80% target tracks RA-specific code, not noise from
+              the broader codebase. Invoke via:
+                mvn -Dpit-ra org.pitest:pitest-maven:mutationCoverage
+              The profile activation keeps the plugin out of the default
+              build — ordinary `mvn test` and `mvn verify` runs do not
+              fork PIT.
+            -->
+            <plugin>
+                <groupId>org.pitest</groupId>
+                <artifactId>pitest-maven</artifactId>
+                <version>1.20.4</version>
+                <dependencies>
+                    <dependency>
+                        <groupId>org.pitest</groupId>
+                        <artifactId>pitest-junit5-plugin</artifactId>
+                        <version>1.2.3</version>
+                    </dependency>
+                </dependencies>
+                <configuration>
+                    <targetClasses>
+                        <param>io.github.nwwarm.hybridcache.core.XFetchPredicate</param>
+                        <param>io.github.nwwarm.hybridcache.core.LoaderRuntimeEwma</param>
+                        <param>io.github.nwwarm.hybridcache.core.RefreshAheadCoordinator</param>
+                    </targetClasses>
+                    <targetTests>
+                        <param>io.github.nwwarm.hybridcache.core.XFetchPredicateTest</param>
+                        <param>io.github.nwwarm.hybridcache.core.LoaderRuntimeEwmaTest</param>
+                        <param>io.github.nwwarm.hybridcache.core.RefreshAheadCoordinatorTest</param>
+                        <param>io.github.nwwarm.hybridcache.core.RefreshAheadMonotonicityPropertyTest</param>
+                    </targetTests>
+                    <mutationThreshold>80</mutationThreshold>
+                    <coverageThreshold>80</coverageThreshold>
+                    <timestampedReports>false</timestampedReports>
+                </configuration>
+            </plugin>
         </plugins>
     </build>
 </project>

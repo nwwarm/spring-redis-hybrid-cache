@@ -149,7 +149,7 @@ class CacheSpecValidatorReconciliationTest {
                 tier, Duration.ofHours(1), 10_000,
                 Duration.ofSeconds(5), Duration.ofSeconds(30),
                 CacheProperties.Codec.JSON,
-                null, null, null, 0.0, null, null, r, null);
+                null, null, null, 0.0, null, null, r, null, null);
         return new CacheProperties(
                 new CacheProperties.Server(CacheProperties.Mode.SINGLE,
                         "redis://localhost:6379", null, null, null, null),

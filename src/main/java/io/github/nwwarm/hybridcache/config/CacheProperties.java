@@ -67,6 +67,7 @@ public record CacheProperties(
                     null,
                     null,
                     null,
+                    null,
                     null);
         }
     }
@@ -415,6 +416,61 @@ public record CacheProperties(
     public record Swr(Duration freshFor, Duration staleFor) {}
 
     /**
+     * Per-cache refresh-ahead tuning (0.5.0).
+     *
+     * <p>Refresh-ahead is implemented as a <b>probabilistic firing mode of
+     * SWR</b>, not as an independent feature. It reuses SWR's async refresh
+     * pipeline, in-flight collapse, executor, and breaker — only the
+     * predicate that decides "refresh now" differs. Inside the fresh window
+     * (i.e. before the SWR stale window opens), every read evaluates the
+     * XFetch probability function:
+     *
+     * <pre>{@code
+     * now() − lastWrite + β · loaderRuntimeEstimate · (−ln(rand())) ≥ freshFor
+     * }</pre>
+     *
+     * <p>{@code loaderRuntimeEstimate} is a per-cache exponentially-weighted
+     * moving average of measured loader durations — there is no per-key
+     * estimate, since per-key would duplicate Caffeine's frequency sketch
+     * (see §10 0.5.0 decisions and §2 RA architecture).
+     *
+     * <p><b>Tier rules.</b> Allowed on {@code NEAR_CACHE} and
+     * {@code LOCAL_ONLY} (the same set as SWR; RA is a SWR mode). Rejected
+     * on {@code DISTRIBUTED_ONLY} — no L1 means no fresh-window predicate
+     * to evaluate.
+     *
+     * <p><b>Requires SWR.</b> {@code refresh-ahead.enabled=true} requires
+     * {@code swr.fresh-for} and {@code swr.stale-for} to be configured for
+     * the same cache. The validator rejects RA-without-SWR at boot, rather
+     * than silently treating "RA does nothing" as a runtime mystery.
+     *
+     * <p><b>{@code beta=0} is a misconfiguration.</b> The XFetch predicate
+     * with β=0 degenerates to "now − lastWrite ≥ freshFor" — equivalent to
+     * "the entry is already stale" and fires nothing extra. Operators who
+     * want RA off set {@code refresh-ahead.enabled=false}; β=0 is rejected
+     * by the validator. See {@code # implementation guardrails / ## Refresh-ahead}.
+     *
+     * @param enabled opt-in. Default {@code false}.
+     * @param beta    XFetch aggressiveness multiplier — higher β fires
+     *                refresh earlier in the fresh window. Default
+     *                {@code 1.0} (XFetch's recommended default per Vattani
+     *                et al.). Validator rule: {@code > 0}.
+     */
+    public record RefreshAhead(boolean enabled, double beta) {
+        public RefreshAhead {
+            // No defaulting of beta here: a user-supplied beta=0 must
+            // reach the validator unchanged so the misconfiguration
+            // surfaces at boot. Only the all-defaults factory below
+            // applies the 1.0 default for "enabled with no explicit beta."
+        }
+
+        /** Convenience factory: enabled with default beta=1.0. */
+        public static RefreshAhead enabledWithDefaults() {
+            return new RefreshAhead(true, 1.0);
+        }
+    }
+
+    /**
      * Per-cache reconciliation tuning (0.5.0).
      *
      * <p>Pub/sub is at-most-once. A subscriber that drops an
@@ -513,7 +569,8 @@ public record CacheProperties(
             Duration maxIdle,
             Preloader preloader,
             Reconciliation reconciliation,
-            Swr swr) {
+            Swr swr,
+            RefreshAhead refreshAhead) {
 
         public CacheSpec {
             if (tier == null) tier = Tier.NEAR_CACHE;
@@ -538,6 +595,9 @@ public record CacheProperties(
             // (no LOCAL_ONLY) lives in CacheSpecValidator.
             // swr defaults to null = disabled. Validator enforces
             // 0 < freshFor < staleFor <= ttl and rejects DISTRIBUTED_ONLY.
+            // refreshAhead defaults to null = disabled. Validator enforces
+            // tier ∈ {NEAR_CACHE, LOCAL_ONLY}, beta > 0, and the requires-SWR
+            // dependency at boot rather than letting RA silently never fire.
         }
     }
 

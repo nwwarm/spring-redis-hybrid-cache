@@ -73,6 +73,21 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
     private final MeterRegistry meterRegistry;
     /** Non-null only when {@code spec.swr() != null} — SWR opts in via configuration. */
     private final SwrSidecar swrSidecar;
+    /**
+     * Non-null only when {@code spec.refreshAhead() != null && spec.refreshAhead().enabled()}.
+     * RA requires SWR (the validator enforces this); when this field is
+     * non-null, {@link #swrSidecar} is also non-null.
+     */
+    private final RefreshAheadCoordinator refreshAhead;
+    /**
+     * Per-cache EWMA of measured loader durations. Non-null only when SWR
+     * or RA is configured — the EWMA is owned by RA but updated from the
+     * SWR refresh path too so RA's predicate sees a current estimate even
+     * when only SWR-triggered refreshes have run. Null when neither
+     * feature is configured (loader timing is otherwise observed by the
+     * existing latency timer).
+     */
+    private final LoaderRuntimeEwma loaderEwma;
 
     // Generation counter for O(1) clear
     private final RAtomicLong distributedGeneration;
@@ -134,6 +149,31 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
                      MeterRegistry meterRegistry,
                      KeyLogFormatter keyLogFormatter,
                      SwrSidecar swrSidecar) {
+        this(caffeineCache, spec, bucketCodec, redisson, breaker, dispatcher,
+                meterRegistry, keyLogFormatter, swrSidecar, null, null);
+    }
+
+    /**
+     * Full constructor with SWR + RA support (0.5.0). The {@code refreshAhead}
+     * coordinator is non-null only when
+     * {@code spec.refreshAhead().enabled()}, and in that case {@code swrSidecar}
+     * MUST also be non-null (validator E38 enforces RA-requires-SWR at
+     * boot). The {@code loaderEwma} parameter is the per-cache estimator
+     * shared between SWR and RA refresh paths — both increment it on
+     * loader completion so RA's predicate sees a current estimate even
+     * when only SWR has fired so far.
+     */
+    public NearCache(Cache caffeineCache,
+                     CacheProperties.CacheSpec spec,
+                     Codec bucketCodec,
+                     RedissonClient redisson,
+                     CircuitBreaker breaker,
+                     InvalidationDispatcher dispatcher,
+                     MeterRegistry meterRegistry,
+                     KeyLogFormatter keyLogFormatter,
+                     SwrSidecar swrSidecar,
+                     RefreshAheadCoordinator refreshAhead,
+                     LoaderRuntimeEwma loaderEwma) {
         this.caffeineCache = caffeineCache;
         this.cacheName = caffeineCache.getName();
         this.spec = spec;
@@ -146,6 +186,8 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
         this.loaderGate = new LoaderGate(cacheName,
                 spec.maxConcurrentLoaders(), spec.loaderAcquireTimeout(), meterRegistry);
         this.swrSidecar = swrSidecar;
+        this.refreshAhead = refreshAhead;
+        this.loaderEwma = loaderEwma;
 
         this.distributedGeneration = redisson.getAtomicLong(CacheKeys.generationKey(cacheName));
         initializeGeneration();
@@ -324,31 +366,51 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
     }
 
     /**
-     * SWR helper: classifies the L1-hit wrapper against the dual deadlines
-     * and dispatches a refresh on stale. Loader-aware — only the
+     * SWR / RA helper: classifies the L1-hit wrapper against the dual
+     * deadlines and dispatches a refresh on stale (SWR) or speculatively
+     * inside the fresh window (RA). Loader-aware — only the
      * {@code get(key, valueLoader)} path uses this; plain {@code get(key)}
      * has no loader to call.
      *
-     * <p>The refresh task body wraps the loader through the same
-     * {@link LoaderGate} the synchronous path uses (guardrail #5) and
-     * writes the result via {@link #put(Object, Object)} so L2 and the
-     * cross-node invalidation publish (guardrail #6) both happen — a
-     * direct Caffeine write would update only this node's L1 and leave
-     * peers serving stale until their own {@code stale-until}.
+     * <p>The refresh task body is shared between SWR and RA (per
+     * § 10 0.5.0: "RA = SWR with a probabilistic trigger"): same loader
+     * gate, same write path through {@link #put(Object, Object)}, same
+     * EWMA timing recording. Whichever feature fires first inserts into
+     * the in-flight map; the other sees the slot and increments its
+     * respective de-dup counter without burning an executor slot.
      */
     private <T> void maybeFireSwrRefresh(String stringKey, Callable<T> valueLoader) {
         if (swrSidecar == null) return;
-        if (swrSidecar.classify(stringKey) != SwrSidecar.Classification.STALE) return;
+        SwrSidecar.Classification classification = swrSidecar.classify(stringKey);
         Callable<Object> refreshTask = () -> {
             // loaderGate.run guarantees the per-cache concurrency cap is
             // respected for refresh-driven loads — guardrail item 5. Going
             // through put() (rather than caffeineCache.put directly)
             // ensures L2 + invalidation propagate to peers (guardrail #6).
-            Object value = loaderGate.run(stringKey, valueLoader);
-            put(stringKey, value);
-            return value;
+            // Time the loader so the per-cache EWMA tracks load behavior
+            // for RA's XFetch predicate.
+            long start = System.nanoTime();
+            try {
+                Object value = loaderGate.run(stringKey, valueLoader);
+                put(stringKey, value);
+                return value;
+            } finally {
+                if (loaderEwma != null) {
+                    loaderEwma.record(System.nanoTime() - start);
+                }
+            }
         };
-        swrSidecar.maybeDispatchRefresh(stringKey, refreshTask);
+        if (classification == SwrSidecar.Classification.STALE) {
+            swrSidecar.maybeDispatchRefresh(stringKey, refreshTask);
+            return;
+        }
+        // FRESH classification: RA may still fire the loader speculatively
+        // via XFetch. RA is enabled only when the coordinator is non-null
+        // (validator-checked: RA requires SWR, hence both fields are
+        // populated together).
+        if (refreshAhead != null) {
+            refreshAhead.evaluateAndMaybeDispatch(stringKey, refreshTask);
+        }
     }
 
     /**
@@ -385,8 +447,12 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
             log.debug("Distributed lock acquisition failed for key '{}'; proceeding with local single-flight only", keyLogFormatter.format(key), e);
         }
 
+        long loaderStart = System.nanoTime();
         try {
             Object value = loaderGate.run(key, valueLoader);
+            if (loaderEwma != null) {
+                loaderEwma.record(System.nanoTime() - loaderStart);
+            }
             writeToL2(key, value);
             // Cold-load completion: do NOT publish.
             //
@@ -874,5 +940,19 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
      */
     public SwrSidecar swrSidecar() {
         return swrSidecar;
+    }
+
+    /**
+     * Test seam: returns the refresh-ahead coordinator when configured,
+     * {@code null} otherwise. Tests use this to assert XFetch firing and
+     * the de-dup interaction with SWR.
+     */
+    public RefreshAheadCoordinator refreshAhead() {
+        return refreshAhead;
+    }
+
+    /** Test seam: per-cache loader-runtime EWMA, or {@code null} when SWR/RA is not configured. */
+    public LoaderRuntimeEwma loaderEwma() {
+        return loaderEwma;
     }
 }

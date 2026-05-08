@@ -143,10 +143,13 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
                                 null,
                                 meterRegistry)
                         : null;
+                LoaderRuntimeEwma localEwma = (spec.swr() != null) ? new LoaderRuntimeEwma() : null;
+                RefreshAheadCoordinator localRa = buildRefreshAheadCoordinator(
+                        name, spec, localSidecar, null, localEwma);
                 yield new LocalOnlyCache(
                         buildCaffeineCache(name, spec, localSidecar),
                         spec.maxConcurrentLoaders(), spec.loaderAcquireTimeout(),
-                        meterRegistry, localSidecar);
+                        meterRegistry, localSidecar, localRa, localEwma);
             }
             case DISTRIBUTED_ONLY -> {
                 CircuitBreaker breaker = breakerFactory.resolve(name, spec.circuitBreaker());
@@ -173,10 +176,13 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
                                 breaker,
                                 meterRegistry)
                         : null;
+                LoaderRuntimeEwma nearEwma = (spec.swr() != null) ? new LoaderRuntimeEwma() : null;
+                RefreshAheadCoordinator nearRa = buildRefreshAheadCoordinator(
+                        name, spec, swrSidecar, breaker, nearEwma);
                 NearCache near = new NearCache(
                         buildCaffeineCache(name, spec, swrSidecar),
                         spec, bucketCodec, redisson, breaker, dispatcher,
-                        meterRegistry, keyLogFormatter, swrSidecar);
+                        meterRegistry, keyLogFormatter, swrSidecar, nearRa, nearEwma);
                 nearCaches.add(near);
                 // Preloader registration runs *after* the cache is fully
                 // built and the dispatcher has registered the listener
@@ -204,6 +210,47 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
 
     private CaffeineCache buildCaffeineCache(String name, CacheProperties.CacheSpec spec) {
         return buildCaffeineCache(name, spec, null);
+    }
+
+    /**
+     * Builds the {@link RefreshAheadCoordinator} for a cache, returning
+     * {@code null} when RA is not enabled. RA requires SWR (validator E38)
+     * — the {@code sidecar} parameter MUST be non-null when
+     * {@code spec.refreshAhead().enabled()}, otherwise the call is a
+     * programmer error caught by the assertion below.
+     *
+     * <p>Centralized helper so both the LOCAL_ONLY and NEAR_CACHE branches
+     * share the wiring rather than duplicating the construction logic
+     * (and its {@code spec.refreshAhead() != null && enabled()} guard).
+     */
+    private RefreshAheadCoordinator buildRefreshAheadCoordinator(
+            String name,
+            CacheProperties.CacheSpec spec,
+            SwrSidecar sidecar,
+            CircuitBreaker breaker,
+            LoaderRuntimeEwma ewma) {
+        if (spec.refreshAhead() == null || !spec.refreshAhead().enabled()) {
+            return null;
+        }
+        // Validator E38: RA requires SWR. If we got here with a null
+        // sidecar, configuration validation was skipped — fail loud
+        // rather than silently constructing an unusable coordinator.
+        if (sidecar == null) {
+            throw new IllegalStateException(
+                    "Cache '" + name + "': refresh-ahead.enabled=true but"
+                            + " no SWR sidecar was constructed (swr.* missing)."
+                            + " The validator should have caught this — check that"
+                            + " CacheSpecValidator.validate(...) ran before bean wiring.");
+        }
+        return new RefreshAheadCoordinator(
+                name,
+                spec.swr().freshFor().toNanos(),
+                spec.refreshAhead().beta(),
+                sidecar,
+                refreshExecutor,
+                breaker,
+                ewma,
+                meterRegistry);
     }
 
     /**

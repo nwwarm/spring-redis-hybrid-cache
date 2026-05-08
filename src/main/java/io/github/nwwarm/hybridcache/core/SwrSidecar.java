@@ -247,6 +247,32 @@ public final class SwrSidecar {
         deadlines.remove(key);
     }
 
+    /**
+     * Returns the per-key fresh-until deadline in nanos, or {@code 0} if no
+     * deadline is tracked. Used by {@link RefreshAheadCoordinator} on the
+     * read path to compute {@code timeSinceWrite} for the XFetch predicate
+     * — RA reuses the SWR sidecar's deadline rather than maintaining a
+     * parallel one. Package-private: this is a cooperating-class seam, not
+     * a public extension point.
+     */
+    long deadlineNanos(String key) {
+        Long d = deadlines.get(key);
+        return d == null ? 0L : d;
+    }
+
+    /**
+     * Returns the shared per-key in-flight map. Both SWR's stale-refresh
+     * dispatch and {@link RefreshAheadCoordinator}'s probabilistic dispatch
+     * collapse onto this map so a single key never has two refreshes in
+     * flight at once (§ 10 0.5.0 / guardrail item 4). Package-private to
+     * keep the coupling to {@code RefreshAheadCoordinator} explicit and
+     * scoped — external code has no business holding a reference to the
+     * shared in-flight map.
+     */
+    ConcurrentMap<String, CompletableFuture<Object>> inflightMap() {
+        return inflight;
+    }
+
     /** Test seam: number of tracked fresh-until deadlines. */
     public int sidecarSize() {
         return deadlines.size();

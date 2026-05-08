@@ -150,7 +150,7 @@ class SentinelCacheIT {
                 CacheProperties.Tier.NEAR_CACHE,
                 Duration.ofMinutes(10), 10_000,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
-                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null, null, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null, null, null, null);
         var caffeineNative = Caffeine.newBuilder()
                 .expireAfterWrite(Duration.ofMinutes(10))
                 .maximumSize(spec.maximumSize())

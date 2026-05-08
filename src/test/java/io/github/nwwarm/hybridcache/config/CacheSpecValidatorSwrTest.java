@@ -148,7 +148,7 @@ class CacheSpecValidatorSwrTest {
                 tier, ttl, 10_000,
                 Duration.ofSeconds(5), Duration.ofSeconds(30),
                 CacheProperties.Codec.JSON,
-                null, null, null, 0.0, null, null, null, swr);
+                null, null, null, 0.0, null, null, null, swr, null);
     }
 
     private static CacheProperties propsWithCache(
@@ -168,6 +168,6 @@ class CacheSpecValidatorSwrTest {
         return new CacheProperties.CacheSpec(
                 CacheProperties.Tier.NEAR_CACHE, Duration.ofHours(1), 10_000,
                 Duration.ofSeconds(5), Duration.ofSeconds(30),
-                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null, null, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null, null, null, null);
     }
 }

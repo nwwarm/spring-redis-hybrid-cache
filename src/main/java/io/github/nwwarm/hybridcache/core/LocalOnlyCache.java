@@ -22,6 +22,13 @@ public class LocalOnlyCache implements HybridCache {
     private final LoaderGate loaderGate;
     /** Non-null only when {@code spec.swr() != null}. */
     private final SwrSidecar swrSidecar;
+    /**
+     * Non-null only when {@code spec.refreshAhead().enabled()}. When
+     * non-null, {@link #swrSidecar} is also non-null (validator E38).
+     */
+    private final RefreshAheadCoordinator refreshAhead;
+    /** Per-cache EWMA shared between SWR and RA refresh paths. Null when neither feature is configured. */
+    private final LoaderRuntimeEwma loaderEwma;
 
     public LocalOnlyCache(Cache delegate, MeterRegistry meterRegistry) {
         this(delegate, null, null, meterRegistry, null);
@@ -47,10 +54,31 @@ public class LocalOnlyCache implements HybridCache {
                           java.time.Duration loaderAcquireTimeout,
                           MeterRegistry meterRegistry,
                           SwrSidecar swrSidecar) {
+        this(delegate, maxConcurrentLoaders, loaderAcquireTimeout, meterRegistry,
+                swrSidecar, null, null);
+    }
+
+    /**
+     * Full constructor with SWR + RA support (0.5.0). RA is enabled when
+     * {@code refreshAhead != null}; in that case {@code swrSidecar} MUST
+     * also be non-null (validator E38: RA requires SWR). The shared
+     * {@code loaderEwma} estimator is updated on every loader completion
+     * (sync path and SWR/RA refresh paths) so RA's predicate sees a
+     * current estimate regardless of which trigger has fired so far.
+     */
+    public LocalOnlyCache(Cache delegate,
+                          Integer maxConcurrentLoaders,
+                          java.time.Duration loaderAcquireTimeout,
+                          MeterRegistry meterRegistry,
+                          SwrSidecar swrSidecar,
+                          RefreshAheadCoordinator refreshAhead,
+                          LoaderRuntimeEwma loaderEwma) {
         this.delegate = delegate;
         this.loaderGate = new LoaderGate(delegate.getName(),
                 maxConcurrentLoaders, loaderAcquireTimeout, meterRegistry);
         this.swrSidecar = swrSidecar;
+        this.refreshAhead = refreshAhead;
+        this.loaderEwma = loaderEwma;
         Object native_ = delegate.getNativeCache();
         if (native_ instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineNative) {
             CaffeineCacheMetrics.monitor(meterRegistry, caffeineNative, delegate.getName());
@@ -84,15 +112,18 @@ public class LocalOnlyCache implements HybridCache {
 
     @Override
     public <T> T get(@Nonnull Object key, @Nonnull Callable<T> valueLoader) {
-        // SWR fast path: an L1 hit can either be fresh (return synchronously,
-        // no extra work) or stale (return synchronously AND dispatch async
-        // refresh). The wrapper inspection happens before delegate.get(...,
-        // valueLoader) so the loader does not run on the synchronous path.
+        // SWR/RA fast path: an L1 hit can be fresh (synchronous return; RA
+        // may speculatively refresh) or stale (synchronous return AND SWR
+        // dispatches async refresh). The wrapper inspection happens before
+        // delegate.get(..., valueLoader) so the loader does not run on the
+        // synchronous path.
         if (swrSidecar != null) {
             ValueWrapper wrapper = delegate.get(key);
             if (wrapper != null) {
-                if (swrSidecar.classify(stringKey(key)) == SwrSidecar.Classification.STALE) {
-                    swrSidecar.maybeDispatchRefresh(stringKey(key), () -> {
+                String sk = stringKey(key);
+                Callable<Object> refreshTask = () -> {
+                    long start = System.nanoTime();
+                    try {
                         // Loader through the same gate the sync path uses
                         // (guardrail item 5). Refresh writes back via
                         // put() so the SWR sidecar deadline is updated and
@@ -100,7 +131,21 @@ public class LocalOnlyCache implements HybridCache {
                         Object value = loaderGate.run(key, valueLoader);
                         put(key, value);
                         return value;
-                    });
+                    } finally {
+                        if (loaderEwma != null) {
+                            loaderEwma.record(System.nanoTime() - start);
+                        }
+                    }
+                };
+                SwrSidecar.Classification classification = swrSidecar.classify(sk);
+                if (classification == SwrSidecar.Classification.STALE) {
+                    swrSidecar.maybeDispatchRefresh(sk, refreshTask);
+                } else if (refreshAhead != null) {
+                    // FRESH classification + RA enabled: XFetch may fire a
+                    // speculative refresh. The shared in-flight map ensures
+                    // a single key never has both SWR and RA refreshes in
+                    // flight at once.
+                    refreshAhead.evaluateAndMaybeDispatch(sk, refreshTask);
                 }
                 @SuppressWarnings("unchecked")
                 T cast = (T) wrapper.get();
@@ -118,20 +163,37 @@ public class LocalOnlyCache implements HybridCache {
         // "loader rejected" from "loader ran and failed."
         try {
             return delegate.get(key, () -> {
-                Object loaded = loaderGate.run(key, valueLoader);
-                // Sidecar pre-write before Caffeine's compute populates
-                // the entry (guardrail item 2). For LOCAL_ONLY, no L2 /
-                // peers — the loader-completion path writes the deadline
-                // and Caffeine writes the value atomically.
-                if (swrSidecar != null) swrSidecar.recordWrite(stringKey(key));
-                @SuppressWarnings("unchecked")
-                T typed = (T) loaded;
-                return typed;
+                long start = System.nanoTime();
+                try {
+                    Object loaded = loaderGate.run(key, valueLoader);
+                    // Sidecar pre-write before Caffeine's compute populates
+                    // the entry (guardrail item 2). For LOCAL_ONLY, no L2 /
+                    // peers — the loader-completion path writes the deadline
+                    // and Caffeine writes the value atomically.
+                    if (swrSidecar != null) swrSidecar.recordWrite(stringKey(key));
+                    @SuppressWarnings("unchecked")
+                    T typed = (T) loaded;
+                    return typed;
+                } finally {
+                    if (loaderEwma != null) {
+                        loaderEwma.record(System.nanoTime() - start);
+                    }
+                }
             });
         } catch (Cache.ValueRetrievalException e) {
             if (e.getCause() instanceof LoaderRejectedException lr) throw lr;
             throw e;
         }
+    }
+
+    /** Test seam: returns the RA coordinator when configured. */
+    public RefreshAheadCoordinator refreshAhead() {
+        return refreshAhead;
+    }
+
+    /** Test seam: returns the per-cache loader-runtime EWMA. */
+    public LoaderRuntimeEwma loaderEwma() {
+        return loaderEwma;
     }
 
     @Override

@@ -152,7 +152,7 @@ public abstract class RedisTestBase {
         CacheProperties.CacheSpec spec = new CacheProperties.CacheSpec(
                 CacheProperties.Tier.NEAR_CACHE,
                 ttl, 10_000, lockWait, lockLease, codec, null, null, null, 0.0, null, null,
-                reconciliation, null);
+                reconciliation, null, null);
 
         com.github.benmanes.caffeine.cache.Cache<Object, Object> caffeineNative = Caffeine.newBuilder()
                 .expireAfterWrite(ttl)
@@ -212,7 +212,8 @@ public abstract class RedisTestBase {
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
                 CacheProperties.Codec.JSON, null, null, null, 0.0, null, null,
                 reconciliation,
-                new CacheProperties.Swr(freshFor, staleFor));
+                new CacheProperties.Swr(freshFor, staleFor),
+                null);
 
         io.github.nwwarm.hybridcache.core.SwrSidecar sidecar =
                 new io.github.nwwarm.hybridcache.core.SwrSidecar(name,
@@ -241,6 +242,85 @@ public abstract class RedisTestBase {
                 new KeyLogFormatter(false, "test"), sidecar);
     }
 
+    /**
+     * SWR + RA-enabled near cache for integration tests. Builds the same
+     * wiring as {@link #newSwrNearCache(String, RedissonClient, CircuitBreaker, String, MeterRegistry, io.github.nwwarm.hybridcache.core.RefreshExecutor, Duration, Duration, Duration, CacheProperties.Reconciliation)}
+     * plus a {@link io.github.nwwarm.hybridcache.core.RefreshAheadCoordinator}
+     * and a {@link io.github.nwwarm.hybridcache.core.LoaderRuntimeEwma}
+     * shared between the SWR refresh path and RA. Mirrors
+     * {@code HybridCacheManager} so the RA IT suite isn't testing a parallel
+     * implementation.
+     *
+     * @param beta XFetch β; β > 0 (validator E39 enforces this in production).
+     */
+    protected NearCache newRaNearCache(String name,
+                                        RedissonClient redisson,
+                                        CircuitBreaker breaker,
+                                        String nodeId,
+                                        MeterRegistry meterRegistry,
+                                        io.github.nwwarm.hybridcache.core.RefreshExecutor refreshExecutor,
+                                        Duration ttl,
+                                        Duration freshFor,
+                                        Duration staleFor,
+                                        double beta) {
+        return newRaNearCache(name, redisson, breaker, nodeId, meterRegistry,
+                refreshExecutor, ttl, freshFor, staleFor, beta, null);
+    }
+
+    /**
+     * Same as the simpler RA fixture but with a caller-supplied
+     * {@link java.util.random.RandomGenerator} so tests can fix the XFetch
+     * sample seed for deterministic predicate firing.
+     */
+    protected NearCache newRaNearCache(String name,
+                                        RedissonClient redisson,
+                                        CircuitBreaker breaker,
+                                        String nodeId,
+                                        MeterRegistry meterRegistry,
+                                        io.github.nwwarm.hybridcache.core.RefreshExecutor refreshExecutor,
+                                        Duration ttl,
+                                        Duration freshFor,
+                                        Duration staleFor,
+                                        double beta,
+                                        java.util.random.RandomGenerator rng) {
+        CacheProperties.CacheSpec spec = new CacheProperties.CacheSpec(
+                CacheProperties.Tier.NEAR_CACHE,
+                ttl, 10_000,
+                Duration.ofSeconds(2), Duration.ofSeconds(10),
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null,
+                null,
+                new CacheProperties.Swr(freshFor, staleFor),
+                new CacheProperties.RefreshAhead(true, beta));
+
+        io.github.nwwarm.hybridcache.core.SwrSidecar sidecar =
+                new io.github.nwwarm.hybridcache.core.SwrSidecar(name,
+                        freshFor.toNanos(), refreshExecutor, breaker, meterRegistry);
+        io.github.nwwarm.hybridcache.core.LoaderRuntimeEwma ewma =
+                new io.github.nwwarm.hybridcache.core.LoaderRuntimeEwma();
+        io.github.nwwarm.hybridcache.core.RefreshAheadCoordinator ra =
+                new io.github.nwwarm.hybridcache.core.RefreshAheadCoordinator(name,
+                        freshFor.toNanos(), beta, sidecar, refreshExecutor,
+                        breaker, ewma, meterRegistry, rng);
+
+        com.github.benmanes.caffeine.cache.Cache<Object, Object> caffeineNative = Caffeine.newBuilder()
+                .expireAfterWrite(staleFor)
+                .maximumSize(spec.maximumSize())
+                .recordStats()
+                .executor(Runnable::run)
+                .removalListener((k, v, cause) -> {
+                    if (k != null
+                            && cause != com.github.benmanes.caffeine.cache.RemovalCause.REPLACED) {
+                        sidecar.onRemoval(k.toString());
+                    }
+                })
+                .build();
+        CaffeineCache springCache = new CaffeineCache(name, caffeineNative, true);
+        InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, nodeId, meterRegistry);
+        return new NearCache(springCache, spec, resolveTestCodec(spec.codec()), redisson,
+                breaker, dispatcher, meterRegistry,
+                new KeyLogFormatter(false, "test"), sidecar, ra, ewma);
+    }
+
     protected DistributedOnlyCache newDistributedCache(String name,
                                                        RedissonClient redisson,
                                                        CircuitBreaker breaker) {
@@ -255,7 +335,7 @@ public abstract class RedisTestBase {
                 CacheProperties.Tier.DISTRIBUTED_ONLY,
                 Duration.ofMinutes(10), 10_000,
                 Duration.ofSeconds(2), Duration.ofSeconds(10),
-                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null, null, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null, null, null, null);
         MeterRegistry meterRegistry = new SimpleMeterRegistry();
         InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, nodeId, meterRegistry);
         return new DistributedOnlyCache(name, spec, resolveTestCodec(spec.codec()),

@@ -778,7 +778,7 @@ class CacheSpecValidatorTest {
         return new CacheProperties.CacheSpec(
                 CacheProperties.Tier.NEAR_CACHE, Duration.ofHours(1), 10_000,
                 Duration.ofSeconds(5), Duration.ofSeconds(30),
-                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null, null, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null, null, null, null);
     }
 
     private static CacheProperties.CacheSpec spec(
@@ -786,7 +786,7 @@ class CacheSpecValidatorTest {
             Duration lockWait, Duration lockLease,
             CacheProperties.Codec codec, CacheProperties.CircuitBreaker cb) {
         return new CacheProperties.CacheSpec(
-                tier, ttl, 10_000, lockWait, lockLease, codec, cb, null, null, 0.0, null, null, null, null);
+                tier, ttl, 10_000, lockWait, lockLease, codec, cb, null, null, 0.0, null, null, null, null, null);
     }
 
     private static CacheProperties.CacheSpec specWithJitter(
@@ -794,7 +794,7 @@ class CacheSpecValidatorTest {
         return new CacheProperties.CacheSpec(
                 tier, Duration.ofHours(1), 10_000,
                 Duration.ofSeconds(5), Duration.ofSeconds(30),
-                CacheProperties.Codec.JSON, null, null, null, ratio, null, null, null, null);
+                CacheProperties.Codec.JSON, null, null, null, ratio, null, null, null, null, null);
     }
 
     private static CacheProperties.CacheSpec specWithMaxIdle(
@@ -802,7 +802,7 @@ class CacheSpecValidatorTest {
         return new CacheProperties.CacheSpec(
                 tier, ttl, 10_000,
                 Duration.ofSeconds(5), Duration.ofSeconds(30),
-                CacheProperties.Codec.JSON, null, null, null, 0.0, maxIdle, null, null, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, maxIdle, null, null, null, null);
     }
 
     static CacheProperties.CacheSpec specWithPreloader(
@@ -810,7 +810,7 @@ class CacheSpecValidatorTest {
         return new CacheProperties.CacheSpec(
                 tier, Duration.ofHours(1), 10_000,
                 Duration.ofSeconds(5), Duration.ofSeconds(30),
-                CacheProperties.Codec.JSON, null, null, null, 0.0, null, preloader, null, null);
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null, preloader, null, null, null);
     }
 
     private static CacheProperties.CacheSpec specWithCb(CacheProperties.CircuitBreaker cb) {

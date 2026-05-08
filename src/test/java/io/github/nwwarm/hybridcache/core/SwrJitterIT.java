@@ -141,7 +141,8 @@ class SwrJitterIT extends RedisTestBase {
                 null,
                 null,
                 null,
-                new CacheProperties.Swr(freshFor, staleFor));
+                new CacheProperties.Swr(freshFor, staleFor),
+                null);
 
         com.github.benmanes.caffeine.cache.Cache<Object, Object> caffeineNative = Caffeine.newBuilder()
                 // SWR mode: stale-for is the L1 expireAfterWrite; jitter is
