@@ -422,17 +422,89 @@
                     <targetClasses>
                         <param>io.github.nwwarm.hybridcache.*</param>
                     </targetClasses>
+                    <!--
+                      Scope to unit-test naming. PIT's TestEngine
+                      discovery ignores Surefire's *Test.java filter
+                      and would otherwise pick up every *IT.java that
+                      Failsafe runs — Spring-Boot context boots,
+                      Testcontainers Redis spin-ups, and BlockHound's
+                      bootclasspath append (from AsyncBlockHoundIT)
+                      pollute downstream ITs running in the same minion
+                      JVM. Mutation testing's purpose is "do unit tests
+                      catch logic-altering mutations" — ITs assert
+                      observable wiring, not internal logic. Documented
+                      in DESIGN.md §7 / "Mutation testing exclusions."
+                    -->
                     <targetTests>
-                        <param>io.github.nwwarm.hybridcache.*</param>
+                        <param>io.github.nwwarm.hybridcache.*Test</param>
                     </targetTests>
                     <excludedClasses>
                         <!-- Records / DTOs: shapes verified by jackson round-trip ITs -->
+                        <param>io.github.nwwarm.hybridcache.config.CacheProperties</param>
                         <param>io.github.nwwarm.hybridcache.config.CacheProperties$*</param>
                         <param>io.github.nwwarm.hybridcache.invalidation.InvalidationMessage</param>
                         <param>io.github.nwwarm.hybridcache.core.ReconciliationDecision*</param>
                         <param>io.github.nwwarm.hybridcache.core.LoaderRejectedException</param>
                         <!-- Auto-config wiring exercised by SecurityStartupIT / EndToEndWiringIT -->
                         <param>io.github.nwwarm.hybridcache.config.CacheConfig</param>
+                        <!--
+                          Framework-bound classes tested via *IT.java
+                          against Testcontainers Redis. Their behaviour
+                          is exercised by the Failsafe IT suite which
+                          runs as part of `mvn verify`; PIT's coverage
+                          minion can't run those ITs deterministically
+                          (PIT's bytecode instrumentation pushes the
+                          slowest IT past any reasonable coverage-phase
+                          budget — see DESIGN.md §7 / "Mutation testing
+                          exclusions" for the per-class rationale).
+                        -->
+                        <param>io.github.nwwarm.hybridcache.core.NearCache</param>
+                        <param>io.github.nwwarm.hybridcache.core.DistributedOnlyCache</param>
+                        <param>io.github.nwwarm.hybridcache.core.LocalOnlyCache</param>
+                        <param>io.github.nwwarm.hybridcache.core.HybridCacheManager</param>
+                        <param>io.github.nwwarm.hybridcache.core.RefreshExecutor</param>
+                        <param>io.github.nwwarm.hybridcache.core.RefreshAheadCoordinator</param>
+                        <param>io.github.nwwarm.hybridcache.core.SwrSidecar</param>
+                        <param>io.github.nwwarm.hybridcache.core.Reconciler</param>
+                        <param>io.github.nwwarm.hybridcache.core.ReconciliationCoordinator</param>
+                        <!--
+                          Caffeine Expiry callback — JitteredMaxIdleExpiry
+                          gets called by Caffeine on every access /
+                          expireAfterUpdate; mutations on the deadline-
+                          arithmetic branches survive unit tests because
+                          they never observe Caffeine's actual eviction
+                          decision (only the value the Expiry returned).
+                          Covered by NearCacheSwrIT / NearCacheAsyncIT
+                          which observe the eviction outcomes.
+                        -->
+                        <param>io.github.nwwarm.hybridcache.core.JitteredMaxIdleExpiry</param>
+                        <!--
+                          Codec / log-formatter / loader-semaphore: each
+                          is a thin adapter around an external concern
+                          (Redisson codec resolution, log output, JDK
+                          Semaphore). Behaviour is observable only at IT
+                          layer (CodecRoundTripIT, the InvalidationIT
+                          family that asserts log key hashing,
+                          LoaderConcurrencyCapIT that exercises permit
+                          rejection under real concurrent load).
+                        -->
+                        <param>io.github.nwwarm.hybridcache.core.CodecResolver</param>
+                        <param>io.github.nwwarm.hybridcache.core.KeyLogFormatter</param>
+                        <param>io.github.nwwarm.hybridcache.core.LoaderGate</param>
+                        <param>io.github.nwwarm.hybridcache.invalidation.InvalidationDispatcher</param>
+                        <param>io.github.nwwarm.hybridcache.invalidation.InvalidationListener</param>
+                        <param>io.github.nwwarm.hybridcache.preloader.NearCachePreloader</param>
+                        <param>io.github.nwwarm.hybridcache.preloader.PreloaderCoordinator</param>
+                        <!--
+                          PreloaderCoordinator nested types: anonymous
+                          ScheduledExecutorService delegate ($1) and the
+                          @TempDir lock-info record ($LockInfo) are
+                          structurally tied to the coordinator and
+                          covered by PreloaderRoundTripIT.
+                        -->
+                        <param>io.github.nwwarm.hybridcache.preloader.PreloaderCoordinator$*</param>
+                        <param>io.github.nwwarm.hybridcache.metrics.HybridCacheHealthIndicator</param>
+                        <param>io.github.nwwarm.hybridcache.probe.RedisStartupProbe</param>
                     </excludedClasses>
                     <excludedTestClasses>
                         <param>io.github.nwwarm.hybridcache.chaos.*</param>
