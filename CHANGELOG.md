@@ -1,5 +1,147 @@
 # Changelog
 
+## 0.5.0 (in progress)
+
+The production-readiness milestone. Closes the missed-invalidation
+gap, adds the read-path features hot caches need, brings reactive
+applications onto the same primitives the sync path uses. All four
+features off by default; sync `@Cacheable` behavior is byte-identical
+when no opt-in YAML is set; no 0.4.x configuration breaks.
+
+### Migrating from 0.4.x
+
+**No breaking changes.** Every 0.5.0 feature is opt-in. The required
+work to upgrade from 0.4.x is to bump the version and that's it.
+
+The optional work, depending on which features you adopt:
+
+#### Reconciliation (per-cache opt-in)
+
+```yaml
+cache:
+  caches:
+    products:
+      reconciliation:
+        enabled: true        # default false
+        interval: 60s        # default 60s
+        miss-tolerance: 5    # default 5
+```
+
+Effect: every successful `RTopic.publish(...)` is preceded by one
+`INCR` on a per-cache `RAtomicLong`; the new value rides on the
+`InvalidationMessage`. A periodic cycle reads the canonical seq and
+recovers locally on detected miss. New metrics:
+`cache.reconciliation.cycles{cache}`,
+`cache.reconciliation.misses{cache}`,
+`cache.reconciliation.skipped{cache, reason}`,
+`cache.reconciliation.seq.regressions{cache}`.
+
+Cost: `+1 op, +~16 bytes payload, +0 round-trips` per published
+invalidation. One extra `GET` per cache per cycle (default 60s).
+Rejected at startup on `tier=LOCAL_ONLY` (no cross-node coherence
+problem to reconcile against).
+
+#### Stale-while-revalidate (per-cache opt-in)
+
+```yaml
+cache:
+  caches:
+    products:
+      ttl: 1h
+      swr:
+        fresh-for: 5m       # required when swr block is present
+        stale-for: 30m      # required; <= ttl
+```
+
+Effect: reads inside `[write, fresh-until)` return synchronously;
+reads inside `[fresh-until, stale-until)` return the stale value
+synchronously *and* dispatch an async refresh on a shared executor.
+Reads past `stale-until` see physical eviction.
+
+New metrics: `cache.swr.refreshes{cache, result=success|failure}`,
+`cache.swr.refresh.failures{cache}`,
+`cache.swr.refreshes.skipped{cache, reason=in_flight}`. Rejected at
+startup on `tier=DISTRIBUTED_ONLY`.
+
+#### Refresh-ahead (per-cache opt-in; requires SWR)
+
+```yaml
+cache:
+  caches:
+    products:
+      swr:
+        fresh-for: 5m
+        stale-for: 30m
+      refresh-ahead:
+        enabled: true       # default false
+        beta: 1.0           # default 1.0; XFetch β
+```
+
+Effect: every read inside `[write, fresh-until)` evaluates the
+XFetch predicate; if it fires, dispatches an async refresh through
+the same executor SWR uses. Hotter keys access more often, so they
+roll the dice more times. RA without SWR is rejected at startup.
+
+New metrics: `cache.refresh.ahead.fires{cache}`,
+`cache.refresh.ahead.failures{cache}`.
+
+#### Async / reactive loader support (no YAML)
+
+Spring 6.1's `Cache.retrieve(...)` is now overridden on every tier
+(`LocalOnlyCache`, `DistributedOnlyCache`, `NearCache`). The cache
+emits `CompletableFuture<ValueWrapper>`; Spring's `CacheInterceptor`
+adapts to/from `Mono`/`Flux` via `ReactiveAdapterRegistry`
+upstream. **No code change required** in your application — Spring
+uses `retrieve(...)` automatically when your `@Cacheable`-annotated
+method has a reactive return type.
+
+The cache layer holds zero Reactor dependencies (banned via the
+`maven-enforcer-plugin` rule landed in 0.5.0). `Mono`/`Flux` interop
+happens entirely upstream of the cache.
+
+`Flux<T>` results are materialized to `List<T>` before storage —
+this is Spring's adaptation, not a library decision. Per-cache
+value-size design constraint (~100 KB) applies to the materialized
+list. Large `Flux` results push past the constraint and likely
+shouldn't be cached as the materialized form at all.
+
+#### Refresh-executor knob (rare)
+
+```yaml
+cache:
+  refresh:
+    scheduler-pool-size: 4   # default 4; shared by SWR / RA / async
+```
+
+Effect: shared `FixedThreadPool` for SWR refreshes, RA refreshes,
+and async-loader hops off the Netty event loop. Sustained non-zero
+`cache.refresh.queue.size` is the signal to tune up.
+
+### Added
+
+- Per-cache reconciliation. YAML: `cache.caches.<name>.reconciliation.{enabled, interval, miss-tolerance}`. Closes the missed-invalidation gap; recovery is local-only (no cross-cluster cascade). Documented in DESIGN.md §3 / Reconciliation and §10 0.5.0 entries.
+- Stale-while-revalidate. YAML: `cache.caches.<name>.swr.{fresh-for, stale-for}`. L1 entries gain a fresh-until deadline alongside Caffeine's stale-until.
+- Refresh-ahead as a mode of SWR. YAML: `cache.caches.<name>.refresh-ahead.{enabled, beta}`. XFetch (Vattani et al.) probability function, β tunes aggressiveness.
+- Async / reactive loader support. `Cache.retrieve(...)` overrides on every tier; no Reactor dependency in the cache layer.
+- Top-level refresh-executor knob `cache.refresh.scheduler-pool-size` (default 4).
+- New metrics for every feature above; full list in DESIGN.md §6.
+- `cache-benchmarks/` sibling Maven module with JMH microbenchmarks for L1/L2 hit, single-flight collapse, SWR, RA, async, and reconciliation.
+- `soak/` sibling module with a WebFlux smoke app and 24h soak driver.
+- `load/k6-scenario.js` for k6-driven load testing against the smoke app.
+- Chaos integration suite under `src/test/java/.../chaos/` (Toxiproxy-based; `@Tag("chaos")`-gated; opt-in via `mvn -Pchaos verify`).
+- jqwik dependency on test classpath; `ReconciliationDecisionPropertyTest` and the existing SWR / XFetch property tests now run as part of `mvn verify`.
+- `.github/renovate.json` for dependency update automation; banned-deps list pinned (no Reactor in the cache layer).
+- `maven-enforcer-plugin` `bannedDependencies` rule rejecting `spring-boot-starter-data-redis-reactive`, `resilience4j-reactor`, `reactor-core`, and `lettuce-core` from runtime classpaths.
+- PIT mutation testing now runs library-wide with an 80% kill-rate threshold.
+- DESIGN.md §11 / "Production baselines" — the published evidence layer behind the production-ready claim.
+- README "Production deployment checklist" section.
+
+### Changed
+
+- `forceRefreshDue()` and `localGeneration()` on `NearCache` and `DistributedOnlyCache` are now public — part of the recovery contract. Previously package-private.
+- The `pitest-maven` plugin scope widened from per-class to library-wide. Trivial classes (records, exceptions, auto-config wiring) listed in `<excludedClasses>`; rationale in DESIGN.md §7 / "Mutation testing exclusions."
+- Default `mvn verify` now excludes JUnit-tagged categories (`chaos`, `soak`) so the slow opt-in suites stay off the default path.
+
 ## 0.4.0 
 
 ### ⚠️ Source-incompatible: package reorganization

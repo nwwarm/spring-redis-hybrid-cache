@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  cache-benchmarks: JMH microbenchmarks for hybrid-cache-spring-boot-starter.
+
+  This is a self-contained sibling Maven project that depends on the
+  installed snapshot of the main artifact. To run locally:
+
+    mvn -DskipTests install            # from repo root, installs library
+    mvn -f cache-benchmarks/pom.xml verify
+
+  CI runs the suite as a non-blocking job (see TESTING.md). Regression
+  baselines are stored in DESIGN.md §11 (Production baselines), referenced
+  from this module's README, not duplicated.
+
+  The module is not part of any reactor pom by design — JMH benchmarks
+  are slow and we don't want them on the default `mvn verify` path.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>io.github.nwwarm</groupId>
+    <artifactId>cache-benchmarks</artifactId>
+    <version>0.5.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+    <name>cache-benchmarks</name>
+    <description>JMH microbenchmarks for hybrid-cache-spring-boot-starter. Not published to Central.</description>
+
+    <properties>
+        <java.version>17</java.version>
+        <jmh.version>1.37</jmh.version>
+        <hybrid.cache.version>0.5.0-SNAPSHOT</hybrid.cache.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.github.nwwarm</groupId>
+            <artifactId>hybrid-cache-spring-boot-starter</artifactId>
+            <version>${hybrid.cache.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.openjdk.jmh</groupId>
+            <artifactId>jmh-core</artifactId>
+            <version>${jmh.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.openjdk.jmh</groupId>
+            <artifactId>jmh-generator-annprocess</artifactId>
+            <version>${jmh.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!--
+          Testcontainers is needed for the L2 / single-flight benchmarks
+          that boot a real Redis. JMH itself runs as `mvn verify` so the
+          containers spin during the integration-test phase.
+        -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers</artifactId>
+            <version>1.20.4</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>cache-benchmarks</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <source>${java.version}</source>
+                    <target>${java.version}</target>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.openjdk.jmh</groupId>
+                            <artifactId>jmh-generator-annprocess</artifactId>
+                            <version>${jmh.version}</version>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+
+            <!--
+              Build an executable benchmark jar so CI can:
+                java -jar cache-benchmarks/target/benchmarks.jar -rf json -rff results.json
+              and post the JSON back to the PR. The shaded jar is the
+              standard JMH packaging; without it, the @State and
+              @Benchmark generators don't resolve correctly under
+              `java -jar`.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.6.0</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <finalName>benchmarks</finalName>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>org.openjdk.jmh.Main</mainClass>
+                                </transformer>
+                            </transformers>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

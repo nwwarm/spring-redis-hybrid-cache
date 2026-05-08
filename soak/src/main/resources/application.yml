@@ -1,0 +1,54 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: hybrid-cache-soak
+
+cache:
+  server:
+    address: ${REDIS_ADDRESS:redis://localhost:6379}
+  allowed-packages:
+    - java.lang.
+    - java.util.
+  default-spec:
+    tier: NEAR_CACHE
+    ttl: 1h
+    maximum-size: 50000
+  caches:
+    products:
+      tier: NEAR_CACHE
+      ttl: 6h
+      maximum-size: 100000
+      ttl-jitter-ratio: 0.1
+      reconciliation:
+        enabled: true
+        interval: 30s
+        miss-tolerance: 5
+      swr:
+        fresh-for: 5m
+        stale-for: 30m
+      refresh-ahead:
+        enabled: true
+        beta: 1.0
+    users:
+      tier: NEAR_CACHE
+      ttl: 1h
+      maximum-size: 50000
+      reconciliation:
+        enabled: true
+        interval: 30s
+    sessions:
+      tier: DISTRIBUTED_ONLY
+      ttl: 30m
+      reconciliation:
+        enabled: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always

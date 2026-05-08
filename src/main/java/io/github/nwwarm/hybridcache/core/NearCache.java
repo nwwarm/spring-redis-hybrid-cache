@@ -979,7 +979,13 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
         return CacheStats.empty();
     }
 
-    void forceRefreshDue() {
+    /**
+     * Force the next {@link #currentGeneration()} call to refresh from
+     * Redis instead of returning the cached value. Public surface as of
+     * 0.5.0 — part of the reconciliation recovery contract. Pinned in
+     * DESIGN.md §2 / Refactoring sweep and §10 0.5.0 entries.
+     */
+    public void forceRefreshDue() {
         lastRefreshNanos.set(0);
     }
 

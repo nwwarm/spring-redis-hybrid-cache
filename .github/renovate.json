@@ -1,0 +1,40 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "schedule": ["before 4am on Monday"],
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "matchPackagePatterns": ["^org\\.springframework\\.boot"],
+      "groupName": "Spring Boot",
+      "schedule": ["before 4am on the first day of the month"]
+    },
+    {
+      "matchPackagePatterns": ["^org\\.testcontainers"],
+      "groupName": "Testcontainers"
+    },
+    {
+      "matchPackagePatterns": ["^io\\.github\\.resilience4j"],
+      "groupName": "Resilience4j"
+    },
+    {
+      "description": "Banned in DESIGN.md / # implementation guardrails / Async/reactive — never propose.",
+      "matchPackageNames": [
+        "org.springframework.boot:spring-boot-starter-data-redis-reactive",
+        "io.github.resilience4j:resilience4j-reactor",
+        "io.projectreactor:reactor-core",
+        "io.lettuce:lettuce-core"
+      ],
+      "enabled": false
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "schedule": ["before 4am on the first day of the month"]
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security"]
+  },
+  "osvVulnerabilityAlerts": true
+}

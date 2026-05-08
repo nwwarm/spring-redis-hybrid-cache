@@ -170,6 +170,16 @@ This is the section that distinguishes a production cache from a demo. Every sce
 | **Sentinel quorum loss** | If fewer than the configured quorum of Sentinels are reachable, no failover can occur. The current primary remains writable; the cache continues operating normally. If the primary then fails while quorum is lost, manual operator intervention is required. The library cannot detect this state directly — monitor Sentinel quorum health separately via your Redis monitoring. |
 | **Cluster/Sentinel read routing** | Reads are routed to masters by default to preserve read-your-writes coherence with the invalidation pipeline. Applications can override via custom `RedissonClient` bean if eventual-consistency reads are acceptable in exchange for higher read throughput. |
 | **Network partition between nodes** | Each side of the partition serves from L1 within TTL bounds. After partition heals, normal pub/sub propagation resumes. Stale entries written before the partition expire via TTL. This is a correctness-vs-availability tradeoff: the library favors availability. |
+| **Subscriber briefly disconnects** | Redisson auto-reconnects. Messages lost during the disconnect window are recovered by the next reconciliation cycle (when `reconciliation.enabled=true`): a `redisSeq − lastObservedSeq > miss-tolerance` reading triggers `caffeineCache.clear()` on `NearCache` or a generation-pointer refresh on `DistributedOnlyCache`. Worst-case staleness is bounded by the reconciliation interval (default 60s). |
+| **Reconciliation cycle fails** | Cycle is skipped, `cache.reconciliation.skipped{cache, reason=breaker_open\|exception}` increments, no exception escapes. Next cycle runs as normal. |
+| **Reconciliation declares a miss** | `cache.reconciliation.misses{cache}` increments, INFO log lines name the cache and the seq delta, and the recovery action runs. The cache resets `lastObservedSeq` so the next cycle does not re-fire on the same gap. |
+| **SWR refresh fails** | Stale value continues to serve until `stale-until`. `cache.swr.refresh.failures{cache}` increments; WARN log. No exception surfaces to the caller. |
+| **Refresh-ahead refresh fails** | Same handling as SWR refresh failure — `cache.refresh.ahead.failures{cache}` increments, no exception surfaces. The next read inside the fresh window may roll the dice again. |
+| **Async loader fails** | Returned `CompletableFuture` is completed exceptionally with the loader's cause, wrapped in `Cache.ValueRetrievalException` to match the sync path. Single-flight in-flight entry is removed; subsequent calls retry. Failed futures with `recordExceptions` causes count toward the breaker. |
+| **Async path with breaker open** | `CompletableFuture` resolves to `null` (treated as a miss; caller's loader runs). `cache.l2.breaker.open{cache}` increments. Identical to sync-path semantics. |
+| **Reconciliation seq counter `RAtomicLong` lost** (operator action: manual `DEL`, `FLUSHALL`) | Receivers detect `redisSeq < lastObservedSeq`, clamp to "no miss," reset `lastObservedSeq`, and `cache.reconciliation.seq.regressions{cache}` increments with a WARN log once per event. The library does not propagate operator action into a cache-clearing cascade. |
+| **L2 delete fails on evict** | No invalidation published (canonical state didn't change). Local evict still happens. Cross-node coherence on this evict bounded by TTL until next successful evict. |
+| **Loader rejected by semaphore** | `LoaderRejectedException` propagates to caller; distinct from loader failure. Rejection is not cached — subsequent calls with permits available succeed. |
 
 ---
 
@@ -592,6 +602,126 @@ io.github.nwwarm.hybridcache
 └── testfixtures/  Shared test infrastructure (test sources only — not on the runtime classpath)
 ```
 
+
+## Production deployment checklist
+
+The artefact a new operator follows end to end before a 0.5.0+ deploy.
+Every item maps to a specific configuration knob, metric, or runbook
+step elsewhere in this README; this checklist is the integration view.
+
+### Redis topology
+
+- [ ] Pick the `cache.server.mode` for your environment (`SINGLE`,
+      `CLUSTER`, `SENTINEL`). Defaults to `SINGLE`. See "Deployment
+      topologies" above.
+- [ ] For `CLUSTER`: list at least one master per shard in
+      `cache.server.addresses`; Redisson discovers replicas. Confirm
+      `cache.server.scan-interval` (default `2000ms`) matches your
+      shard-failover tolerance.
+- [ ] For `SENTINEL`: list Sentinel addresses (not data nodes) in
+      `cache.server.addresses`; set `master-name` to match the
+      `sentinel monitor` configuration on the Sentinels.
+- [ ] Set `cache.server.password` via environment variable
+      (`${REDIS_PASSWORD:}`). Never commit literals.
+- [ ] If you are on Redis 7.0+ and a Cluster deployment with high
+      invalidation rates, evaluate `cache.invalidation.sharded-pubsub=true`.
+
+### Memory sizing
+
+- [ ] Estimate working-set entries × per-entry size. Caffeine overhead
+      is ~96 bytes per entry plus key + value sizes. The `maximum-size`
+      per cache caps entries; total heap from caches = sum of (
+      `maximum-size × per-entry`).
+- [ ] L2 memory is a Redis sizing question; a healthy headroom is
+      working-set × 1.5 to absorb generation-counter orphan keys
+      (TTL'd; `clearImmediate()` reclaims eagerly if frequent
+      `@CacheEvict(allEntries=true)` is in play).
+- [ ] Confirm Redis `maxmemory-policy` is `noeviction` or
+      `allkeys-lru` per your tolerance for evictions on memory
+      pressure. The library does not assume either, but `noeviction`
+      surfaces memory pressure as `OOMCommandNotAllowed` errors that
+      trip the breaker, while `allkeys-lru` silently drops cache
+      entries.
+
+### Breaker tuning
+
+- [ ] Default thresholds are documented in "Configuration reference"
+      above. They are sane for most workloads.
+- [ ] If your loader can take >500ms legitimately, raise
+      `slow-call-duration-threshold` to avoid false-positive trips.
+      Set it once at the global level
+      (`resilience4j.circuitbreaker.instances.redis-cache.*`) or
+      per-cache via `cache.caches.<name>.circuit-breaker.*`.
+- [ ] Confirm `wait-duration-in-open-state` (default 30s) matches
+      your incident-recovery expectation. Sentinel deployments that
+      take >30s to fail over should raise this so the breaker
+      doesn't half-open before Redis is genuinely back.
+
+### Reconciliation
+
+- [ ] Enable per-cache via `cache.caches.<name>.reconciliation.enabled=true`
+      for any cache where missed-invalidation staleness up to TTL is
+      unacceptable. Default is `false`.
+- [ ] Default `interval=60s` matches Hazelcast's default. Tune down
+      for high-criticality caches (cost: one extra GET per cache per
+      cycle).
+- [ ] Default `miss-tolerance=5` accommodates legitimate in-flight
+      bursts. Tune up if `cache.reconciliation.misses` increments
+      under healthy traffic; tune down if you want faster detection.
+- [ ] Track `cache.reconciliation.cycles` / `misses` / `skipped` /
+      `seq.regressions` on your dashboards. The "stuck open" or
+      "regression spam" patterns surface here first.
+
+### SWR / Refresh-ahead
+
+- [ ] SWR is opt-in per cache via `swr.fresh-for` / `swr.stale-for`.
+      Operator-meaningful values: `fresh-for` ≈ acceptable freshness
+      window; `stale-for` ≈ TTL.
+- [ ] RA (`refresh-ahead.enabled=true`, requires SWR configured) is
+      probabilistic — track `cache.refresh.ahead.fires` to confirm
+      it's firing as you expect. β default `1.0` matches the XFetch
+      paper's recommendation.
+- [ ] Size the refresh executor via `cache.refresh.scheduler-pool-size`
+      (default 4). Watch `cache.refresh.queue.size` — sustained
+      non-zero means undersized.
+
+### JVM flags for the async path
+
+- [ ] Async `Cache.retrieve(...)` runs continuations on Redisson's
+      Netty event loop (until the loader hop). Standard Spring Boot
+      JVM flags apply; no additional flags required for correctness.
+- [ ] In test environments using BlockHound (the
+      `AsyncBlockHoundIT` regression guard), surefire/failsafe
+      requires `-XX:+AllowRedefinitionToAddDeleteMethods` (already in
+      `pom.xml`). Production runtimes do not need this flag.
+- [ ] Reactive applications: confirm Spring's `CacheInterceptor`
+      detects your reactive return type (`Mono`/`Flux`). The library
+      adapts via `ReactiveAdapterRegistry` upstream — your code
+      should not need to change.
+
+### Observability before traffic
+
+- [ ] `/actuator/health` reports the operational state of the L2
+      path. Wire it as the Kubernetes readiness probe.
+- [ ] Confirm your Prometheus / Datadog scrape picks up
+      `cache.gets`, `cache.l2.gets`, `cache.l2.failures`,
+      `cache.l2.breaker.open`, `resilience4j.circuitbreaker.state`.
+      The example alert rules under "Alerts" above are the
+      starter set.
+- [ ] `cache.invalidations.published` and `cache.invalidations.received`
+      should track ~1:N (one published per N receivers). Drift here
+      points to a deployment-config mismatch — the `received.unknown`
+      counter is the canary.
+
+### Pre-deployment validation
+
+- [ ] Run `mvn verify` locally; the suite includes the topology
+      integration tests against Testcontainers.
+- [ ] If you are upgrading from 0.4.x: the migration table in
+      `CHANGELOG.md` lists every property and behavioural change
+      between 0.4.x and 0.5.0. SWR / RA / reconciliation / async are
+      all opt-in; existing 0.4.x configurations continue to work
+      byte-identical.
 
 ## License
 

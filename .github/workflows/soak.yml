@@ -1,0 +1,54 @@
+name: Soak (nightly)
+on:
+  schedule:
+    - cron: '0 2 * * *'   # nightly at 02:00 UTC
+  workflow_dispatch:
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1500   # 24h + buffer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
+          cache: maven
+      - name: Start Redis
+        run: docker run -d --name redis -p 6379:6379 redis:7-alpine
+      - name: Install library
+        run: mvn -B -DskipTests install
+      - name: Build soak app
+        run: mvn -B -f soak/pom.xml package
+      - name: Boot smoke app
+        run: |
+          nohup java -jar soak/target/cache-soak-0.5.0-SNAPSHOT.jar \
+            > soak/app.log 2>&1 &
+          echo $! > soak/app.pid
+          # Smoke health check
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:8080/actuator/health && break || sleep 2
+          done
+      - name: Run soak driver
+        run: |
+          mvn -B -f soak/pom.xml exec:java \
+            -Dexec.mainClass=io.github.nwwarm.hybridcache.soak.SoakDriver \
+            -Dexec.args="http://localhost:8080 24h 1000"
+      - name: Capture metrics snapshot
+        if: always()
+        run: |
+          curl -fsS http://localhost:8080/actuator/metrics > soak/metrics-end.json || true
+          jcmd $(cat soak/app.pid) GC.heap_info > soak/heap-end.txt || true
+          jcmd $(cat soak/app.pid) Thread.print > soak/threads-end.txt || true
+      - name: Stop smoke app
+        if: always()
+        run: |
+          kill -TERM $(cat soak/app.pid) || true
+          sleep 5
+      - name: Upload soak artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-${{ github.run_id }}
+          path: soak/*.log soak/*.json soak/*.txt

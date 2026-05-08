@@ -614,8 +614,24 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
         return localGeneration.get();
     }
 
-    void forceRefreshDue() {
+    /**
+     * Force the next {@link #currentGeneration()} call to refresh from
+     * Redis instead of returning the cached value. Public surface as of
+     * 0.5.0 — part of the reconciliation recovery contract. The
+     * {@link Reconciler} calls this on a detected miss; the same path
+     * {@code handleInvalidation(OP_CLEAR, ...)} already takes.
+     */
+    public void forceRefreshDue() {
         lastRefreshNanos.set(0);
+    }
+
+    /**
+     * Return the locally cached generation snapshot. Public surface as
+     * of 0.5.0 — used by the {@link Reconciler} to compare against the
+     * canonical {@code <cache>:generation} value during a cycle.
+     */
+    public long localGeneration() {
+        return localGeneration.get();
     }
 
     CircuitBreaker getBreaker() {

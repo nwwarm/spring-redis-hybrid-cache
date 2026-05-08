@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  soak: WebFlux smoke app + soak harness.
+
+  Sibling Maven project (not part of any reactor pom). The smoke app
+  exercises every cache tier and every 0.5.0 feature against a real
+  Redis (single-server topology); the soak harness drives sustained
+  load and asserts the pass criteria documented in DESIGN.md §7 /
+  Soak tests and TESTING.md / Soak testing.
+
+  Run locally:
+      mvn -DskipTests install                           # from repo root
+      mvn -f soak/pom.xml spring-boot:run               # boots the smoke app
+      mvn -f soak/pom.xml exec:java -Dexec.mainClass=\
+        io.github.nwwarm.hybridcache.soak.SoakDriver    # 24h driver
+
+  CI runs the harness nightly (.github/workflows/soak.yml) — not on
+  pull requests, since the run takes 24 hours. Pass criteria are
+  asserted by the driver and recorded in
+  DESIGN.md §11 / "Soak run summary" on each release.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>io.github.nwwarm</groupId>
+    <artifactId>cache-soak</artifactId>
+    <version>0.5.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+    <name>cache-soak</name>
+    <description>WebFlux smoke app + 24h soak harness for hybrid-cache-spring-boot-starter.</description>
+
+    <properties>
+        <java.version>17</java.version>
+        <springboot.version>3.5.14</springboot.version>
+        <hybrid.cache.version>0.5.0-SNAPSHOT</hybrid.cache.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>${springboot.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.github.nwwarm</groupId>
+            <artifactId>hybrid-cache-spring-boot-starter</artifactId>
+            <version>${hybrid.cache.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webflux</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <source>${java.version}</source>
+                    <target>${java.version}</target>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <version>${springboot.version}</version>
+            </plugin>
+        </plugins>
+    </build>
+</project>

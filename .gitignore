@@ -11,3 +11,6 @@ out/
 .DS_Store
 Thumbs.db
 /DESIGN.md
+
+# jqwik run database (shrink-cache, shouldn't be committed)
+.jqwik-database

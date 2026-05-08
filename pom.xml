@@ -6,7 +6,7 @@
 
     <groupId>io.github.nwwarm</groupId>
     <artifactId>hybrid-cache-spring-boot-starter</artifactId>
-    <version>0.4.0</version>
+    <version>0.5.0</version>
     <name>spring-redis-hybrid-cache</name>
     <description>Three-tier cache library: local-only, distributed-only, or near-cache (Caffeine + Redisson)</description>
     <url>https://github.com/nwwarm/spring-redis-hybrid-cache</url>
@@ -91,6 +91,37 @@
                         <extensions>true</extensions>
                         <configuration>
                             <publishingServerId>central</publishingServerId>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!--
+          chaos profile: opt in to the chaos integration suite. Pulls
+          in testcontainers-toxiproxy and tells Failsafe to run only
+          tests tagged @Tag("chaos"). Default `mvn verify` skips the
+          suite (the slow Toxiproxy container start dominates a vanilla
+          test run, and chaos tests can be flaky on contended runners
+          without the dedicated allowance).
+
+          Run via:
+              mvn -Pchaos verify
+
+          Pass criteria and per-scenario commands documented in
+          TESTING.md / Chaos testing.
+        -->
+        <profile>
+            <id>chaos</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <configuration>
+                            <groups>chaos</groups>
+                            <excludedGroups>combine.self</excludedGroups>
+                            <argLine>-XX:+AllowRedefinitionToAddDeleteMethods</argLine>
                         </configuration>
                     </plugin>
                 </plugins>
@@ -193,9 +224,35 @@
             <artifactId>junit-jupiter</artifactId>
             <scope>test</scope>
         </dependency>
+        <!--
+          Toxiproxy: chaos integration suite (latency, bandwidth,
+          disconnect, pub/sub message-loss). § 7 / "Chaos tests" pins
+          the test categories; TESTING.md / Chaos testing documents the
+          run command. Tests are tagged @Tag("chaos") and excluded from
+          default `mvn verify`; opt in via `mvn -Pchaos verify`. Test
+          scope only.
+        -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-toxiproxy</artifactId>
+            <scope>test</scope>
+        </dependency>
         <dependency>
             <groupId>org.awaitility</groupId>
             <artifactId>awaitility</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!--
+          jqwik: property-based tests catalogued against § 4 / § 5 /
+          § 10 invariants (every cache invariant gets at least one
+          property test). § 7 / "Property-based tests" lists the
+          mapping; TESTING.md / Property-based testing references it.
+          Test scope only.
+        -->
+        <dependency>
+            <groupId>net.jqwik</groupId>
+            <artifactId>jqwik</artifactId>
+            <version>1.9.2</version>
             <scope>test</scope>
         </dependency>
 
@@ -229,6 +286,72 @@
                 </configuration>
             </plugin>
             <!--
+              enforce-banned-dependencies: rejects the parallel-Redis
+              reactive stack from the runtime classpath. Pinned in
+              DESIGN.md / # implementation guardrails / Async/reactive
+              item 1 (Reactor) and item 12 (spring-boot-starter-data-
+              redis-reactive). The build rule is what survives a
+              future "dependency cleanup" PR that wouldn't read the
+              guardrail.
+
+              Test-scope BlockHound and reactor-test are allowed
+              because they only run during the test phase and are not
+              shipped to runtime classpaths.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <version>3.5.0</version>
+                <executions>
+                    <execution>
+                        <id>enforce-banned-dependencies</id>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <bannedDependencies>
+                                    <searchTransitive>false</searchTransitive>
+                                    <!--
+                                      Banned dependencies on direct
+                                      production scope (compile and
+                                      runtime). Test-scope variants are
+                                      intentionally allowed because
+                                      BlockHound and friends pull in
+                                      Reactor through transitive test
+                                      deps; the rule fires only on
+                                      direct compile/runtime additions.
+                                    -->
+                                    <excludes>
+                                        <exclude>org.springframework.boot:spring-boot-starter-data-redis-reactive</exclude>
+                                        <exclude>io.github.resilience4j:resilience4j-reactor</exclude>
+                                        <exclude>io.lettuce:lettuce-core</exclude>
+                                    </excludes>
+                                    <includes>
+                                        <!--
+                                          Allow Reactor only as a test
+                                          dep — BlockHound pulls it in
+                                          and the cache layer never
+                                          imports it (verified by the
+                                          `chaos.*` and `core.*` test
+                                          classes that compile without
+                                          Reactor on the production
+                                          classpath).
+                                        -->
+                                        <include>io.projectreactor:reactor-core:*:*:test</include>
+                                    </includes>
+                                    <message>
+                                        Banned by DESIGN.md / # implementation guardrails / Async/reactive.
+                                        The cache layer holds zero Reactor dependencies; Mono/Flux interop
+                                        happens in Spring's CacheInterceptor upstream.
+                                    </message>
+                                </bannedDependencies>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <!--
               Surefire arg-line: BlockHound's instrumentation needs
               -XX:+AllowRedefinitionToAddDeleteMethods on JDK 13+ for
               its agent to redefine classes that add new methods.
@@ -250,6 +373,13 @@
                 <version>3.5.5</version>
                 <configuration>
                     <argLine>-XX:+AllowRedefinitionToAddDeleteMethods</argLine>
+                    <!--
+                      Default `mvn verify` excludes JUnit-tagged
+                      categories that gate behind opt-in profiles.
+                      Each tag has a dedicated profile that flips the
+                      default exclude. See `<profiles>` above.
+                    -->
+                    <excludedGroups>chaos,soak</excludedGroups>
                 </configuration>
                 <executions>
                     <execution>
@@ -262,14 +392,20 @@
             </plugin>
 
             <!--
-              PIT mutation testing for the refresh-ahead surface (0.5.0).
-              Scoped to the new classes so the run is fast and the kill
-              rate ≥ 80% target tracks RA-specific code, not noise from
-              the broader codebase. Invoke via:
-                mvn -Dpit-ra org.pitest:pitest-maven:mutationCoverage
-              The profile activation keeps the plugin out of the default
-              build — ordinary `mvn test` and `mvn verify` runs do not
-              fork PIT.
+              PIT mutation testing, library-wide. Bar at 80% mutation
+              kill rate (DESIGN.md §7 / Mutation testing). Excluded
+              classes are trivial (records / DTOs / enum holders /
+              auto-config wiring whose semantics are exercised by
+              integration tests rather than mutation-killable unit
+              tests) — see DESIGN.md §7 / "Mutation testing exclusions"
+              for the per-class rationale.
+
+              Invoke via:
+                mvn org.pitest:pitest-maven:mutationCoverage
+
+              Not part of default `mvn verify` — PIT is slow and the
+              CI workflow runs it as a dedicated job (see
+              .github/workflows/ci.yml / mutation-testing).
             -->
             <plugin>
                 <groupId>org.pitest</groupId>
@@ -284,21 +420,30 @@
                 </dependencies>
                 <configuration>
                     <targetClasses>
-                        <param>io.github.nwwarm.hybridcache.core.XFetchPredicate</param>
-                        <param>io.github.nwwarm.hybridcache.core.LoaderRuntimeEwma</param>
-                        <param>io.github.nwwarm.hybridcache.core.RefreshAheadCoordinator</param>
-                        <param>io.github.nwwarm.hybridcache.core.AsyncLoaderGate</param>
+                        <param>io.github.nwwarm.hybridcache.*</param>
                     </targetClasses>
                     <targetTests>
-                        <param>io.github.nwwarm.hybridcache.core.XFetchPredicateTest</param>
-                        <param>io.github.nwwarm.hybridcache.core.LoaderRuntimeEwmaTest</param>
-                        <param>io.github.nwwarm.hybridcache.core.RefreshAheadCoordinatorTest</param>
-                        <param>io.github.nwwarm.hybridcache.core.RefreshAheadMonotonicityPropertyTest</param>
-                        <param>io.github.nwwarm.hybridcache.core.AsyncLoaderGateTest</param>
+                        <param>io.github.nwwarm.hybridcache.*</param>
                     </targetTests>
+                    <excludedClasses>
+                        <!-- Records / DTOs: shapes verified by jackson round-trip ITs -->
+                        <param>io.github.nwwarm.hybridcache.config.CacheProperties$*</param>
+                        <param>io.github.nwwarm.hybridcache.invalidation.InvalidationMessage</param>
+                        <param>io.github.nwwarm.hybridcache.core.ReconciliationDecision*</param>
+                        <param>io.github.nwwarm.hybridcache.core.LoaderRejectedException</param>
+                        <!-- Auto-config wiring exercised by SecurityStartupIT / EndToEndWiringIT -->
+                        <param>io.github.nwwarm.hybridcache.config.CacheConfig</param>
+                    </excludedClasses>
+                    <excludedTestClasses>
+                        <param>io.github.nwwarm.hybridcache.chaos.*</param>
+                    </excludedTestClasses>
                     <mutationThreshold>80</mutationThreshold>
                     <coverageThreshold>80</coverageThreshold>
                     <timestampedReports>false</timestampedReports>
+                    <outputFormats>
+                        <param>HTML</param>
+                        <param>XML</param>
+                    </outputFormats>
                 </configuration>
             </plugin>
         </plugins>
