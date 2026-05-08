@@ -198,6 +198,23 @@
             <artifactId>awaitility</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <!--
+          BlockHound: detects blocking calls on threads marked
+          non-blocking. Used to enforce the async-path guarantee that
+          no read-path step blocks on a Netty event loop. § 10 0.5.0
+          + # implementation guardrails / ## Async/reactive item 2 are
+          the governing decisions.
+
+          Test scope only — production code carries no Reactor dep
+          (guardrail item 1).
+        -->
+        <dependency>
+            <groupId>io.projectreactor.tools</groupId>
+            <artifactId>blockhound</artifactId>
+            <version>1.0.13.RELEASE</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -211,10 +228,29 @@
                     <target>${java.version}</target>
                 </configuration>
             </plugin>
+            <!--
+              Surefire arg-line: BlockHound's instrumentation needs
+              -XX:+AllowRedefinitionToAddDeleteMethods on JDK 13+ for
+              its agent to redefine classes that add new methods.
+              Without it, BlockHound fails to install during AsyncBlockHoundIT
+              (and any other test that calls BlockHound.install).
+              The flag is harmless on tests that don't use BlockHound.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.4</version>
+                <configuration>
+                    <argLine>-XX:+AllowRedefinitionToAddDeleteMethods</argLine>
+                </configuration>
+            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-failsafe-plugin</artifactId>
                 <version>3.5.5</version>
+                <configuration>
+                    <argLine>-XX:+AllowRedefinitionToAddDeleteMethods</argLine>
+                </configuration>
                 <executions>
                     <execution>
                         <goals>
@@ -251,12 +287,14 @@
                         <param>io.github.nwwarm.hybridcache.core.XFetchPredicate</param>
                         <param>io.github.nwwarm.hybridcache.core.LoaderRuntimeEwma</param>
                         <param>io.github.nwwarm.hybridcache.core.RefreshAheadCoordinator</param>
+                        <param>io.github.nwwarm.hybridcache.core.AsyncLoaderGate</param>
                     </targetClasses>
                     <targetTests>
                         <param>io.github.nwwarm.hybridcache.core.XFetchPredicateTest</param>
                         <param>io.github.nwwarm.hybridcache.core.LoaderRuntimeEwmaTest</param>
                         <param>io.github.nwwarm.hybridcache.core.RefreshAheadCoordinatorTest</param>
                         <param>io.github.nwwarm.hybridcache.core.RefreshAheadMonotonicityPropertyTest</param>
+                        <param>io.github.nwwarm.hybridcache.core.AsyncLoaderGateTest</param>
                     </targetTests>
                     <mutationThreshold>80</mutationThreshold>
                     <coverageThreshold>80</coverageThreshold>

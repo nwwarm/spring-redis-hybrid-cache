@@ -18,10 +18,20 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.cache.Cache;
 import org.springframework.cache.support.NullValue;
+import jakarta.annotation.Nullable;
 
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 
 /**
  * Two-tier cache (Caffeine L1, Redis L2) with topic-based cross-node invalidation.
@@ -70,6 +80,23 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
     private final Codec bucketCodec;
     private final KeyLogFormatter keyLogFormatter;
     private final LoaderGate loaderGate;
+    /** Async-path loader gate (0.5.0). Constructed unconditionally; short-circuits when {@code max-concurrent-loaders} is unset. */
+    private final AsyncLoaderGate asyncLoaderGate;
+    /**
+     * Per-JVM single-flight map for the async path (0.5.0). Distinct from
+     * the Caffeine-backed sync single-flight (which uses Caffeine's atomic
+     * {@code get(key, mappingFunction)}); the async path needs an
+     * explicit map because Caffeine's atomic compute blocks the caller —
+     * unacceptable on the async/reactive path. § 10 / guardrail item 5
+     * pins both sync and async to one helper across all tiers; on
+     * {@link NearCache} that's two physical structures (Caffeine atomic
+     * for sync, this map for async) with the same logical contract:
+     * "first inserter runs the loader; the rest wait."
+     */
+    private final ConcurrentMap<String, CompletableFuture<Object>> asyncInflight =
+            new ConcurrentHashMap<>();
+    /** Refresh executor for the mandatory loader hop on the async path (guardrail item 2). */
+    @Nullable private final Executor refreshExecutorRef;
     private final MeterRegistry meterRegistry;
     /** Non-null only when {@code spec.swr() != null} — SWR opts in via configuration. */
     private final SwrSidecar swrSidecar;
@@ -174,6 +201,30 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
                      SwrSidecar swrSidecar,
                      RefreshAheadCoordinator refreshAhead,
                      LoaderRuntimeEwma loaderEwma) {
+        this(caffeineCache, spec, bucketCodec, redisson, breaker, dispatcher,
+                meterRegistry, keyLogFormatter, swrSidecar, refreshAhead, loaderEwma, null);
+    }
+
+    /**
+     * Async-aware constructor (0.5.0). The {@code refreshExecutor} is the
+     * shared executor the async path uses for the loader hop off
+     * Redisson's Netty event loop (guardrail item 2). When null
+     * (legacy / test path), the async loader runs on
+     * {@link ForkJoinPool#commonPool()} — same execution shape, slightly
+     * less control over thread name.
+     */
+    public NearCache(Cache caffeineCache,
+                     CacheProperties.CacheSpec spec,
+                     Codec bucketCodec,
+                     RedissonClient redisson,
+                     CircuitBreaker breaker,
+                     InvalidationDispatcher dispatcher,
+                     MeterRegistry meterRegistry,
+                     KeyLogFormatter keyLogFormatter,
+                     SwrSidecar swrSidecar,
+                     RefreshAheadCoordinator refreshAhead,
+                     LoaderRuntimeEwma loaderEwma,
+                     @Nullable Executor refreshExecutor) {
         this.caffeineCache = caffeineCache;
         this.cacheName = caffeineCache.getName();
         this.spec = spec;
@@ -185,6 +236,9 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
         this.meterRegistry = meterRegistry;
         this.loaderGate = new LoaderGate(cacheName,
                 spec.maxConcurrentLoaders(), spec.loaderAcquireTimeout(), meterRegistry);
+        this.asyncLoaderGate = new AsyncLoaderGate(cacheName,
+                spec.maxConcurrentLoaders(), spec.loaderAcquireTimeout(), meterRegistry);
+        this.refreshExecutorRef = refreshExecutor;
         this.swrSidecar = swrSidecar;
         this.refreshAhead = refreshAhead;
         this.loaderEwma = loaderEwma;
@@ -954,5 +1008,352 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
     /** Test seam: per-cache loader-runtime EWMA, or {@code null} when SWR/RA is not configured. */
     public LoaderRuntimeEwma loaderEwma() {
         return loaderEwma;
+    }
+
+    // ---------- Async / reactive path (0.5.0) ----------
+    //
+    // Reactive @Cacheable methods land here via Spring 6.1's
+    // CompletableFuture<ValueWrapper>-typed retrieve(...). Defaults in
+    // the Cache interface wrap synchronous get(...) in
+    // CompletableFuture.supplyAsync(...) — that blocks the calling
+    // thread for the full chain and defeats reactivity. The override
+    // here keeps the read non-blocking end-to-end:
+    //   L1 (synchronous Caffeine read; cheap)
+    //     → if hit: completedFuture(value), with SWR/RA dispatch on side
+    //     → if miss: L2 via RBucket.getAsync()
+    //         → if hit: populate L1 + completedFuture(value)
+    //         → if miss: tryLockAsync → re-check L2 → loader hop → setAsync → publish
+
+    /**
+     * Async retrieve without a loader. L1 hit returns a completed future;
+     * L1 miss chains to {@code RBucket.getAsync()} on the breaker, with
+     * an L2 hit populating L1 (and recording the SWR sidecar deadline)
+     * before the future completes.
+     */
+    @Override
+    public CompletableFuture<?> retrieve(@Nonnull Object key) {
+        String stringKey = CacheKeys.stringify(cacheName, key);
+        ValueWrapper wrapper = caffeineCache.get(stringKey);
+        if (wrapper != null) {
+            // Loader-less retrieve cannot dispatch SWR/RA refresh — same
+            // as the sync get(key) path. Return the wrapper directly.
+            return CompletableFuture.completedFuture(wrapper);
+        }
+        return readFromL2Async(stringKey)
+                .thenApply(distValue -> {
+                    if (distValue == null) return null;
+                    if (swrSidecar != null) swrSidecar.recordWrite(stringKey);
+                    caffeineCache.put(stringKey, distValue);
+                    // Re-fetch via Caffeine so the wrapper has the same
+                    // NullValue handling the sync path uses.
+                    return caffeineCache.get(stringKey);
+                });
+    }
+
+    /**
+     * Async retrieve with a loader. The headline async surface for
+     * NearCache. Mirrors the sync {@link #get(Object, Callable)} chain
+     * end-to-end with non-blocking primitives:
+     *
+     * <ul>
+     *   <li>L1 hit → completedFuture(value); SWR/RA may dispatch refresh
+     *       through the existing coordinators.</li>
+     *   <li>L1 miss → {@code RBucket.getAsync()} via the breaker.</li>
+     *   <li>L2 hit → populate L1 + completedFuture(value).</li>
+     *   <li>L2 miss → cross-JVM single-flight via the shared async
+     *       in-flight map; cross-node single-flight via {@code RLock.tryLockAsync};
+     *       loader runs on the refresh executor (mandatory loader hop —
+     *       guardrail item 2); on success: {@code setAsync → publishAsync}.</li>
+     * </ul>
+     */
+    @Override
+    @SuppressWarnings("unchecked")
+    public <T> CompletableFuture<T> retrieve(@Nonnull Object key,
+                                              @Nonnull Supplier<CompletableFuture<T>> valueLoader) {
+        String stringKey = CacheKeys.stringify(cacheName, key);
+        ValueWrapper wrapper = caffeineCache.get(stringKey);
+        if (wrapper != null) {
+            // L1 hit. Build the async-aware refresh task body and dispatch
+            // through SWR (STALE) or RA (FRESH + predicate) — matches the
+            // sync read-path's classification branching.
+            if (swrSidecar != null) {
+                Callable<Object> refreshTask = buildAsyncRefreshTaskBody(key, stringKey, valueLoader);
+                SwrSidecar.Classification c = swrSidecar.classify(stringKey);
+                if (c == SwrSidecar.Classification.STALE) {
+                    swrSidecar.maybeDispatchRefresh(stringKey, refreshTask);
+                } else if (refreshAhead != null) {
+                    refreshAhead.evaluateAndMaybeDispatch(stringKey, refreshTask);
+                }
+            }
+            T value = (T) wrapper.get();
+            return CompletableFuture.completedFuture(value);
+        }
+        return readFromL2Async(stringKey)
+                .thenCompose(distValue -> {
+                    if (distValue != null) {
+                        // Sidecar pre-write before L1 visibility (guardrail #2 of SWR).
+                        if (swrSidecar != null) swrSidecar.recordWrite(stringKey);
+                        caffeineCache.put(stringKey, distValue);
+                        @SuppressWarnings("unchecked")
+                        T cast = (T) (distValue instanceof NullValue ? null : distValue);
+                        return CompletableFuture.completedFuture(cast);
+                    }
+                    return loadAsyncWithSingleFlight(key, stringKey, valueLoader);
+                });
+    }
+
+    private CompletableFuture<Object> readFromL2Async(String key) {
+        Timer.Sample sample = Timer.start();
+        Supplier<CompletionStage<Object>> readSupplier = () -> {
+            // bucket() reads the generation counter — safe from any
+            // thread, and the Redisson async API takes it from there.
+            return bucket(key).getAsync().toCompletableFuture();
+        };
+        CompletableFuture<Object> chained;
+        try {
+            chained = breaker.executeCompletionStage(readSupplier).toCompletableFuture();
+        } catch (CallNotPermittedException e) {
+            l2BreakerOpen.increment();
+            sample.stop(l2GetLatency);
+            return CompletableFuture.completedFuture(null);
+        }
+        return chained.handle((value, ex) -> {
+            sample.stop(l2GetLatency);
+            if (ex != null) {
+                Throwable cause = unwrapCompletion(ex);
+                if (cause instanceof CallNotPermittedException) {
+                    l2BreakerOpen.increment();
+                } else {
+                    l2Failures.increment();
+                    log.warn("L2 async read failed for key '{}'; degrading to local-only",
+                            keyLogFormatter.format(key), cause);
+                }
+                return null;
+            }
+            if (value == null) {
+                l2Misses.increment();
+            } else {
+                l2Hits.increment();
+            }
+            return value;
+        });
+    }
+
+    @SuppressWarnings("unchecked")
+    private <T> CompletableFuture<T> loadAsyncWithSingleFlight(
+            Object key, String stringKey, Supplier<CompletableFuture<T>> valueLoader) {
+        CompletableFuture<Object> mine = new CompletableFuture<>();
+        CompletableFuture<Object> theirs = asyncInflight.putIfAbsent(stringKey, mine);
+        if (theirs != null) {
+            return (CompletableFuture<T>) theirs.handle((v, ex) -> {
+                if (ex != null) throw asUncheckedAsyncFailure(key, valueLoader, ex);
+                return v;
+            });
+        }
+
+        Executor hop = refreshExecutorRef != null ? refreshExecutorRef : ForkJoinPool.commonPool();
+        long start = System.nanoTime();
+        return loadCrossNodeAsync(key, stringKey, valueLoader, hop)
+                .handle((value, ex) -> {
+                    try {
+                        if (ex != null) {
+                            mine.completeExceptionally(ex);
+                            throw asUncheckedAsyncFailure(key, valueLoader, ex);
+                        }
+                        // Populate L1 via the cache layer (NullValue
+                        // handling), record sidecar deadline first
+                        // (guardrail #2 of SWR).
+                        if (swrSidecar != null) swrSidecar.recordWrite(stringKey);
+                        caffeineCache.put(stringKey, value);
+                        if (loaderEwma != null) {
+                            loaderEwma.record(System.nanoTime() - start);
+                        }
+                        mine.complete(value);
+                        // No publish on cold load — same rule the sync
+                        // path follows; see the long comment in
+                        // loadWithDistributedLock.
+                        invalidationsSuppressedColdLoad.increment();
+                        @SuppressWarnings("unchecked")
+                        T cast = (T) value;
+                        return cast;
+                    } finally {
+                        asyncInflight.remove(stringKey, mine);
+                    }
+                });
+    }
+
+    private <T> CompletableFuture<Object> loadCrossNodeAsync(
+            Object key, String stringKey,
+            Supplier<CompletableFuture<T>> valueLoader, Executor hop) {
+        if (spec.lockWait().isZero()) {
+            return runAsyncLoaderAndWriteThrough(key, stringKey, valueLoader, hop, null);
+        }
+        RLock lock = redisson.getLock(CacheKeys.lockKey(cacheName, stringKey));
+        return lock.tryLockAsync(
+                        spec.lockWait().toMillis(),
+                        spec.lockLease().toMillis(),
+                        TimeUnit.MILLISECONDS)
+                .toCompletableFuture()
+                .handle((acquired, ex) -> {
+                    if (ex != null) {
+                        log.debug("Distributed async lock acquisition failed for key '{}';"
+                                + " proceeding with local single-flight only",
+                                keyLogFormatter.format(stringKey), ex);
+                        return Boolean.FALSE;
+                    }
+                    return acquired;
+                })
+                .thenCompose(acquired -> {
+                    if (Boolean.TRUE.equals(acquired)) {
+                        return readFromL2Async(stringKey)
+                                .thenCompose(existing -> {
+                                    if (existing != null) {
+                                        return releaseLockAsync(lock).thenApply(v -> existing);
+                                    }
+                                    return runAsyncLoaderAndWriteThrough(
+                                            key, stringKey, valueLoader, hop, lock);
+                                });
+                    }
+                    return runAsyncLoaderAndWriteThrough(
+                            key, stringKey, valueLoader, hop, null);
+                });
+    }
+
+    private <T> CompletableFuture<Object> runAsyncLoaderAndWriteThrough(
+            Object key, String stringKey,
+            Supplier<CompletableFuture<T>> valueLoader, Executor hop,
+            @Nullable RLock lockToReleaseOnCompletion) {
+        return CompletableFuture.completedFuture((Void) null)
+                .thenComposeAsync(v -> asyncLoaderGate.run(key, () -> {
+                    CompletableFuture<T> raw;
+                    try {
+                        raw = valueLoader.get();
+                    } catch (Throwable t) {
+                        CompletableFuture<Object> failed = new CompletableFuture<>();
+                        failed.completeExceptionally(t);
+                        return failed;
+                    }
+                    if (raw == null) raw = CompletableFuture.completedFuture(null);
+                    return raw.thenApply(o -> (Object) o);
+                }), hop)
+                .thenCompose(value ->
+                        writeToL2Async(stringKey, value).thenApply(ignored -> value))
+                .whenComplete((v, ex) -> {
+                    if (lockToReleaseOnCompletion != null) {
+                        releaseLockAsync(lockToReleaseOnCompletion);
+                    }
+                });
+    }
+
+    private CompletableFuture<Void> releaseLockAsync(RLock lock) {
+        try {
+            return lock.unlockAsync().toCompletableFuture()
+                    .handle((v, ex) -> {
+                        if (ex != null) {
+                            log.warn("Async unlock failed cache='{}'", cacheName, ex);
+                        }
+                        return null;
+                    });
+        } catch (Exception e) {
+            log.warn("Async unlock invocation failed cache='{}'", cacheName, e);
+            return CompletableFuture.completedFuture(null);
+        }
+    }
+
+    private CompletableFuture<Void> writeToL2Async(String key, Object value) {
+        Supplier<CompletionStage<Void>> writeSupplier = () -> {
+            return bucket(key).setAsync(value, spec.ttl()).toCompletableFuture()
+                    .thenApply(unused -> (Void) null);
+        };
+        try {
+            return breaker.executeCompletionStage(writeSupplier).toCompletableFuture()
+                    .handle((v, ex) -> {
+                        if (ex != null) {
+                            Throwable cause = unwrapCompletion(ex);
+                            if (cause instanceof CallNotPermittedException) {
+                                l2BreakerOpen.increment();
+                            } else {
+                                l2Failures.increment();
+                                log.warn("L2 async write failed for key '{}';"
+                                        + " cross-node incoherence until TTL",
+                                        keyLogFormatter.format(key), cause);
+                            }
+                        }
+                        return null;
+                    });
+        } catch (CallNotPermittedException e) {
+            l2BreakerOpen.increment();
+            return CompletableFuture.completedFuture(null);
+        }
+    }
+
+    /**
+     * Builds an SWR / RA refresh task body for use from the async
+     * read-path on L1 hit. The same shape the sync path uses (loader
+     * through async gate, write through {@link #put(Object, Object)} so
+     * cross-node invalidation propagates), invoked from inside the SWR
+     * executor's worker thread.
+     *
+     * <p>The dispatch contract on {@code SwrSidecar} / {@code RefreshAheadCoordinator}
+     * is {@code Callable<Object>} — synchronous. We adapt by joining the
+     * async loader future inside the callable, which is acceptable
+     * because the callable runs on the SWR/RA refresh-executor thread,
+     * not on a Netty event loop or Reactor thread.
+     */
+    private <T> Callable<Object> buildAsyncRefreshTaskBody(
+            Object key, String stringKey, Supplier<CompletableFuture<T>> valueLoader) {
+        return () -> {
+            long start = System.nanoTime();
+            try {
+                final CompletableFuture<T> userFuture;
+                try {
+                    CompletableFuture<T> raw = valueLoader.get();
+                    userFuture = raw == null ? CompletableFuture.completedFuture(null) : raw;
+                } catch (Throwable t) {
+                    throw t instanceof Exception ? (Exception) t : new RuntimeException(t);
+                }
+                Object value;
+                try {
+                    value = asyncLoaderGate.run(key, () -> userFuture.thenApply(v -> (Object) v))
+                            .toCompletableFuture().join();
+                } catch (CompletionException ce) {
+                    Throwable cause = ce.getCause() != null ? ce.getCause() : ce;
+                    if (cause instanceof Exception ex) throw ex;
+                    throw new RuntimeException(cause);
+                }
+                // Refresh writes through put(): updates L1, L2, and
+                // publishes the invalidation. Same as the sync refresh
+                // task body — SWR guardrail item 6.
+                put(stringKey, value);
+                return value;
+            } finally {
+                if (loaderEwma != null) {
+                    loaderEwma.record(System.nanoTime() - start);
+                }
+            }
+        };
+    }
+
+    private RuntimeException asUncheckedAsyncFailure(
+            Object key, Supplier<?> loader, Throwable ex) {
+        Throwable cause = unwrapCompletion(ex);
+        if (cause instanceof LoaderRejectedException lr) return lr;
+        if (cause instanceof RuntimeException re
+                && re.getClass() == Cache.ValueRetrievalException.class) {
+            return re;
+        }
+        Callable<?> loaderAdapter = loader::get;
+        return new Cache.ValueRetrievalException(key, loaderAdapter, cause);
+    }
+
+    private static Throwable unwrapCompletion(Throwable t) {
+        Throwable cur = t;
+        while (cur instanceof CompletionException
+                || cur instanceof ExecutionException) {
+            Throwable c = cur.getCause();
+            if (c == null || c == cur) break;
+            cur = c;
+        }
+        return cur;
     }
 }

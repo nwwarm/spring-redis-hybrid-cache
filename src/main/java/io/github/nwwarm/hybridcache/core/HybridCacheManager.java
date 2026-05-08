@@ -149,12 +149,14 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
                 yield new LocalOnlyCache(
                         buildCaffeineCache(name, spec, localSidecar),
                         spec.maxConcurrentLoaders(), spec.loaderAcquireTimeout(),
-                        meterRegistry, localSidecar, localRa, localEwma);
+                        meterRegistry, localSidecar, localRa, localEwma,
+                        refreshExecutor != null ? refreshExecutor.asExecutor() : null);
             }
             case DISTRIBUTED_ONLY -> {
                 CircuitBreaker breaker = breakerFactory.resolve(name, spec.circuitBreaker());
                 DistributedOnlyCache distributed = new DistributedOnlyCache(
-                        name, spec, bucketCodec, redisson, breaker, dispatcher, meterRegistry, keyLogFormatter);
+                        name, spec, bucketCodec, redisson, breaker, dispatcher, meterRegistry, keyLogFormatter,
+                        refreshExecutor != null ? refreshExecutor.asExecutor() : null);
                 distributedCaches.add(distributed);
                 if (reconciliationCoordinator != null
                         && spec.reconciliation() != null
@@ -182,7 +184,8 @@ public class HybridCacheManager extends AbstractCacheManager implements Disposab
                 NearCache near = new NearCache(
                         buildCaffeineCache(name, spec, swrSidecar),
                         spec, bucketCodec, redisson, breaker, dispatcher,
-                        meterRegistry, keyLogFormatter, swrSidecar, nearRa, nearEwma);
+                        meterRegistry, keyLogFormatter, swrSidecar, nearRa, nearEwma,
+                        refreshExecutor != null ? refreshExecutor.asExecutor() : null);
                 nearCaches.add(near);
                 // Preloader registration runs *after* the cache is fully
                 // built and the dispatcher has registered the listener

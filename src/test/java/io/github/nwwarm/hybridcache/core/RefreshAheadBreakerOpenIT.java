@@ -47,19 +47,26 @@ class RefreshAheadBreakerOpenIT extends RedisTestBase {
     @Test
     void breakerOpen_raDispatchSuppressed_metricRecorded() throws Exception {
         CircuitBreaker breaker = defaultBreaker();
-        // Use a seeded RNG that pegs U very small so the predicate fires
-        // even for small time-since-write values; this keeps the test
-        // deterministic without needing to age the entry.
+        // Short freshFor so the XFetch predicate has meaningful fire
+        // probability under a seeded RNG. With freshFor=200ms and a
+        // seeded EWMA of 100ms, P(fire) at t=0 is exp(-2) ≈ 0.13,
+        // so 50 evaluations produce ~6.5 fires on average — plenty for
+        // the assertion.
         NearCache cache = newRaNearCache("ra-breaker", redisson, breaker, "node",
                 meterRegistry, refreshExecutor,
                 Duration.ofMinutes(10),
-                Duration.ofMinutes(1),     // freshFor — long, so we stay fresh
-                Duration.ofMinutes(2),     // staleFor
+                Duration.ofMillis(200),    // freshFor — short for predictable fire rate
+                Duration.ofSeconds(30),    // staleFor — wide so we don't age into stale
                 1.0,
                 new SplittableRandom(0xCAFE_F00DL));
 
-        // Seed the EWMA via a cold load so RA's predicate has a non-zero
-        // loader estimate.
+        // Seed the EWMA explicitly to half of freshFor so the predicate
+        // has the right magnitude. The cold-load timing depends on
+        // hardware; the explicit record makes the test deterministic
+        // across CI environments.
+        cache.loaderEwma().record(Duration.ofMillis(100).toNanos());
+
+        // Cold-load to populate L1.
         cache.get("k", () -> "v0");
 
         // Open the breaker AFTER the cold load completes, so the load

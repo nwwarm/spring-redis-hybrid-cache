@@ -14,10 +14,13 @@ import org.redisson.api.*;
 import org.redisson.client.codec.Codec;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.cache.Cache;
 import org.springframework.cache.support.SimpleValueWrapper;
+import jakarta.annotation.Nullable;
 
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 
 /**
  * Redis-only cache with no L1.
@@ -93,6 +96,21 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
      * can union across tiers.
      */
     private final Counter publishedClear;
+    /**
+     * Async-path loader gate (0.5.0). Constructed unconditionally — when
+     * {@code max-concurrent-loaders} is unset, both sync and async gates
+     * short-circuit to direct loader calls (matches {@link LoaderGate}).
+     */
+    private final AsyncLoaderGate asyncLoaderGate;
+    /**
+     * Refresh executor for the mandatory loader hop on the async path.
+     * When null (legacy/test construction), the async loader runs on
+     * {@link ForkJoinPool#commonPool()} — same execution shape, slightly
+     * less control over thread name. The hop is mandatory: a blocking
+     * loader on Redisson's Netty event loop would stall every other
+     * Redisson IO operation in the JVM (guardrail item 2).
+     */
+    @Nullable private final Executor refreshExecutor;
 
     public DistributedOnlyCache(String cacheName,
                                 CacheProperties.CacheSpec spec,
@@ -102,6 +120,25 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
                                 InvalidationDispatcher dispatcher,
                                 MeterRegistry meterRegistry,
                                 KeyLogFormatter keyLogFormatter) {
+        this(cacheName, spec, bucketCodec, redisson, breaker, dispatcher,
+                meterRegistry, keyLogFormatter, null);
+    }
+
+    /**
+     * Async-aware constructor (0.5.0). The {@code refreshExecutor} is the
+     * same shared executor used by SWR / RA / async-loader hops, plumbed
+     * here so {@link #retrieve(Object, Supplier)} can hand the loader to
+     * a non-Netty thread (guardrail item 2).
+     */
+    public DistributedOnlyCache(String cacheName,
+                                CacheProperties.CacheSpec spec,
+                                Codec bucketCodec,
+                                RedissonClient redisson,
+                                CircuitBreaker breaker,
+                                InvalidationDispatcher dispatcher,
+                                MeterRegistry meterRegistry,
+                                KeyLogFormatter keyLogFormatter,
+                                @Nullable Executor refreshExecutor) {
         this.cacheName = cacheName;
         this.spec = spec;
         this.redisson = redisson;
@@ -139,6 +176,9 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
                 .tag("cache", cacheName).register(meterRegistry);
         this.loaderGate = new LoaderGate(cacheName,
                 spec.maxConcurrentLoaders(), spec.loaderAcquireTimeout(), meterRegistry);
+        this.asyncLoaderGate = new AsyncLoaderGate(cacheName,
+                spec.maxConcurrentLoaders(), spec.loaderAcquireTimeout(), meterRegistry);
+        this.refreshExecutor = refreshExecutor;
         this.publishedClear = Counter.builder("cache.invalidations.published")
                 .tag("cache", cacheName).tag("op", "clear").register(meterRegistry);
     }
@@ -580,5 +620,295 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
 
     CircuitBreaker getBreaker() {
         return breaker;
+    }
+
+    // ---------- Async / reactive path (0.5.0) ----------
+    //
+    // Implements Spring 6.1's CompletableFuture<ValueWrapper>-typed
+    // retrieve(...) methods so the cache layer is non-blocking when an
+    // @Cacheable method has a Mono / Flux / CompletableFuture return type.
+    // The defaults in the Cache interface wrap the synchronous get(...) in
+    // CompletableFuture.supplyAsync(...) — that blocks the calling thread
+    // and defeats the whole point of overriding here.
+
+    /**
+     * Async retrieve without a loader. Chains:
+     * {@code RBucket.getAsync → wrap → CompletableFuture<ValueWrapper>}.
+     * No thread switch — the chain stays on Redisson's Netty event loop
+     * (no loader to invoke, so no hop needed). Hits and misses both
+     * complete normally; a breaker-open / Redis-unreachable surfaces as
+     * a {@code completedFuture(null)} (matches sync-path "L2 read failure
+     * is treated as a miss").
+     */
+    @Override
+    public CompletableFuture<?> retrieve(@Nonnull Object key) {
+        String stringKey = CacheKeys.stringify(cacheName, key);
+        return readFromRedisAsync(stringKey)
+                .thenApply(value -> value == null ? null : new SimpleValueWrapper(value));
+    }
+
+    /**
+     * Async retrieve with a loader. Chains:
+     * {@code RBucket.getAsync → if hit: completedFuture(value);
+     *  else: tryLockAsync → recheck-getAsync → loader-on-refreshExecutor → setAsync → publish}.
+     *
+     * <p>Single-flight via the shared {@link #inflight} map (guardrail
+     * item 5): a sync caller and an async caller racing for the same key
+     * converge on the same in-flight entry.
+     *
+     * <p>The returned future:
+     * <ul>
+     *   <li>Completes with the cached value on L2 hit OR with the loader
+     *       result after the loader runs;</li>
+     *   <li>Completes exceptionally with {@link Cache.ValueRetrievalException}
+     *       wrapping the loader's cause on loader failure (matches
+     *       sync-path exception type — guardrail item 3);</li>
+     *   <li>Completes exceptionally with {@link LoaderRejectedException}
+     *       (NOT wrapped) on async-loader-gate timeout.</li>
+     * </ul>
+     */
+    @Override
+    @SuppressWarnings("unchecked")
+    public <T> CompletableFuture<T> retrieve(@Nonnull Object key,
+                                              @Nonnull Supplier<CompletableFuture<T>> valueLoader) {
+        String stringKey = CacheKeys.stringify(cacheName, key);
+        return readFromRedisAsync(stringKey)
+                .thenCompose(existing -> {
+                    if (existing != null) return CompletableFuture.completedFuture((T) existing);
+                    return loadAsyncWithSingleFlight(key, stringKey, valueLoader);
+                });
+    }
+
+    /**
+     * Async L2 read wrapped in {@link CircuitBreaker#executeCompletionStage}.
+     * On breaker-open or Redis failure, the returned future completes with
+     * {@code null} (matches sync-path "L2 read failure → treated as a miss"
+     * — see § 4 failure-modes table). Metrics increment identically to the
+     * sync path: {@code cache.distributed.gets{result=hit|miss}},
+     * {@code cache.distributed.failures}, {@code cache.distributed.breaker.open}.
+     */
+    private CompletableFuture<Object> readFromRedisAsync(String key) {
+        Timer.Sample sample = Timer.start();
+        Supplier<CompletionStage<Object>> readSupplier = () -> {
+            // bucket() reads currentGeneration() — must run on a thread
+            // safe to call AtomicLong CAS on, which is any thread. The
+            // Redisson async API is non-blocking from here on out.
+            RBucket<Object> b = bucket(key);
+            return b.getAsync().toCompletableFuture();
+        };
+        CompletableFuture<Object> chained;
+        try {
+            chained = breaker.executeCompletionStage(readSupplier).toCompletableFuture();
+        } catch (CallNotPermittedException e) {
+            // executeCompletionStage throws CallNotPermitted synchronously
+            // when the breaker is open at submission time — convert to
+            // a completed-with-null future so the read-as-miss contract
+            // holds.
+            breakerOpen.increment();
+            sample.stop(getLatency);
+            return CompletableFuture.completedFuture(null);
+        }
+        return chained
+                .handle((value, ex) -> {
+                    sample.stop(getLatency);
+                    if (ex != null) {
+                        Throwable cause = unwrapCompletion(ex);
+                        if (cause instanceof CallNotPermittedException) {
+                            breakerOpen.increment();
+                        } else {
+                            failures.increment();
+                            log.warn("Distributed read failed for key '{}'",
+                                    keyLogFormatter.format(key), cause);
+                        }
+                        return null;
+                    }
+                    if (value == null) {
+                        misses.increment();
+                    } else {
+                        hits.increment();
+                    }
+                    return value;
+                });
+    }
+
+    /**
+     * Async cold-load path with two-tier single-flight (per-JVM via
+     * {@link #inflight}, cross-node via {@link RLock#tryLockAsync}).
+     * Falls through to local-only protection if Redis is slow / down /
+     * breaker-open — matches sync-path semantics.
+     */
+    @SuppressWarnings("unchecked")
+    private <T> CompletableFuture<T> loadAsyncWithSingleFlight(
+            Object key, String stringKey, Supplier<CompletableFuture<T>> valueLoader) {
+        CompletableFuture<Object> mine = new CompletableFuture<>();
+        CompletableFuture<Object> theirs = inflight.putIfAbsent(stringKey, mine);
+        if (theirs != null) {
+            // Another thread (sync or async) is already loading. Wait on
+            // its future; translate exceptions to match the async-path
+            // exception contract.
+            return (CompletableFuture<T>) theirs.handle((v, ex) -> {
+                if (ex != null) {
+                    throw asUncheckedAsyncFailure(key, valueLoader, ex);
+                }
+                return v;
+            });
+        }
+
+        // We are the winner. Cross-node single-flight via tryLockAsync,
+        // then loader hop, then setAsync write-through.
+        Executor hop = refreshExecutor != null ? refreshExecutor : ForkJoinPool.commonPool();
+        return loadCrossNodeAsync(key, stringKey, valueLoader, hop)
+                .handle((value, ex) -> {
+                    try {
+                        if (ex != null) {
+                            mine.completeExceptionally(ex);
+                            throw asUncheckedAsyncFailure(key, valueLoader, ex);
+                        }
+                        mine.complete(value);
+                        @SuppressWarnings("unchecked")
+                        T cast = (T) value;
+                        return cast;
+                    } finally {
+                        inflight.remove(stringKey, mine);
+                    }
+                });
+    }
+
+    private <T> CompletableFuture<Object> loadCrossNodeAsync(
+            Object key, String stringKey,
+            Supplier<CompletableFuture<T>> valueLoader, Executor hop) {
+        if (spec.lockWait().isZero()) {
+            // Lock disabled by configuration — go straight to the loader
+            // hop. Local in-flight already protects per-JVM.
+            return runAsyncLoaderAndWriteThrough(key, stringKey, valueLoader, hop, null);
+        }
+        RLock lock = redisson.getLock(CacheKeys.lockKey(cacheName, stringKey));
+        return lock.tryLockAsync(
+                        spec.lockWait().toMillis(),
+                        spec.lockLease().toMillis(),
+                        TimeUnit.MILLISECONDS)
+                .toCompletableFuture()
+                .handle((acquired, ex) -> {
+                    if (ex != null) {
+                        log.debug("Distributed lock acquisition failed for key '{}';"
+                                + " proceeding with local single-flight only",
+                                keyLogFormatter.format(stringKey), ex);
+                        return Boolean.FALSE;
+                    }
+                    return acquired;
+                })
+                .thenCompose(acquired -> {
+                    if (Boolean.TRUE.equals(acquired)) {
+                        // Re-check after acquisition: another node may
+                        // have populated L2 while we waited for the lock.
+                        return readFromRedisAsync(stringKey)
+                                .thenCompose(existing -> {
+                                    if (existing != null) {
+                                        return releaseLockAsync(lock)
+                                                .thenApply(v -> existing);
+                                    }
+                                    return runAsyncLoaderAndWriteThrough(
+                                            key, stringKey, valueLoader, hop, lock);
+                                });
+                    }
+                    return runAsyncLoaderAndWriteThrough(
+                            key, stringKey, valueLoader, hop, null);
+                });
+    }
+
+    private <T> CompletableFuture<Object> runAsyncLoaderAndWriteThrough(
+            Object key, String stringKey,
+            Supplier<CompletableFuture<T>> valueLoader, Executor hop,
+            @Nullable RLock lockToReleaseOnCompletion) {
+        // The mandatory loader hop. thenComposeAsync(loader, hop) keeps
+        // the loader off the Redisson Netty event loop (guardrail item 2).
+        return CompletableFuture.completedFuture((Void) null)
+                .thenComposeAsync(v -> asyncLoaderGate.run(key, () -> {
+                    CompletableFuture<T> raw;
+                    try {
+                        raw = valueLoader.get();
+                    } catch (Throwable t) {
+                        CompletableFuture<Object> failed = new CompletableFuture<>();
+                        failed.completeExceptionally(t);
+                        return failed;
+                    }
+                    if (raw == null) raw = CompletableFuture.completedFuture(null);
+                    return raw.thenApply(o -> (Object) o);
+                }), hop)
+                .thenCompose(value ->
+                        // Async write-through. setAsync is breaker-wrapped
+                        // via executeCompletionStage so failures count
+                        // toward the breaker the same as sync writes.
+                        writeToRedisAsync(stringKey, value).thenApply(ignored -> value))
+                .whenComplete((v, ex) -> {
+                    if (lockToReleaseOnCompletion != null) {
+                        releaseLockAsync(lockToReleaseOnCompletion);
+                    }
+                });
+    }
+
+    private CompletableFuture<Void> releaseLockAsync(RLock lock) {
+        try {
+            return lock.unlockAsync().toCompletableFuture()
+                    .handle((v, ex) -> {
+                        if (ex != null) {
+                            log.warn("Failed to async-unlock cache='{}'", cacheName, ex);
+                        }
+                        return null;
+                    });
+        } catch (Exception e) {
+            log.warn("Failed to invoke async-unlock for cache='{}'", cacheName, e);
+            return CompletableFuture.completedFuture(null);
+        }
+    }
+
+    private CompletableFuture<Void> writeToRedisAsync(String key, Object value) {
+        Supplier<CompletionStage<Void>> writeSupplier = () -> {
+            RBucket<Object> b = bucket(key);
+            return b.setAsync(value, spec.ttl()).toCompletableFuture()
+                    .thenApply(unused -> (Void) null);
+        };
+        try {
+            return breaker.executeCompletionStage(writeSupplier).toCompletableFuture()
+                    .handle((v, ex) -> {
+                        if (ex != null) {
+                            Throwable cause = unwrapCompletion(ex);
+                            if (cause instanceof CallNotPermittedException) {
+                                breakerOpen.increment();
+                            } else {
+                                failures.increment();
+                                log.warn("Distributed async put failed for key '{}'",
+                                        keyLogFormatter.format(key), cause);
+                            }
+                        }
+                        return null;
+                    });
+        } catch (CallNotPermittedException e) {
+            breakerOpen.increment();
+            return CompletableFuture.completedFuture(null);
+        }
+    }
+
+    private RuntimeException asUncheckedAsyncFailure(
+            Object key, Supplier<?> loader, Throwable ex) {
+        Throwable cause = unwrapCompletion(ex);
+        if (cause instanceof LoaderRejectedException lr) return lr;
+        if (cause instanceof RuntimeException re
+                && re.getClass() == Cache.ValueRetrievalException.class) {
+            return re;
+        }
+        Callable<?> loaderAdapter = loader::get;
+        return new Cache.ValueRetrievalException(key, loaderAdapter, cause);
+    }
+
+    private static Throwable unwrapCompletion(Throwable t) {
+        Throwable cur = t;
+        while (cur instanceof CompletionException
+                || cur instanceof ExecutionException) {
+            Throwable c = cur.getCause();
+            if (c == null || c == cur) break;
+            cur = c;
+        }
+        return cur;
     }
 }

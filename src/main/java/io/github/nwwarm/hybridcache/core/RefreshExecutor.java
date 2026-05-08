@@ -104,6 +104,19 @@ public class RefreshExecutor implements SmartLifecycle {
         return pool.getCorePoolSize();
     }
 
+    /**
+     * Returns this executor as a {@link java.util.concurrent.Executor} for
+     * use with {@code CompletableFuture.thenComposeAsync(loader, executor)}
+     * on the async/reactive read path (0.5.0). The returned executor
+     * delegates to {@link #submit(Runnable)} so the executor's running
+     * gate (drop-on-shutdown) and rejected-execution behavior apply
+     * uniformly to every caller — sync SWR/RA dispatch and async-path
+     * loader hops both flow through {@code submit}.
+     */
+    public java.util.concurrent.Executor asExecutor() {
+        return this::submit;
+    }
+
     /** Test seam: queue depth, mirroring the gauge. */
     public int queueSize() {
         return pool.getQueue().size();
