@@ -46,7 +46,7 @@ public record CacheProperties(
         if (caches == null) caches = Map.of();
         if (allowedPackages == null) allowedPackages = List.of();
         if (kryo == null) kryo = new Kryo(List.of());
-        if (health == null) health = new Health(Duration.ofMillis(500));
+        if (health == null) health = new Health(Duration.ofSeconds(2));
         if (resilience == null) resilience = new Resilience(null);
         if (startupProbe == null) startupProbe = new StartupProbe(false, null, 1, null);
         if (invalidation == null) invalidation = new Invalidation(false);
@@ -186,8 +186,8 @@ public record CacheProperties(
      * indicator reports the breaker state and the ping as
      * "timeout" rather than waiting on the full Redis call.
      *
-     * <p>Default 1s. Sub-millisecond on a warm Redisson connection in
-     * steady state, so 1s is roughly three orders of magnitude of
+     * <p>Default 2s. Sub-millisecond on a warm Redisson connection in
+     * steady state, so 2s is roughly three orders of magnitude of
      * headroom: enough to absorb GC pauses and scheduler jitter on a
      * loaded JVM (a CI runner mid-suite, a node with co-tenants) without
      * crossing the timeout typical of a Kubernetes liveness probe (which
@@ -200,7 +200,7 @@ public record CacheProperties(
     public record Health(Duration pingTimeout) {
         public Health {
             if (pingTimeout == null || pingTimeout.isZero() || pingTimeout.isNegative()) {
-                pingTimeout = Duration.ofSeconds(1);
+                pingTimeout = Duration.ofSeconds(2);
             }
         }
     }

@@ -200,7 +200,11 @@ class SwrSidecarTest {
         assertThat(secondDone.await(2, TimeUnit.SECONDS)).isTrue();
         assertThat(secondLoaderCalls.get()).isEqualTo(1);
         assertThat(refreshesFailed()).isEqualTo(1);
-        assertThat(refreshesCompleted()).isEqualTo(1);
+        // refreshesCompleted is incremented in the executor lambda after
+        // refreshTask.call() returns, but the loader signals secondDone
+        // before that return. On a loaded runner the assertion can race
+        // ahead of the increment, so poll instead of asserting once.
+        await(() -> refreshesCompleted() == 1);
     }
 
     // -----------------------------------------------------------------------
