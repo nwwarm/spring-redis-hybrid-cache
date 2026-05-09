@@ -1,6 +1,11 @@
 # spring-redis-hybrid-cache
 
 **Multi-layer caching for Spring Boot with cross-node invalidation, stampede protection, and graceful Redis degradation.**
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.nwwarm/hybrid-cache-spring-boot-starter.svg?label=Maven%20Central&color=blue)](https://central.sonatype.com/artifact/io.github.nwwarm/hybrid-cache-spring-boot-starter)
+[![Javadoc](https://javadoc.io/badge2/io.github.nwwarm/hybrid-cache-spring-boot-starter/javadoc.svg)](https://javadoc.io/doc/io.github.nwwarm/hybrid-cache-spring-boot-starter)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+[![Java](https://img.shields.io/badge/Java-17%2B-orange?logo=openjdk&logoColor=white)](https://openjdk.org/)
+[![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.x-6DB33F?logo=springboot&logoColor=white)](https://spring.io/projects/spring-boot)
 
 Drop-in replacement for the typical `@Cacheable` + Redis setup that addresses the failure modes most home-grown solutions miss: stale local copies after remote writes, thundering herds on cold keys, and cascading outages when Redis is slow.
 
