@@ -303,7 +303,12 @@ class RefreshAheadCoordinatorTest {
         assertThat(secondDone.await(2, TimeUnit.SECONDS)).isTrue();
         assertThat(second.get()).isEqualTo(1);
         assertThat(refreshesFailed()).isEqualTo(1);
-        assertThat(refreshesCompleted()).isEqualTo(1);
+        // refreshesCompleted is incremented in the executor task after
+        // refreshTask.call() returns, but the loader counts down
+        // secondDone before that return. The test thread can race past
+        // secondDone.await() to this assertion before the executor
+        // finishes the increment. Poll the same way lines 289-290 do.
+        await(() -> refreshesCompleted() == 1);
     }
 
     @Test
