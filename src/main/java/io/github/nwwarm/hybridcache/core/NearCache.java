@@ -1148,23 +1148,32 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
     @SuppressWarnings("unchecked")
     private <T> CompletableFuture<T> loadAsyncWithSingleFlight(
             Object key, String stringKey, Supplier<CompletableFuture<T>> valueLoader) {
-        CompletableFuture<Object> mine = new CompletableFuture<>();
-        CompletableFuture<Object> theirs = asyncInflight.putIfAbsent(stringKey, mine);
-        if (theirs != null) {
-            return (CompletableFuture<T>) theirs.handle((v, ex) -> {
-                if (ex != null) throw asUncheckedAsyncFailure(key, valueLoader, ex);
-                return v;
-            });
-        }
-
-        Executor hop = refreshExecutorRef != null ? refreshExecutorRef : ForkJoinPool.commonPool();
-        long start = System.nanoTime();
-        return loadCrossNodeAsync(key, stringKey, valueLoader, hop)
-                .handle((value, ex) -> {
-                    try {
+        // computeIfAbsent makes the "is there an in-flight loader, or do
+        // I create one" decision atomic. The previous putIfAbsent shape
+        // could race against a concurrent retrieve whose L2 miss landed
+        // after the first caller's loader had already completed, populated
+        // L1, and removed itself from the registry — that retrieve would
+        // not re-check L1 (the outer retrieve checked it only at entry)
+        // and would start a second loader. Re-checking L1 inside the
+        // atomic remap closes that window: by the time we are here, an
+        // earlier loader may have populated L1, in which case we publish
+        // its already-completed value through the registry instead of
+        // starting fresh. Equivalent to the Mono.cache() pattern in the
+        // reactive shape: subscribers share one resolution, never
+        // re-trigger the work.
+        CompletableFuture<Object> shared = asyncInflight.computeIfAbsent(stringKey, k -> {
+            ValueWrapper warmed = caffeineCache.get(stringKey);
+            if (warmed != null) {
+                return CompletableFuture.completedFuture(warmed.get());
+            }
+            CompletableFuture<Object> mine = new CompletableFuture<>();
+            Executor hop = refreshExecutorRef != null ? refreshExecutorRef : ForkJoinPool.commonPool();
+            long start = System.nanoTime();
+            loadCrossNodeAsync(key, stringKey, valueLoader, hop)
+                    .whenComplete((value, ex) -> {
                         if (ex != null) {
                             mine.completeExceptionally(ex);
-                            throw asUncheckedAsyncFailure(key, valueLoader, ex);
+                            return;
                         }
                         // Populate L1 via the cache layer (NullValue
                         // handling), record sidecar deadline first
@@ -1174,18 +1183,23 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
                         if (loaderEwma != null) {
                             loaderEwma.record(System.nanoTime() - start);
                         }
-                        mine.complete(value);
                         // No publish on cold load — same rule the sync
                         // path follows; see the long comment in
                         // loadWithDistributedLock.
                         invalidationsSuppressedColdLoad.increment();
-                        @SuppressWarnings("unchecked")
-                        T cast = (T) value;
-                        return cast;
-                    } finally {
-                        asyncInflight.remove(stringKey, mine);
-                    }
-                });
+                        mine.complete(value);
+                    });
+            // Free the registry slot only on terminal signal so concurrent
+            // arrivals during the inflight window all get the same future.
+            // Compare-and-remove (remove(k, mine)) so a slot already
+            // replaced by a later compute cycle is not clobbered.
+            mine.whenComplete((v, ex) -> asyncInflight.remove(k, mine));
+            return mine;
+        });
+        return (CompletableFuture<T>) shared.handle((v, ex) -> {
+            if (ex != null) throw asUncheckedAsyncFailure(key, valueLoader, ex);
+            return v;
+        });
     }
 
     private <T> CompletableFuture<Object> loadCrossNodeAsync(
