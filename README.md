@@ -3,6 +3,7 @@
 **Multi-layer caching for Spring Boot with cross-node invalidation, stampede protection, and graceful Redis degradation.**
 
 [![CI](https://github.com/nwwarm/spring-redis-hybrid-cache/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/nwwarm/spring-redis-hybrid-cache/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/nwwarm/spring-redis-hybrid-cache/branch/main/graph/badge.svg)](https://codecov.io/gh/nwwarm/spring-redis-hybrid-cache)
 [![Maven Central](https://img.shields.io/maven-central/v/io.github.nwwarm/hybrid-cache-spring-boot-starter.svg?label=Maven%20Central&color=blue)](https://central.sonatype.com/artifact/io.github.nwwarm/hybrid-cache-spring-boot-starter)
 [![Javadoc](https://javadoc.io/badge2/io.github.nwwarm/hybrid-cache-spring-boot-starter/javadoc.svg)](https://javadoc.io/doc/io.github.nwwarm/hybrid-cache-spring-boot-starter)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
