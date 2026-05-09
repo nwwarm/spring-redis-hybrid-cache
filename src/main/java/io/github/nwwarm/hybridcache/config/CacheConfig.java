@@ -8,6 +8,7 @@ import io.github.nwwarm.hybridcache.core.CircuitBreakerFactory;
 import io.github.nwwarm.hybridcache.core.CodecResolver;
 import io.github.nwwarm.hybridcache.core.HybridCacheManager;
 import io.github.nwwarm.hybridcache.core.KeyLogFormatter;
+import io.github.nwwarm.hybridcache.core.ObjectRootJsonJacksonCodec;
 import io.github.nwwarm.hybridcache.core.ReconciliationCoordinator;
 import io.github.nwwarm.hybridcache.core.RefreshExecutor;
 import io.github.nwwarm.hybridcache.invalidation.InvalidationDispatcher;
@@ -21,7 +22,6 @@ import io.micrometer.core.instrument.MeterRegistry;
 import org.redisson.Redisson;
 import org.redisson.api.RedissonClient;
 import org.redisson.client.RedisException;
-import org.redisson.codec.JsonJacksonCodec;
 import org.redisson.codec.Kryo5Codec;
 import org.redisson.config.Config;
 import org.redisson.config.ReadMode;
@@ -71,7 +71,14 @@ public class CacheConfig {
                         JsonTypeInfo.As.PROPERTY);
 
         Config config = new Config();
-        config.setCodec(new JsonJacksonCodec(mapper));
+        // ObjectRootJsonJacksonCodec, not JsonJacksonCodec: Jackson's NON_FINAL
+        // default typing skips @class for final runtime types (records are
+        // implicitly final), but the decoder reads via Object.class and
+        // requires the tag — asymmetry that surfaces as InvalidTypeIdException
+        // on every L2 GET of a record-typed cache value. Pinning the writer's
+        // static root type to Object via writerFor(Object.class) keeps the
+        // tag on the wire regardless of finality. See §10 (decision log).
+        config.setCodec(new ObjectRootJsonJacksonCodec(mapper));
         applyTopology(config, properties.server());
         config.setLazyInitialization(true);
         return Redisson.create(config);
