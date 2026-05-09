@@ -12,6 +12,16 @@
 [![Property-based tests: jqwik](https://img.shields.io/badge/property--based%20tests-jqwik-blue)](https://jqwik.net/)
 [![Mutation testing: PIT](https://img.shields.io/badge/mutation%20testing-PIT-blueviolet)](https://pitest.org/)
 
+## Documentation
+
+[The Hybrid Cache](https://github.com/nwwarm/spring-redis-hybrid-cache/releases/download/v1.0.0/the-hybrid-cache-v1.0.0.pdf)
+is an 88-page book covering the design of this library: cache fundamentals,
+local and distributed and hybrid caches, why Redis and Spring, the hard
+problems (stampedes, coherence, failure modes), and a tour of the library's
+internals. Worth reading before adopting in production.
+
+## Quick start
+
 Drop-in replacement for the typical `@Cacheable` + Redis setup that addresses the failure modes most home-grown solutions miss: stale local copies after remote writes, thundering herds on cold keys, and cascading outages when Redis is slow.
 
 ```xml
