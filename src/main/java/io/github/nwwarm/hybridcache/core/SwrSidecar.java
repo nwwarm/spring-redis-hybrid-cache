@@ -226,8 +226,13 @@ public final class SwrSidecar {
                 // to be served until physical eviction at stale-until. Log
                 // WARN, increment failure counter, do not rethrow.
                 refreshesFailed.increment();
-                log.warn("SWR refresh failed for cache '{}' key='{}'",
-                        cacheName, key, t);
+                // Cache name is validated at startup, but the user-supplied
+                // key may carry PII; do not interpolate it into the log line
+                // (KeyLogFormatter's purpose). The metric
+                // `cache.swr.refresh.failures{cache}` increments alongside
+                // the exception stacktrace below, which is enough to
+                // correlate per-failure state back to the workload.
+                log.warn("SWR refresh failed for cache '{}'", cacheName, t);
                 mine.completeExceptionally(t);
             } finally {
                 inflight.remove(key, mine);

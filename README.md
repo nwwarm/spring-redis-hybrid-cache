@@ -8,7 +8,7 @@ Drop-in replacement for the typical `@Cacheable` + Redis setup that addresses th
 <dependency>
   <groupId>io.github.nwwarm</groupId>
   <artifactId>hybrid-cache-spring-boot-starter</artifactId>
-  <version>0.4.0</version>
+  <version>1.0.0</version>
 </dependency>
 ```
 
@@ -17,7 +17,7 @@ Drop-in replacement for the typical `@Cacheable` + Redis setup that addresses th
 public Product findById(Long id) { ... }
 ```
 
-That's the entire integration. Existing `@Cacheable` annotations work unchanged; the library plugs in below Spring's cache abstraction.
+That's the entire integration. Existing `@Cacheable` annotations work unchanged; the library plugs in below Spring's cache abstraction. Reactive return types (`Mono<T>`, `Flux<T>`, `CompletableFuture<T>`) work too, see "Reactive and async" below.
 
 ---
 
@@ -32,6 +32,10 @@ These are the operational properties this library commits to. Each is implemente
 | **Graceful degradation during Redis incidents.** Reads degrade to local-cache-only with a circuit breaker; the application stays available. Writes are suppressed; cross-node coherence is bounded by TTL during the incident. | Resilience4j circuit breaker wrapping all L2 operations. Open breaker → L2 calls skipped, application continues serving from L1. |
 | **O(1) cache clears.** `@CacheEvict(allEntries = true)` does not block on keyspace iteration regardless of cache size. | Generation-counter prefix on every key; clear bumps the counter, old keys orphan and reclaim via Redis TTL. |
 | **Per-cache configuration.** TTL, size, codec, and consistency are configured per cache name in YAML, not globally. | `cache.caches.<name>.*` properties, per-name `Caffeine` and Redisson codec. |
+| **Missed-invalidation recovery.** When a pub/sub message is lost, a per-cache reconciliation cycle detects the gap and clears the affected L1 within the configured interval. Bounded staleness without waiting for TTL. | Per-cache `RAtomicLong` sequence counter, `INCR`'d on every successful publish; subscribers compare local observed seq against the canonical reading on a periodic cycle (default 60s). See [Reconciliation](#reconciliation). |
+| **Stale-while-revalidate.** Reads inside the configured fresh window return synchronously; reads inside `[fresh-until, stale-until)` return the stale value and dispatch an async refresh. The slow loader stays out of the read path. | `SwrSidecar` per-key fresh-until deadline plus a shared refresh executor. Per-key in-flight collapse so N concurrent stale reads fire one refresh. See [Stale-while-revalidate](#stale-while-revalidate). |
+| **Refresh-ahead.** Hot keys refresh probabilistically before they stale, so the operator never sees the cliff at `fresh-until`. | XFetch (Vattani et al.) probability function evaluated on every read inside the fresh window, β tunes aggressiveness. Same refresh executor and per-key collapse as SWR. See [Refresh-ahead](#refresh-ahead). |
+| **Reactive and async caching.** `@Cacheable` methods returning `Mono<T>`, `Flux<T>`, or `CompletableFuture<T>` use the same L1, L2, breaker, and single-flight machinery as the synchronous path, without blocking the event loop. | Spring 6.1's `Cache.retrieve(...)` overrides on every tier. L1/L2 chain stays on Redisson's Netty event loop until the loader hop, which lands on the shared refresh executor. See [Reactive and async](#reactive-and-async). |
 
 ---
 
@@ -191,7 +195,7 @@ This is the section that distinguishes a production cache from a demo. Every sce
 <dependency>
   <groupId>io.github.nwwarm</groupId>
   <artifactId>hybrid-cache-spring-boot-starter</artifactId>
-  <version>0.4.0</version>
+  <version>1.0.0</version>
 </dependency>
 ```
 
@@ -319,6 +323,83 @@ Tier is selected per cache name in `application.yml`. Application code is unchan
 
 ---
 
+## Reconciliation
+
+Pub/sub is at-most-once: a subscriber that drops a message serves stale entries until L1 TTL. Reconciliation closes that gap by detecting the drop and clearing the affected L1 within a configured interval. The cost is one extra Redis `GET` per cache per cycle.
+
+```yaml
+cache:
+  caches:
+    products:
+      reconciliation:
+        enabled: true        # default false
+        interval: 60s        # default 60s
+        miss-tolerance: 5    # default 5
+```
+
+What this buys: a missed invalidation message no longer waits for TTL. The receiving node detects `redisSeq − lastObservedSeq > miss-tolerance` on the next cycle and runs a local recovery (`caffeineCache.clear()` on `NearCache`, generation-pointer refresh on `DistributedOnlyCache`). Reconciliation is repair mode, not the first line of defence: pub/sub still carries every healthy invalidation. The metric `cache.reconciliation.misses{cache}` increments once per detected gap; if it climbs in steady state, look at pub/sub or the network before tightening the tolerance.
+
+---
+
+## Stale-while-revalidate
+
+Reads inside `[write, write + fresh-for)` return synchronously with no extra work. Reads inside `[write + fresh-for, write + stale-for)` return the stale value immediately and dispatch an async refresh on the shared refresh executor. Reads past `stale-for` see physical L1 eviction and reload through the normal path.
+
+```yaml
+cache:
+  caches:
+    catalog:
+      ttl: 1h                # acts as stale-for ceiling
+      swr:
+        fresh-for: 30s       # synchronous, no refresh
+        stale-for: 5m        # serve stale, dispatch refresh
+```
+
+The slow loader stays out of the read path inside the stale window. Per-key in-flight collapse means N concurrent stale reads on the same key dispatch one refresh, not N. Refresh failures keep the stale value visible for the rest of the stale window; physical eviction at `stale-for` is the backstop. SWR is rejected at startup on `tier=DISTRIBUTED_ONLY` (no L1 to apply it to).
+
+---
+
+## Refresh-ahead
+
+Refresh-ahead is a mode of SWR: the same async refresh pipeline, the same per-key collapse, the same executor. The difference is the trigger. RA evaluates an XFetch (Vattani et al.) probability function on every read inside the fresh window; hotter keys access more often, get more dice rolls, and refresh probabilistically before they stale. The operator never sees the cliff at `fresh-until`.
+
+```yaml
+cache:
+  caches:
+    catalog:
+      ttl: 1h
+      swr:
+        fresh-for: 30s
+        stale-for: 5m
+      refresh-ahead:
+        enabled: true        # default false
+        beta: 1.0            # XFetch β; default 1.0 matches the paper
+```
+
+`refresh-ahead.enabled=true` requires `swr.fresh-for` and `swr.stale-for` configured; the validator rejects RA-without-SWR at startup. Higher β fires earlier (more aggressive). Track `cache.refresh.ahead.fires{cache}` to confirm RA is firing as expected.
+
+---
+
+## Reactive and async
+
+`@Cacheable` methods returning `Mono<T>`, `Flux<T>`, or `CompletableFuture<T>` use the same L1, L2, breaker, and single-flight machinery as the synchronous path. The library does not block the event loop: L1 and L2 reads chain through Redisson's async API and stay on its Netty event loop until the loader hop, which lands on the shared refresh executor (sized via `cache.refresh.scheduler-pool-size`, default 4).
+
+```java
+@Cacheable("products")
+public Mono<Product> findById(Long id) {
+  return repository.findById(id);
+}
+
+@Cacheable("orders")
+public CompletableFuture<Order> findOrder(Long id) {
+  return orderClient.fetchAsync(id);
+}
+```
+
+The synchronous path is unchanged. There are no async-specific YAML knobs: the path activates implicitly when Spring's `CacheInterceptor` calls `Cache.retrieve(...)` because the method has a reactive return type. `Flux<T>` cache values are materialized to a list before storage by Spring's `ReactiveAdapterRegistry`, so the per-cache value-size constraint applies to the materialized list. Large `Flux` results push past the ~100 KB design constraint and likely should not be cached as the materialized form at all.
+
+---
+
 ## Performance characteristics
 
 This library has not been formally benchmarked in production conditions and the README will not invent numbers. What can be said honestly:
@@ -351,6 +432,17 @@ The library exposes the following Micrometer metrics, tagged by cache name:
 | `cache.invalidations.suppressed.cold_load{cache}` | counter | Cold-load completions that intentionally did not publish (peer L1 has nothing stale to drop). Different question from the publish/receive pair — leaves the publish path quieter than naive write-through would. |
 | `resilience4j.circuitbreaker.state{name=redis-cache}` | gauge | Breaker state. 0=closed, 1=half-open, 2=open. |
 | `cache.size{cache}` | gauge | Current Caffeine entry count. |
+| `cache.reconciliation.cycles{cache}` | counter | Periodic reconciliation cycles invoked, regardless of outcome. Pair with `misses` to compute miss rate. |
+| `cache.reconciliation.misses{cache}` | counter | Cycles that declared a miss (`redisSeq − lastObservedSeq > tolerance`); each increment corresponds to one local recovery action. |
+| `cache.reconciliation.skipped{cache, reason=breaker_open\|exception}` | counter | Cycles skipped because Redis was unhealthy (breaker open) or threw unexpectedly. Tagged so dashboards distinguish the two. |
+| `cache.reconciliation.seq.regressions{cache}` | counter | Cycles where `redisSeq < lastObservedSeq`. Almost always operator-driven (`DEL`, `FLUSHALL`); WARN log once per event. |
+| `cache.swr.refreshes{cache, status=started\|completed\|failed\|suppressed_breaker_open}` | counter | SWR async refresh dispatches grouped by outcome. Breaker-open suppression is a separate status from failure so dashboards distinguishing "Redis incident" from "loader bug" stay honest. |
+| `cache.swr.refreshes.skipped{cache, reason=in_flight}` | counter | Stale reads that found an in-flight refresh and did not dispatch a duplicate. Confirms the per-key collapse is firing. |
+| `cache.swr.stale_returns{cache}` | counter | Reads that returned a stale value (and dispatched an SWR refresh, except when suppressed). |
+| `cache.refresh.ahead.fires{cache}` | counter | Reads inside the fresh window where the XFetch predicate returned true and a refresh was dispatched. |
+| `cache.refresh.ahead.failures{cache}` | counter | Failed RA refreshes; kept distinct from SWR's failure counter because the trigger is different. |
+| `cache.refresh.queue.size` | gauge | Current depth of the shared refresh executor's work queue. Sustained non-zero means the executor is undersized. |
+| `cache.refresh.executor.active` | gauge | Currently-running refresh tasks across SWR, RA, and the async loader hop. |
 
 ### Alerts
 
@@ -373,24 +465,22 @@ histogram_quantile(0.99, rate(cache_l2_get_latency_seconds_bucket[5m])) > 0.1
 
 ### Health
 
-The library registers a Spring Boot Actuator `HealthIndicator` named `hybridCache` when Actuator is on the classpath. `/actuator/health` reports the operational state of the L2 path:
+The library registers a Spring Boot Actuator `HealthIndicator` named `hybridCache` when Actuator is on the classpath. `/actuator/health` reports the operational state of the L2 path, derived from the per-cache circuit breaker states and the L1 hit/miss counters that the cache hot path already maintains. The indicator does not issue a separate Redis command; the production path is reaching Redis on every miss and write, so a separate probe would only add a second code path that can fail in ways the production path does not (and would pollute the breaker stats it claims to monitor).
 
-| Breaker state | Redis ping | Reported status |
+| Breaker state | Cache activity | Reported status |
 |---|---|---|
-| `CLOSED` | success | `UP` |
-| `CLOSED` | timeout/unreachable | `DOWN` |
-| `OPEN` / `FORCED_OPEN` | (any) | `OUT_OF_SERVICE` |
-| `HALF_OPEN` | (any) | `UNKNOWN` |
+| All `CLOSED` / `METRICS_ONLY` / `DISABLED` | Any cache has executed a Redis call | `UP` |
+| All `CLOSED` etc. | No cache traffic yet, Redisson client alive | `UP` |
+| All `CLOSED` etc. | No cache traffic, Redisson client shut down | `DOWN` |
+| Any `OPEN` / `FORCED_OPEN` | (any) | `OUT_OF_SERVICE` |
+| Any `HALF_OPEN` | (any) | `UNKNOWN` |
 
 Details include:
 
-- `breakerState`, `breakerFailureRate`, `breakerSlowCallRate`
-- `redisPing` (`ok`, `timeout after Nms`, or `unreachable: <message>`) and `redisPingMs` when reachable
-- `caches.<name>` map with per-cache `size`, `hitCount`, `missCount`, `hitRate` from the underlying Caffeine when present
+- `redisStatus` summarising the derived reachability: `reachable via active caches`, `no cache activity; redisson client alive`, `degraded; see caches.*.breakerState`, or `redisson client shut down`
+- `caches.<name>` map with per-cache `breakerState`, `breakerFailureRate`, `breakerSlowCallRate`, plus `size`, `hitCount`, `missCount`, `hitRate` from the underlying Caffeine when present
 
-The Redis ping is a single async `EXISTS` against a sentinel key, bounded by `cache.health.ping-timeout` (default `500ms`). The endpoint never blocks longer than the timeout — `/actuator/health` stays responsive during a Redis incident, which matters because Kubernetes liveness probes and load balancers hit it.
-
-Useful for Kubernetes readiness probes and monitoring tool health checks.
+`/actuator/health` does not block on Redis: the indicator only reads in-process bookkeeping. Suitable for Kubernetes readiness and liveness probes.
 
 ### Logging
 
@@ -403,6 +493,26 @@ Notable log lines and their operational meaning:
 | `WARN  L2 evict failed for key '...'; cross-node coherence not guaranteed until TTL` | An evict couldn't reach L2. The `NearCache` suppresses the cross-node invalidation message in this case (see Failure behavior, "L2 delete fails"); remote nodes' L1 entries serve their stale value until the TTL expires. |
 | `WARN  Generation bump failed; clear visible only locally` | A `clear()` couldn't update Redis. Other nodes won't see the clear until their generation refreshes (which won't help if Redis is down). |
 | `INFO  Polymorphic type validator restricted to packages: [...]` | At startup, confirms the security validator is configured. |
+
+### Redis ACL
+
+The library issues the following Redis commands. A least-privilege Redis ACL for the cache user covers exactly this set:
+
+| Command | When | Required for |
+|---|---|---|
+| `GET` | L2 read (`RBucket.get`) | every tier except `LOCAL_ONLY` |
+| `SET` (with `PX`) | L2 write (`RBucket.set` with TTL) | every tier except `LOCAL_ONLY` |
+| `DEL` | L2 evict (`RBucket.delete`) | every tier except `LOCAL_ONLY` |
+| `EXISTS` | optional startup probe (`cache.startup-probe.enabled=true`) | only when the probe is enabled |
+| `INCR` | generation counter on `clear()`; reconciliation seq counter on every successful publish | always (generation); only when `reconciliation.enabled=true` (seq) |
+| `PUBLISH` | invalidation pub/sub (default) | `NEAR_CACHE` and `DISTRIBUTED_ONLY` |
+| `SUBSCRIBE` | invalidation pub/sub listener | `NEAR_CACHE` and `DISTRIBUTED_ONLY` |
+| `SPUBLISH` / `SSUBSCRIBE` | sharded pub/sub when `cache.invalidation.sharded-pubsub=true` | optional, Cluster + Redis 7.0+ only |
+| `SCAN`, `UNLINK` | `clearImmediate()` eager-clear (`RKeys.unlinkByPattern`) | only when application code calls `clearImmediate()` |
+| `EVAL`, `EVALSHA` | Redisson's `RLock` and `RAtomicLong` use Lua scripts | every tier except `LOCAL_ONLY` |
+| `CLIENT SETNAME`, `CLUSTER NODES`, `INFO`, `PING` | Redisson's connection bookkeeping | every tier except `LOCAL_ONLY` |
+
+Redisson uses `EVAL` for atomic primitives (lock acquire/release, atomic-long increment with watchdog renewal). Operators on Redis 6+ ACL-restricted setups should grant `+@read +@write +@scripting +@pubsub +@connection` to the cache user as the minimum, plus `+@cluster` if running on Cluster.
 
 ---
 
@@ -419,7 +529,7 @@ Notable log lines and their operational meaning:
 | `cache.node-id` | random UUID | Identifies this JVM in invalidation messages. Set explicitly to correlate with logs. |
 | `cache.allowed-packages` | (required for default JSON codec) | Package prefixes allowed for Jackson polymorphic deserialization. Each entry must end with `.` or be a fully-qualified class name. Empty value fails startup. See Security. |
 | `cache.kryo.registered-classes` | `[]` | Fully-qualified class names registered with the Kryo codec. Required (non-empty) when any cache uses `codec: KRYO`. Order matters — appending is safe, reordering breaks the wire format. See Security. |
-| `cache.health.ping-timeout` | `500ms` | Bounds the Redis ping issued by the Actuator health indicator. `/actuator/health` returns within this window even if Redis is unreachable. |
+| `cache.health.ping-timeout` | `2s` | Retained for backward compatibility. The 1.0.0 indicator no longer issues a separate Redis ping (it derives reachability from the breaker states and L1 counters the cache hot path already maintains), so the value is ignored. The property and the deprecated four-argument indicator constructor are retained so existing wiring continues to compile. |
 | `cache.startup-probe.enabled` | `false` | Optional fail-fast Redis reachability probe at application startup. Default behaviour stays "boot lazily and surface failures via the breaker" — the probe is for environments where fail-to-boot is preferred over boot-and-then-500. Skipped automatically when every configured cache is `tier=LOCAL_ONLY` (Redis isn't on the request path). |
 | `cache.startup-probe.timeout` | `5s` | Per-attempt timeout. Total bound on probe time is `(retries + 1) * timeout + retries * retry-delay`. |
 | `cache.startup-probe.retries` | `1` | Additional attempts after the first failure (so two attempts total by default). `0` is valid — single attempt. |
@@ -460,8 +570,6 @@ The library produces three kinds of Redis key per logical cache entry:
 | gen | `<cache>:generation` | `products:generation` |
 
 The `{...}` is a Redis Cluster hash tag — Cluster routes by the substring inside it. So value and lock for the same logical `(cache, key)` collocate on one shard, while different keys distribute across shards normally. The generation counter sits outside the tag (per-cache, intentionally not collocated with each key).
-
-**Upgrading from 0.2.0:** the key format changed. 0.3.0 will not see entries written by 0.2.0; entries lazily reload — acceptable for a cache, but plan for a brief cold-start period after the upgrade. Lock keys also changed, so during a rolling deploy 0.2.0 and 0.3.0 nodes cannot coordinate single-flight on the same key. See [`CHANGELOG.md`](CHANGELOG.md) for full migration guidance.
 
 ## Multi-tenancy
 
@@ -605,123 +713,111 @@ io.github.nwwarm.hybridcache
 
 ## Production deployment checklist
 
-The artefact a new operator follows end to end before a 0.5.0+ deploy.
+The artefact a new operator follows end to end before a 1.0.0 deploy.
 Every item maps to a specific configuration knob, metric, or runbook
 step elsewhere in this README; this checklist is the integration view.
 
 ### Redis topology
 
 - [ ] Pick the `cache.server.mode` for your environment (`SINGLE`,
-      `CLUSTER`, `SENTINEL`). Defaults to `SINGLE`. See "Deployment
-      topologies" above.
+  `CLUSTER`, `SENTINEL`). Defaults to `SINGLE`. See "Deployment
+  topologies" above.
 - [ ] For `CLUSTER`: list at least one master per shard in
-      `cache.server.addresses`; Redisson discovers replicas. Confirm
-      `cache.server.scan-interval` (default `2000ms`) matches your
-      shard-failover tolerance.
+  `cache.server.addresses`; Redisson discovers replicas. Confirm
+  `cache.server.scan-interval` (default `2000ms`) matches your
+  shard-failover tolerance.
 - [ ] For `SENTINEL`: list Sentinel addresses (not data nodes) in
-      `cache.server.addresses`; set `master-name` to match the
-      `sentinel monitor` configuration on the Sentinels.
+  `cache.server.addresses`; set `master-name` to match the
+  `sentinel monitor` configuration on the Sentinels.
 - [ ] Set `cache.server.password` via environment variable
-      (`${REDIS_PASSWORD:}`). Never commit literals.
+  (`${REDIS_PASSWORD:}`). Never commit literals.
 - [ ] If you are on Redis 7.0+ and a Cluster deployment with high
-      invalidation rates, evaluate `cache.invalidation.sharded-pubsub=true`.
+  invalidation rates, evaluate `cache.invalidation.sharded-pubsub=true`.
 
 ### Memory sizing
 
 - [ ] Estimate working-set entries × per-entry size. Caffeine overhead
-      is ~96 bytes per entry plus key + value sizes. The `maximum-size`
-      per cache caps entries; total heap from caches = sum of (
-      `maximum-size × per-entry`).
+  is a few hundred bytes per entry plus key and value sizes.
+  `maximum-size` per cache caps entries; total heap from caches is
+  the sum of (`maximum-size × per-entry`) across caches.
 - [ ] L2 memory is a Redis sizing question; a healthy headroom is
-      working-set × 1.5 to absorb generation-counter orphan keys
-      (TTL'd; `clearImmediate()` reclaims eagerly if frequent
-      `@CacheEvict(allEntries=true)` is in play).
+  working-set × 1.5 to absorb generation-counter orphan keys
+  (TTL'd; `clearImmediate()` reclaims eagerly if frequent
+  `@CacheEvict(allEntries=true)` is in play).
 - [ ] Confirm Redis `maxmemory-policy` is `noeviction` or
-      `allkeys-lru` per your tolerance for evictions on memory
-      pressure. The library does not assume either, but `noeviction`
-      surfaces memory pressure as `OOMCommandNotAllowed` errors that
-      trip the breaker, while `allkeys-lru` silently drops cache
-      entries.
+  `allkeys-lru` per your tolerance for evictions on memory
+  pressure. The library does not assume either, but `noeviction`
+  surfaces memory pressure as `OOMCommandNotAllowed` errors that
+  trip the breaker, while `allkeys-lru` silently drops cache
+  entries.
 
 ### Breaker tuning
 
 - [ ] Default thresholds are documented in "Configuration reference"
-      above. They are sane for most workloads.
+  above. They are sane for most workloads.
 - [ ] If your loader can take >500ms legitimately, raise
-      `slow-call-duration-threshold` to avoid false-positive trips.
-      Set it once at the global level
-      (`resilience4j.circuitbreaker.instances.redis-cache.*`) or
-      per-cache via `cache.caches.<name>.circuit-breaker.*`.
+  `slow-call-duration-threshold` to avoid false-positive trips.
+  Set it once at the global level
+  (`resilience4j.circuitbreaker.instances.redis-cache.*`) or
+  per-cache via `cache.caches.<name>.circuit-breaker.*`.
 - [ ] Confirm `wait-duration-in-open-state` (default 30s) matches
-      your incident-recovery expectation. Sentinel deployments that
-      take >30s to fail over should raise this so the breaker
-      doesn't half-open before Redis is genuinely back.
+  your incident-recovery expectation. Sentinel deployments that
+  take >30s to fail over should raise this so the breaker
+  doesn't half-open before Redis is genuinely back.
 
 ### Reconciliation
 
 - [ ] Enable per-cache via `cache.caches.<name>.reconciliation.enabled=true`
-      for any cache where missed-invalidation staleness up to TTL is
-      unacceptable. Default is `false`.
+  for any cache where missed-invalidation staleness up to TTL is
+  unacceptable. Default is `false`.
 - [ ] Default `interval=60s` matches Hazelcast's default. Tune down
-      for high-criticality caches (cost: one extra GET per cache per
-      cycle).
+  for high-criticality caches (cost: one extra GET per cache per
+  cycle).
 - [ ] Default `miss-tolerance=5` accommodates legitimate in-flight
-      bursts. Tune up if `cache.reconciliation.misses` increments
-      under healthy traffic; tune down if you want faster detection.
+  bursts. Tune up if `cache.reconciliation.misses` increments
+  under healthy traffic; tune down if you want faster detection.
 - [ ] Track `cache.reconciliation.cycles` / `misses` / `skipped` /
-      `seq.regressions` on your dashboards. The "stuck open" or
-      "regression spam" patterns surface here first.
+  `seq.regressions` on your dashboards. The "stuck open" or
+  "regression spam" patterns surface here first.
 
 ### SWR / Refresh-ahead
 
 - [ ] SWR is opt-in per cache via `swr.fresh-for` / `swr.stale-for`.
-      Operator-meaningful values: `fresh-for` ≈ acceptable freshness
-      window; `stale-for` ≈ TTL.
+  Operator-meaningful values: `fresh-for` ≈ acceptable freshness
+  window; `stale-for` ≈ TTL.
 - [ ] RA (`refresh-ahead.enabled=true`, requires SWR configured) is
-      probabilistic — track `cache.refresh.ahead.fires` to confirm
-      it's firing as you expect. β default `1.0` matches the XFetch
-      paper's recommendation.
+  probabilistic, track `cache.refresh.ahead.fires` to confirm
+  it's firing as you expect. β default `1.0` matches the XFetch
+  paper's recommendation.
 - [ ] Size the refresh executor via `cache.refresh.scheduler-pool-size`
-      (default 4). Watch `cache.refresh.queue.size` — sustained
-      non-zero means undersized.
+  (default 4). Watch `cache.refresh.queue.size`, sustained
+  non-zero means undersized.
 
-### JVM flags for the async path
+### Reactive applications
 
-- [ ] Async `Cache.retrieve(...)` runs continuations on Redisson's
-      Netty event loop (until the loader hop). Standard Spring Boot
-      JVM flags apply; no additional flags required for correctness.
-- [ ] In test environments using BlockHound (the
-      `AsyncBlockHoundIT` regression guard), surefire/failsafe
-      requires `-XX:+AllowRedefinitionToAddDeleteMethods` (already in
-      `pom.xml`). Production runtimes do not need this flag.
-- [ ] Reactive applications: confirm Spring's `CacheInterceptor`
-      detects your reactive return type (`Mono`/`Flux`). The library
-      adapts via `ReactiveAdapterRegistry` upstream — your code
-      should not need to change.
+- [ ] Reactive return types (`Mono`, `Flux`) are detected automatically
+  by Spring's `CacheInterceptor`. No configuration change required.
 
 ### Observability before traffic
 
 - [ ] `/actuator/health` reports the operational state of the L2
-      path. Wire it as the Kubernetes readiness probe.
+  path. Wire it as the Kubernetes readiness probe.
 - [ ] Confirm your Prometheus / Datadog scrape picks up
-      `cache.gets`, `cache.l2.gets`, `cache.l2.failures`,
-      `cache.l2.breaker.open`, `resilience4j.circuitbreaker.state`.
-      The example alert rules under "Alerts" above are the
-      starter set.
+  `cache.gets`, `cache.l2.gets`, `cache.l2.failures`,
+  `cache.l2.breaker.open`, `resilience4j.circuitbreaker.state`.
+  The example alert rules under "Alerts" above are the
+  starter set.
 - [ ] `cache.invalidations.published` and `cache.invalidations.received`
-      should track ~1:N (one published per N receivers). Drift here
-      points to a deployment-config mismatch — the `received.unknown`
-      counter is the canary.
+  should track ~1:N (one published per N receivers). Drift here
+  points to a deployment-config mismatch, the `received.unknown`
+  counter is the canary.
 
 ### Pre-deployment validation
 
-- [ ] Run `mvn verify` locally; the suite includes the topology
-      integration tests against Testcontainers.
-- [ ] If you are upgrading from 0.4.x: the migration table in
-      `CHANGELOG.md` lists every property and behavioural change
-      between 0.4.x and 0.5.0. SWR / RA / reconciliation / async are
-      all opt-in; existing 0.4.x configurations continue to work
-      byte-identical.
+- [ ] Run your application's integration tests against the target
+  Redis topology before promoting. The library's own topology
+  tests assume Testcontainers; your application's tests should
+  assert the cache behaviour your service depends on.
 
 ## License
 

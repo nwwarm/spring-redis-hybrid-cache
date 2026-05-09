@@ -26,7 +26,7 @@
 
     <groupId>io.github.nwwarm</groupId>
     <artifactId>cache-soak</artifactId>
-    <version>0.5.0-SNAPSHOT</version>
+    <version>1.0.0</version>
     <packaging>jar</packaging>
     <name>cache-soak</name>
     <description>WebFlux smoke app + 24h soak harness for hybrid-cache-spring-boot-starter.</description>
@@ -34,7 +34,7 @@
     <properties>
         <java.version>17</java.version>
         <springboot.version>3.5.14</springboot.version>
-        <hybrid.cache.version>0.5.0-SNAPSHOT</hybrid.cache.version>
+        <hybrid.cache.version>1.0.0</hybrid.cache.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 

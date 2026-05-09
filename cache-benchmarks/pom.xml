@@ -22,7 +22,7 @@
 
     <groupId>io.github.nwwarm</groupId>
     <artifactId>cache-benchmarks</artifactId>
-    <version>0.5.0-SNAPSHOT</version>
+    <version>1.0.0</version>
     <packaging>jar</packaging>
     <name>cache-benchmarks</name>
     <description>JMH microbenchmarks for hybrid-cache-spring-boot-starter. Not published to Central.</description>
@@ -30,7 +30,7 @@
     <properties>
         <java.version>17</java.version>
         <jmh.version>1.37</jmh.version>
-        <hybrid.cache.version>0.5.0-SNAPSHOT</hybrid.cache.version>
+        <hybrid.cache.version>1.0.0</hybrid.cache.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 

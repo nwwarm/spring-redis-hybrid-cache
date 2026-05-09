@@ -231,8 +231,11 @@ public final class RefreshAheadCoordinator {
                 // SWR refresh failures explicitly applies "same rule to
                 // RA failures."
                 refreshesFailed.increment();
-                log.warn("RA refresh failed for cache '{}' key='{}'",
-                        cacheName, key, t);
+                // See SwrSidecar's matching log site: the cache name is
+                // validated, but the key may carry PII so it does not
+                // appear in the message. The metric and stacktrace below
+                // carry the diagnostic load.
+                log.warn("RA refresh failed for cache '{}'", cacheName, t);
                 mine.completeExceptionally(t);
             } finally {
                 inflight.remove(key, mine);
