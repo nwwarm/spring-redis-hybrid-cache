@@ -48,10 +48,11 @@ import java.util.concurrent.TimeoutException;
  * separately.
  *
  * <p>The Redis ping is a single asynchronous {@code EXISTS} on a sentinel
- * key, bounded by the configured timeout (default 500ms). The timeout
- * matters: {@code /actuator/health} is hit by Kubernetes liveness probes,
- * load balancers, and dashboards — it must not block on a Redis incident
- * for tens of seconds. If the ping doesn't return inside the timeout, the
+ * key, bounded by the configured timeout (default 1s, see
+ * {@code CacheProperties.Health}). The timeout matters:
+ * {@code /actuator/health} is hit by Kubernetes liveness probes, load
+ * balancers, and dashboards — it must not block on a Redis incident for
+ * tens of seconds. If the ping doesn't return inside the timeout, the
  * indicator reports the breaker state and {@code redisPingMs="timeout"}.
  */
 public class HybridCacheHealthIndicator implements HealthIndicator {

@@ -185,11 +185,22 @@ public record CacheProperties(
      * incident — if the ping doesn't return within the timeout, the
      * indicator reports the breaker state and the ping as
      * "timeout" rather than waiting on the full Redis call.
+     *
+     * <p>Default 1s. Sub-millisecond on a warm Redisson connection in
+     * steady state, so 1s is roughly three orders of magnitude of
+     * headroom: enough to absorb GC pauses and scheduler jitter on a
+     * loaded JVM (a CI runner mid-suite, a node with co-tenants) without
+     * crossing the timeout typical of a Kubernetes liveness probe (which
+     * is the indicator's real production caller, and runs on multi-second
+     * budgets). Operators wanting a tighter signal can drop this; the
+     * 500ms default that shipped in 0.2.0 was tight enough that a normal
+     * loaded-JVM stall could trip it and report L2 as broken when it
+     * wasn't.
      */
     public record Health(Duration pingTimeout) {
         public Health {
             if (pingTimeout == null || pingTimeout.isZero() || pingTimeout.isNegative()) {
-                pingTimeout = Duration.ofMillis(500);
+                pingTimeout = Duration.ofSeconds(1);
             }
         }
     }

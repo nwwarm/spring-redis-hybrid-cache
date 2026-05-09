@@ -51,7 +51,15 @@ class HealthIndicatorIT extends EndToEndTestBase {
         productService.findById(1L);
 
         Health health = healthIndicator.health();
-        assertThat(health.getStatus()).isEqualTo(Status.UP);
+        // Surface the indicator's own details map on failure: the only DOWN
+        // path is "all breakers nominally CLOSED but Redis ping failed", and
+        // when this assertion fires on CI without the details it is
+        // impossible to tell whether the breaker tripped, the ping timed
+        // out, or the ping threw. Cheap to include and self-diagnoses
+        // future flakes.
+        assertThat(health.getStatus())
+                .as("health.getDetails()=%s", health.getDetails())
+                .isEqualTo(Status.UP);
         assertThat(health.getDetails())
                 .containsKeys("redisPing", "redisPingMs", "caches");
         assertThat(health.getDetails().get("redisPing")).isEqualTo("ok");
