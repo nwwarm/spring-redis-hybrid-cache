@@ -160,7 +160,7 @@ class LocalOnlyCacheAsyncTest {
     }
 
     @Test
-    void retrieveWithLoader_loaderRejected_failsWithLoaderRejectedExceptionUnwrapped() {
+    void retrieveWithLoader_loaderRejected_failsWithLoaderRejectedExceptionUnwrapped() throws Exception {
         // max-concurrent-loaders=1, acquire-timeout=50ms. Two DIFFERENT
         // keys so per-key single-flight doesn't collapse them — first
         // caller holds the only permit forever; second caller's acquire
@@ -168,8 +168,23 @@ class LocalOnlyCacheAsyncTest {
         // item 3 of async section).
         LocalOnlyCache cache = build(1, Duration.ofMillis(50));
         CompletableFuture<String> first = new CompletableFuture<>();
-        cache.retrieve("k1", () -> first);
-        // Wait for first to occupy the gate's only permit.
+        // Synchronize on the loader entering the gate. The supplier is
+        // invoked inside AsyncLoaderGate.runWithRelease *after* the only
+        // permit is acquired, so countDown here marks the permit as held.
+        // Without this latch the two retrieves race on refreshExecutor's
+        // worker pool; on a slow CI runner k2's worker can reach
+        // tryAcquire before k1's, take the only permit, run the
+        // "never-runs" loader, and complete `rejected` normally with
+        // "never-runs" — the test then sees `thrown=null` and fails at
+        // the isNotNull assertion below.
+        CountDownLatch firstLoaderEntered = new CountDownLatch(1);
+        cache.retrieve("k1", () -> {
+            firstLoaderEntered.countDown();
+            return first;
+        });
+        assertThat(firstLoaderEntered.await(2, TimeUnit.SECONDS))
+                .as("first retrieve must occupy the gate's only permit before k2 fires")
+                .isTrue();
         CompletableFuture<String> rejected = cache.retrieve("k2",
                 () -> CompletableFuture.completedFuture("never-runs"));
         // The async-path exception wraps in CompletionException for
