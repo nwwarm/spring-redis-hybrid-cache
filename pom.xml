@@ -364,7 +364,7 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.5.4</version>
                 <configuration>
-                    <argLine>-XX:+AllowRedefinitionToAddDeleteMethods</argLine>
+                    <argLine>@{argLine} -XX:+AllowRedefinitionToAddDeleteMethods</argLine>
                 </configuration>
             </plugin>
             <plugin>
@@ -372,7 +372,7 @@
                 <artifactId>maven-failsafe-plugin</artifactId>
                 <version>3.5.5</version>
                 <configuration>
-                    <argLine>-XX:+AllowRedefinitionToAddDeleteMethods</argLine>
+                    <argLine>@{argLine} -XX:+AllowRedefinitionToAddDeleteMethods</argLine>
                     <!--
                       Default `mvn verify` excludes JUnit-tagged
                       categories that gate behind opt-in profiles.
@@ -530,8 +530,14 @@
                         </goals>
                     </execution>
                     <execution>
+                        <id>prepare-agent-integration</id>
+                        <goals>
+                            <goal>prepare-agent-integration</goal>
+                        </goals>
+                    </execution>
+                    <execution>
                         <id>report</id>
-                        <phase>test</phase>
+                        <phase>verify</phase>
                         <goals>
                             <goal>report</goal>
                         </goals>
