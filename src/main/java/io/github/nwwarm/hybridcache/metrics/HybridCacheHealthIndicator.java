@@ -6,8 +6,6 @@ import io.github.nwwarm.hybridcache.core.HybridCacheManager;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import org.redisson.api.RedissonClient;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.boot.actuate.health.Health;
 import org.springframework.boot.actuate.health.HealthIndicator;
 import org.springframework.boot.actuate.health.Status;
@@ -17,15 +15,14 @@ import java.time.Duration;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
 /**
  * Spring Boot Actuator {@link HealthIndicator} for the hybrid cache.
  *
  * <p>Reports the operational state of the L2 path: per-cache circuit breaker
- * state (one entry per cache name), Redis reachability, and a per-cache
- * snapshot of L1 stats.
+ * state (one entry per cache name) and a per-cache snapshot of L1 stats.
+ * Redis reachability is <em>derived</em> from those signals rather than
+ * probed by a separate command. See "Why no ping?" below.
  *
  * <h2>Status mapping</h2>
  *
@@ -35,11 +32,12 @@ import java.util.concurrent.TimeoutException;
  *   <li>Any breaker {@code OPEN} or {@code FORCED_OPEN} → {@link Status#OUT_OF_SERVICE}.</li>
  *   <li>Else any breaker {@code HALF_OPEN} → {@link Status#UNKNOWN}.</li>
  *   <li>Else all breakers {@code CLOSED}/{@code METRICS_ONLY}/{@code DISABLED}
- *       and Redis ping success → {@link Status#UP}.</li>
- *   <li>All breakers nominally CLOSED but Redis ping fails →
- *       {@link Status#DOWN}. Either Redis is briefly unavailable but no
- *       breaker has tripped yet, or the connection is too slow to complete
- *       inside the configured ping timeout.</li>
+ *       and either at least one cache has executed Redis calls
+ *       successfully or the {@link RedissonClient} is alive →
+ *       {@link Status#UP}.</li>
+ *   <li>All breakers nominally CLOSED, no cache has touched Redis yet,
+ *       and the Redisson client is shut down or shutting down →
+ *       {@link Status#DOWN}.</li>
  * </ul>
  *
  * <p>Each cache also reports its own breaker state under
@@ -47,32 +45,66 @@ import java.util.concurrent.TimeoutException;
  * caches have lost L2 access without having to inspect every breaker
  * separately.
  *
- * <p>The Redis ping is a single asynchronous {@code EXISTS} on a sentinel
- * key, bounded by the configured timeout (default 2s, see
- * {@code CacheProperties.Health}). The timeout matters:
- * {@code /actuator/health} is hit by Kubernetes liveness probes, load
- * balancers, and dashboards — it must not block on a Redis incident for
- * tens of seconds. If the ping doesn't return inside the timeout, the
- * indicator reports the breaker state and {@code redisPingMs="timeout"}.
+ * <h2>Why no ping?</h2>
+ *
+ * <p>The 0.2.0 implementation issued a separate {@code EXISTS} on a
+ * sentinel key with a configurable timeout. Three problems with that:
+ * <ul>
+ *   <li>Redundant. The cache hot path is reaching Redis on every miss
+ *       and every write; if it works, Redis works. A second probe code
+ *       path can fail in ways the production path does not (different
+ *       connection pool semantics, different command, different
+ *       event-loop scheduling) and tells operators nothing the
+ *       production path is not already telling them.</li>
+ *   <li>Pollutes the breaker. {@code /actuator/health} is hit on every
+ *       liveness probe interval (Kubernetes, dashboards, load
+ *       balancers); each probe ran an extra Redis command through the
+ *       same connection pool, and a slow probe registered as a slow
+ *       call against the per-cache breaker, inflating the very
+ *       {@code breakerSlowCallRate} the indicator was reporting.</li>
+ *   <li>Flaky. Event-loop contention from co-located tests or a busy
+ *       JVM could push the EXISTS over the configured timeout while
+ *       Redis itself was responding in well under a millisecond,
+ *       producing {@code DOWN} in CI for a system that was actually
+ *       healthy.</li>
+ * </ul>
+ *
+ * <p>Mature health indicators follow the same pattern. Spring Boot's
+ * {@code DataSourceHealthIndicator} consults the connection pool
+ * rather than running a separate validation query when the pool's
+ * own bookkeeping is authoritative.
  */
 public class HybridCacheHealthIndicator implements HealthIndicator {
-
-    private static final Logger log = LoggerFactory.getLogger(HybridCacheHealthIndicator.class);
-    private static final String PING_KEY = "hybrid-cache:health-ping";
 
     private final RedissonClient redisson;
     private final CircuitBreakerRegistry breakerRegistry;
     private final HybridCacheManager cacheManager;
-    private final Duration pingTimeout;
 
+    /**
+     * Constructor preserving the 0.2.0 signature for backward compatibility
+     * with applications and tests that supplied a ping timeout. The timeout
+     * is no longer load-bearing (no ping is issued) but the parameter is
+     * retained so the wiring in {@code CacheConfig} and existing test
+     * fixtures continue to compile against the same shape.
+     *
+     * @deprecated use {@link #HybridCacheHealthIndicator(RedissonClient,
+     *             CircuitBreakerRegistry, HybridCacheManager)}; the
+     *             {@code pingTimeout} argument is ignored.
+     */
+    @Deprecated
     public HybridCacheHealthIndicator(RedissonClient redisson,
                                       CircuitBreakerRegistry breakerRegistry,
                                       HybridCacheManager cacheManager,
                                       Duration pingTimeout) {
+        this(redisson, breakerRegistry, cacheManager);
+    }
+
+    public HybridCacheHealthIndicator(RedissonClient redisson,
+                                      CircuitBreakerRegistry breakerRegistry,
+                                      HybridCacheManager cacheManager) {
         this.redisson = redisson;
         this.breakerRegistry = breakerRegistry;
         this.cacheManager = cacheManager;
-        this.pingTimeout = pingTimeout;
     }
 
     @Override
@@ -85,20 +117,23 @@ public class HybridCacheHealthIndicator implements HealthIndicator {
             case CLOSED, METRICS_ONLY, DISABLED -> Health.up();
         };
 
-        PingResult ping = pingRedis();
-        // If every breaker is nominally CLOSED but Redis is unreachable,
-        // downgrade to DOWN — the application is one slow call away from
-        // tripping and operators should know the L2 path is broken even if
-        // no breaker has caught up yet.
-        if (aggregate.allClosed() && !ping.reachable) {
+        Map<String, Object> caches = buildCacheDetails();
+        String redisStatus = deriveRedisStatus(aggregate, caches);
+
+        // The only path to DOWN now: every breaker nominally closed, no
+        // cache has executed any Redis call yet (so the breaker activity
+        // signal is silent), and the Redisson client itself is shut down
+        // or shutting down. Without that last condition we cannot tell
+        // "Redis is unhealthy" from "no traffic yet"; we prefer UP in
+        // the silent-but-alive case so a freshly-booted application does
+        // not flap DOWN before its first cache miss.
+        if (aggregate.allClosed() && !anyBreakerActive() && !anyCacheActive(caches)
+                && !redissonAlive()) {
             builder = Health.down();
         }
 
-        builder.withDetail("redisPing", ping.label);
-        if (ping.latencyMs >= 0) {
-            builder.withDetail("redisPingMs", ping.latencyMs);
-        }
-        builder.withDetail("caches", buildCacheDetails());
+        builder.withDetail("redisStatus", redisStatus);
+        builder.withDetail("caches", caches);
         return builder.build();
     }
 
@@ -140,23 +175,56 @@ public class HybridCacheHealthIndicator implements HealthIndicator {
         };
     }
 
-    private record PingResult(boolean reachable, long latencyMs, String label) {}
-
-    private PingResult pingRedis() {
-        long startNanos = System.nanoTime();
-        try {
-            redisson.getBucket(PING_KEY).isExistsAsync()
-                    .toCompletableFuture()
-                    .get(pingTimeout.toMillis(), TimeUnit.MILLISECONDS);
-            long ms = (System.nanoTime() - startNanos) / 1_000_000;
-            return new PingResult(true, ms, "ok");
-        } catch (TimeoutException e) {
-            return new PingResult(false, -1, "timeout after " + pingTimeout.toMillis() + "ms");
-        } catch (Exception e) {
-            log.debug("Redis ping failed in health indicator", e);
-            String msg = e.getCause() != null ? e.getCause().getMessage() : e.getMessage();
-            return new PingResult(false, -1, "unreachable: " + msg);
+    /**
+     * The breaker increments {@link CircuitBreaker.Metrics#getNumberOfBufferedCalls()}
+     * on every {@code executeXXX} regardless of success or failure, so a
+     * non-zero value means the cache's L2 path has actually executed at least
+     * one Redis call. Combined with the breaker still being nominally
+     * closed, that is direct evidence that Redis is reachable, equivalent to
+     * what a successful ping would have told us, but for traffic the
+     * production code already issued.
+     */
+    private boolean anyBreakerActive() {
+        for (CircuitBreaker breaker : breakerRegistry.getAllCircuitBreakers()) {
+            if (breaker.getMetrics().getNumberOfBufferedCalls() > 0) return true;
         }
+        return false;
+    }
+
+    /**
+     * L1 hit or miss counts as "active" for the purposes of the silent-app
+     * fallback. A hit means the cache served from Caffeine which itself was
+     * populated by an earlier loader run that exercised L2; a miss means
+     * the L2 path was just attempted. Either is evidence the Redis path
+     * is being exercised somewhere recent.
+     */
+    @SuppressWarnings("unchecked")
+    private boolean anyCacheActive(Map<String, Object> caches) {
+        for (Object value : caches.values()) {
+            if (!(value instanceof Map<?, ?> entry)) continue;
+            Object hits = ((Map<String, Object>) entry).get("hitCount");
+            Object misses = ((Map<String, Object>) entry).get("missCount");
+            if (hits instanceof Number h && h.longValue() > 0) return true;
+            if (misses instanceof Number m && m.longValue() > 0) return true;
+        }
+        return false;
+    }
+
+    private boolean redissonAlive() {
+        return !redisson.isShutdown() && !redisson.isShuttingDown();
+    }
+
+    private String deriveRedisStatus(AggregateState aggregate, Map<String, Object> caches) {
+        if (!aggregate.allClosed()) {
+            return "degraded; see caches.*.breakerState";
+        }
+        if (anyBreakerActive() || anyCacheActive(caches)) {
+            return "reachable via active caches";
+        }
+        if (redissonAlive()) {
+            return "no cache activity; redisson client alive";
+        }
+        return "redisson client shut down";
     }
 
     private Map<String, Object> buildCacheDetails() {

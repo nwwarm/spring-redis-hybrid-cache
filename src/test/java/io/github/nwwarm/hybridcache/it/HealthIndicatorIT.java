@@ -46,23 +46,24 @@ class HealthIndicatorIT extends EndToEndTestBase {
 
     @Test
     void healthIndicator_isUp_whenRedisReachable() {
-        // Touch a cache so the cache details map has at least one entry and
-        // the per-cache breaker is created.
+        // Touch a cache so the cache details map has at least one entry, the
+        // per-cache breaker is created, and the breaker registers at least
+        // one buffered Redis call (the indicator's "Redis is reachable"
+        // signal — see HybridCacheHealthIndicator's "Why no ping?" javadoc).
         productService.findById(1L);
 
         Health health = healthIndicator.health();
-        // Surface the indicator's own details map on failure: the only DOWN
-        // path is "all breakers nominally CLOSED but Redis ping failed", and
-        // when this assertion fires on CI without the details it is
-        // impossible to tell whether the breaker tripped, the ping timed
-        // out, or the ping threw. Cheap to include and self-diagnoses
-        // future flakes.
+        // Surface the indicator's own details map on failure so a future
+        // flake self-diagnoses. The indicator no longer issues a Redis
+        // ping; the only DOWN path is "no cache activity AND Redisson
+        // client shut down", which an autowired-context test cannot
+        // legitimately hit.
         assertThat(health.getStatus())
                 .as("health.getDetails()=%s", health.getDetails())
                 .isEqualTo(Status.UP);
-        assertThat(health.getDetails())
-                .containsKeys("redisPing", "redisPingMs", "caches");
-        assertThat(health.getDetails().get("redisPing")).isEqualTo("ok");
+        assertThat(health.getDetails()).containsKeys("redisStatus", "caches");
+        assertThat(health.getDetails().get("redisStatus"))
+                .isEqualTo("reachable via active caches");
 
         @SuppressWarnings("unchecked")
         java.util.Map<String, Object> caches =
