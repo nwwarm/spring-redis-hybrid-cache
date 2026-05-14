@@ -1,6 +1,6 @@
 # spring-redis-hybrid-cache
 
-**Multi-layer caching for Spring Boot with cross-node invalidation, stampede protection, and graceful Redis degradation.**
+**Spring Boot Redis Near-Cache: Multi-layer caching for Spring Boot with cross-node invalidation, stampede protection, and graceful Redis degradation.**
 
 [![CI](https://github.com/nwwarm/spring-redis-hybrid-cache/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/nwwarm/spring-redis-hybrid-cache/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/nwwarm/spring-redis-hybrid-cache/branch/main/graph/badge.svg)](https://codecov.io/gh/nwwarm/spring-redis-hybrid-cache)
