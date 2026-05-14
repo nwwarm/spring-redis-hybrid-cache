@@ -4,6 +4,7 @@ import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
+import reactor.netty.http.HttpResources;
 
 import java.lang.management.ManagementFactory;
 import java.time.Duration;
@@ -66,17 +67,21 @@ public final class SoakDriver {
 
     void run() {
         Instant start = Instant.now();
-        Instant deadline = start.plus(soakFor);
-        long intervalNanos = 1_000_000_000L / targetRps;
 
         System.out.printf("Soak started: %s for %s @ %d req/s%n", start, soakFor, targetRps);
         printSnapshot("start");
 
-        Flux.interval(Duration.ofNanos(intervalNanos))
-                .takeWhile(t -> Instant.now().isBefore(deadline))
-                .flatMap(t -> issue(), 32)
-                .doOnNext(ok -> { if (ok) success.incrementAndGet(); else failure.incrementAndGet(); })
-                .blockLast();
+        try {
+            Flux.range(0, Integer.MAX_VALUE)
+                    .concatMap(i -> issue())
+                    .delayElements(Duration.ofMillis(1000 / targetRps))
+                    .take(soakFor)
+                    .doOnNext(ok -> { if (ok) success.incrementAndGet(); else failure.incrementAndGet(); })
+                    .blockLast();
+        } finally {
+            HttpResources.disposeLoopsAndConnections();
+            Schedulers.shutdownNow();
+        }
 
         printSnapshot("end");
         System.out.printf("Soak finished: %s success, %s failures over %s%n",
