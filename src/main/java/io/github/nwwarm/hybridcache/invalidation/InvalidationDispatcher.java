@@ -200,6 +200,17 @@ public class InvalidationDispatcher implements MessageListener<InvalidationMessa
         topic.publish(message);
     }
 
+    /**
+     * Async publish used by the cache layer's hot write paths (put / evict /
+     * clear) so the sync {@link RTopic#publish(Object)} call is never made
+     * from a Redisson Netty event-loop thread. Returns the underlying
+     * Redisson future's count of receivers; callers compose this into
+     * their async chain via {@code thenApply} / {@code handle}.
+     */
+    public java.util.concurrent.CompletionStage<Long> publishAsync(InvalidationMessage message) {
+        return topic.publishAsync(message).toCompletableFuture();
+    }
+
     @Override
     public void onMessage(CharSequence channel, InvalidationMessage msg) {
         if (nodeId.equals(msg.nodeId())) return;

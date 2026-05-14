@@ -10,45 +10,108 @@ jobs:
     timeout-minutes: 1500   # 24h + buffer
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           java-version: 17
           distribution: temurin
           cache: maven
+
       - name: Start Redis
         run: docker run -d --name redis -p 6379:6379 redis:7-alpine
+
       - name: Install library
         run: mvn -B -DskipTests install
+
       - name: Build soak app
         run: mvn -B -f soak/pom.xml package
+
+      - name: Resolve soak jar
+        id: jar
+        run: |
+          path=$(ls soak/target/cache-soak-*.jar | grep -v sources | grep -v javadoc | head -1)
+          if [ -z "$path" ]; then
+            echo "::error::No soak jar found in soak/target/"
+            ls -la soak/target/ || true
+            exit 1
+          fi
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+          echo "Resolved soak jar: $path"
+
       - name: Boot smoke app
         run: |
-          nohup java -jar soak/target/cache-soak-0.5.0-SNAPSHOT.jar \
+          nohup java \
+            -XX:+HeapDumpOnOutOfMemoryError \
+            -XX:HeapDumpPath=soak/heap-oom.hprof \
+            -Xlog:gc*:file=soak/gc.log:time,uptime,level,tags \
+            -jar ${{ steps.jar.outputs.path }} \
             > soak/app.log 2>&1 &
           echo $! > soak/app.pid
           # Smoke health check
           for i in $(seq 1 30); do
             curl -fsS http://localhost:8080/actuator/health && break || sleep 2
           done
+
+      - name: Start periodic snapshotter
+        run: |
+          # Snapshot heap and process stats every 30 minutes so we have
+          # a trajectory, not just start/end. Essential for diagnosing
+          # leaks or slow drift after a failed run.
+          (while true; do
+            ts=$(date -u +%Y%m%dT%H%M%S)
+            pid=$(cat soak/app.pid)
+            jcmd "$pid" GC.heap_info > "soak/heap-$ts.txt" 2>/dev/null || true
+            ps -p "$pid" -o pid,etime,rss,pcpu --no-headers >> soak/ps-timeline.txt 2>/dev/null || true
+            sleep 1800
+          done) &
+          echo $! > soak/snapshotter.pid
+
       - name: Run soak driver
         run: |
           mvn -B -f soak/pom.xml exec:java \
             -Dexec.mainClass=io.github.nwwarm.hybridcache.soak.SoakDriver \
             -Dexec.args="http://localhost:8080 24h 1000"
+
+      - name: Stop snapshotter
+        if: always()
+        run: kill $(cat soak/snapshotter.pid) 2>/dev/null || true
+
       - name: Capture metrics snapshot
         if: always()
         run: |
           curl -fsS http://localhost:8080/actuator/metrics > soak/metrics-end.json || true
           jcmd $(cat soak/app.pid) GC.heap_info > soak/heap-end.txt || true
           jcmd $(cat soak/app.pid) Thread.print > soak/threads-end.txt || true
+
       - name: Stop smoke app
         if: always()
         run: |
           kill -TERM $(cat soak/app.pid) || true
           sleep 5
+
+      - name: Assert app log clean
+        if: always()
+        run: |
+          # The driver's success/failure count is request-level. App-side
+          # exceptions (e.g. Redisson sync-in-async, serialization errors)
+          # can fire without flipping driver responses to non-2xx, so a
+          # run can appear green while the app log is full of stack
+          # traces. This gate catches that.
+          count=$(grep -cE "Exception|ERROR" soak/app.log || echo 0)
+          echo "App log error/exception count: $count"
+          if [ "$count" -gt 10 ]; then
+            echo "::error::Too many errors in app log ($count > threshold of 10). Check soak/app.log in artifacts."
+            grep -E "Exception|ERROR" soak/app.log | head -20
+            exit 1
+          fi
+
       - name: Upload soak artefacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: soak-${{ github.run_id }}
-          path: soak/*.log soak/*.json soak/*.txt
+          path: |
+            soak/*.log
+            soak/*.json
+            soak/*.txt
+            soak/*.hprof

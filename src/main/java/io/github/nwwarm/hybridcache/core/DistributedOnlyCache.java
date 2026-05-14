@@ -325,7 +325,15 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
     @Override
     public void put(@Nonnull Object key, Object value) {
         String stringKey = CacheKeys.stringify(cacheName, key);
-        writeToRedis(stringKey, value);
+        // Async write end-to-end. A sync RBucket.set here would throw
+        // IllegalStateException when put() is invoked from a Redisson
+        // Netty event-loop thread (Spring's reactive cache integration
+        // drives put() from inside a CompletionStage continuation;
+        // under load that continuation may run on the I/O thread).
+        // On non-event-loop threads we await the chain to preserve the
+        // 1.0.0 sync contract — callers expect put() to be observable
+        // before it returns.
+        awaitUnlessOnEventLoop(writeToRedisAsync(stringKey, value));
     }
 
     private void writeToRedis(String key, Object value) {
@@ -343,30 +351,86 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
     @Override
     public void evict(@Nonnull Object key) {
         String stringKey = CacheKeys.stringify(cacheName, key);
+        awaitUnlessOnEventLoop(deleteFromRedisAsync(stringKey));
+    }
+
+    private CompletableFuture<Void> deleteFromRedisAsync(String key) {
+        Supplier<CompletionStage<Void>> deleteSupplier = () ->
+                bucket(key).deleteAsync().toCompletableFuture()
+                        .thenApply(deleted -> (Void) null);
         try {
-            breaker.executeRunnable(() -> bucket(stringKey).delete());
+            return breaker.executeCompletionStage(deleteSupplier).toCompletableFuture()
+                    .handle((v, ex) -> {
+                        if (ex != null) {
+                            Throwable cause = unwrapCompletion(ex);
+                            if (cause instanceof CallNotPermittedException) {
+                                breakerOpen.increment();
+                            } else {
+                                failures.increment();
+                                log.warn("Distributed evict failed for key '{}'",
+                                        keyLogFormatter.format(key), cause);
+                            }
+                        }
+                        return null;
+                    });
         } catch (CallNotPermittedException e) {
             breakerOpen.increment();
-        } catch (Exception e) {
-            failures.increment();
-            log.warn("Distributed evict failed for key '{}'", keyLogFormatter.format(stringKey), e);
+            return CompletableFuture.completedFuture(null);
         }
     }
 
     @Override
     public void clear() {
+        // Async chain: bump generation, then publish OP_CLEAR. clear() is
+        // reactive-reachable via @CacheEvict(allEntries=true) — sync
+        // RAtomicLong.incrementAndGet / RTopic.publish here would throw
+        // IllegalStateException on the Netty event loop. On non-event-loop
+        // threads we await so the 1.0.0 sync contract holds.
+        awaitUnlessOnEventLoop(
+                bumpGenerationAsync()
+                        .thenCompose(v -> publishClearAsync()));
+    }
+
+    /**
+     * Block on the async chain when invoked from a regular worker thread;
+     * leave it running fire-and-forget when on a Redisson Netty event-loop
+     * thread. Mirrors {@link NearCache#awaitUnlessOnEventLoop}.
+     */
+    private static void awaitUnlessOnEventLoop(CompletableFuture<?> chain) {
+        if (isOnRedissonEventLoop()) return;
+        chain.join();
+    }
+
+    private static boolean isOnRedissonEventLoop() {
+        String name = Thread.currentThread().getName();
+        return name.startsWith("redisson-netty-") || name.startsWith("nioEventLoopGroup-");
+    }
+
+    private CompletableFuture<Void> bumpGenerationAsync() {
+        Supplier<CompletionStage<Long>> incrSupplier = () ->
+                distributedGeneration.incrementAndGetAsync().toCompletableFuture();
         try {
-            Long newGen = breaker.executeSupplier(distributedGeneration::incrementAndGet);
-            localGeneration.set(newGen);
-            lastRefreshNanos.set(System.nanoTime());
-        } catch (Exception e) {
-            failures.increment();
-            log.warn("Distributed clear (generation bump) failed for cache '{}'", cacheName, e);
+            return breaker.executeCompletionStage(incrSupplier).toCompletableFuture()
+                    .handle((newGen, ex) -> {
+                        if (ex != null) {
+                            Throwable cause = unwrapCompletion(ex);
+                            if (cause instanceof CallNotPermittedException) {
+                                breakerOpen.increment();
+                            } else {
+                                failures.increment();
+                                log.warn("Distributed clear (generation bump) failed for cache '{}'",
+                                        cacheName, cause);
+                            }
+                            return null;
+                        }
+                        localGeneration.set(newGen);
+                        lastRefreshNanos.set(System.nanoTime());
+                        return null;
+                    });
+        } catch (CallNotPermittedException e) {
+            breakerOpen.increment();
+            return CompletableFuture.completedFuture(null);
         }
-        // Publish so peers refresh their cached generation immediately rather
-        // than waiting up to GENERATION_REFRESH_NANOS for the next poll. The
-        // 1s poll remains as a backstop if the message is dropped.
-        publishClear();
     }
 
     /**
@@ -389,6 +453,13 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
      */
     @Override
     public void clearImmediate() {
+        // TODO(1.0.x): the sync incrementAndGet and unlinkByPattern below
+        // would throw IllegalStateException if clearImmediate is invoked
+        // on a Redisson Netty event-loop thread. Left sync for 1.0.1 —
+        // the hot-path put/evict/clear bug surfaced in soak; this control
+        // op has not been observed to fire from an event loop. unlinkByPattern
+        // is also documented to propagate failures, which is hard to mirror
+        // in a fire-and-forget shape.
         long newGen;
         try {
             newGen = breaker.executeSupplier(distributedGeneration::incrementAndGet);
@@ -401,7 +472,7 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
         lastRefreshNanos.set(System.nanoTime());
         long oldGen = newGen - 1;
 
-        publishClear();
+        publishClearAsync();
 
         String pattern = CacheKeys.valueKeyPattern(cacheName, oldGen);
         try {
@@ -415,37 +486,60 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
         }
     }
 
-    private void publishClear() {
-        long seq = 0L;
+    private CompletableFuture<Void> publishClearAsync() {
+        CompletableFuture<Long> seqStage;
         if (reconciliationEnabled) {
+            Supplier<CompletionStage<Long>> incrSupplier = () ->
+                    distributedSeq.incrementAndGetAsync().toCompletableFuture();
             try {
-                seq = breaker.executeSupplier(distributedSeq::incrementAndGet);
+                seqStage = breaker.executeCompletionStage(incrSupplier).toCompletableFuture()
+                        .handle((seq, ex) -> {
+                            if (ex != null) {
+                                Throwable cause = unwrapCompletion(ex);
+                                if (cause instanceof CallNotPermittedException) {
+                                    breakerOpen.increment();
+                                } else {
+                                    failures.increment();
+                                    log.warn("Reconciliation INCR failed on clear for cache '{}'; skipping publish",
+                                            cacheName, cause);
+                                }
+                                return null;
+                            }
+                            // Self-bump local watermark — dispatcher self-skips our own
+                            // message so without this our lastObservedSeq would lag.
+                            lastObservedSeq.accumulateAndGet(seq, Math::max);
+                            return seq;
+                        });
             } catch (CallNotPermittedException e) {
                 breakerOpen.increment();
-                return;
-            } catch (Exception e) {
-                failures.increment();
-                log.warn("Reconciliation INCR failed on clear for cache '{}'; skipping publish",
-                        cacheName, e);
-                return;
+                return CompletableFuture.completedFuture(null);
             }
-            // Self-bump local watermark — dispatcher self-skips our own
-            // message so without this our lastObservedSeq would lag.
-            // See NearCache.publishInvalidation for the full rationale.
-            lastObservedSeq.accumulateAndGet(seq, Math::max);
+        } else {
+            seqStage = CompletableFuture.completedFuture(0L);
         }
-        final long publishedSeq = seq;
-        try {
-            breaker.executeRunnable(() ->
-                    dispatcher.publish(new InvalidationMessage(
-                            dispatcher.getNodeId(), cacheName,
-                            InvalidationMessage.OP_CLEAR, null, publishedSeq)));
-        } catch (Exception e) {
-            // Suppressed — peers will catch up via the 1s generation poll
-            // or the next reconciliation cycle when reconciliation is enabled.
-            return;
-        }
-        publishedClear.increment();
+
+        return seqStage.thenCompose(seq -> {
+            if (seq == null) return CompletableFuture.completedFuture(null);
+            long publishedSeq = seq;
+            Supplier<CompletionStage<Long>> publishSupplier = () ->
+                    dispatcher.publishAsync(new InvalidationMessage(
+                                    dispatcher.getNodeId(), cacheName,
+                                    InvalidationMessage.OP_CLEAR, null, publishedSeq))
+                            .toCompletableFuture();
+            CompletableFuture<Long> publishStage;
+            try {
+                publishStage = breaker.executeCompletionStage(publishSupplier).toCompletableFuture();
+            } catch (CallNotPermittedException e) {
+                breakerOpen.increment();
+                return CompletableFuture.completedFuture(null);
+            }
+            return publishStage.handle((receivers, ex) -> {
+                if (ex == null) publishedClear.increment();
+                // Failures suppressed — peers will catch up via the 1s
+                // generation poll or the next reconciliation cycle.
+                return null;
+            });
+        });
     }
 
     /**
@@ -606,6 +700,13 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
         long now = System.nanoTime();
         if (now - observed < GENERATION_REFRESH_NANOS) return localGeneration.get();
         if (!lastRefreshNanos.compareAndSet(observed, now)) return localGeneration.get();
+        // TODO(1.0.x): sync distributedGeneration.get() — CAS-guarded
+        // (~1/sec/cache) and unobserved in the 1.0.1 soak, but theoretically
+        // reachable from a Netty event loop via bucket() on the
+        // fire-and-forget async write paths. Left sync because
+        // GenerationRefreshConcurrencyTest asserts sync RAtomicLong.get()
+        // call counts; converting to getAsync would require updating that
+        // test. Mirror of NearCache.currentGeneration TODO.
         try {
             breaker.executeRunnable(() -> localGeneration.set(distributedGeneration.get()));
         } catch (Exception e) {

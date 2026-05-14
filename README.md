@@ -28,7 +28,7 @@ Drop-in replacement for the typical `@Cacheable` + Redis setup that addresses th
 <dependency>
   <groupId>io.github.nwwarm</groupId>
   <artifactId>hybrid-cache-spring-boot-starter</artifactId>
-  <version>1.0.0</version>
+  <version>1.0.1</version>
 </dependency>
 ```
 
@@ -215,7 +215,7 @@ This is the section that distinguishes a production cache from a demo. Every sce
 <dependency>
   <groupId>io.github.nwwarm</groupId>
   <artifactId>hybrid-cache-spring-boot-starter</artifactId>
-  <version>1.0.0</version>
+  <version>1.0.1</version>
 </dependency>
 ```
 

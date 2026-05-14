@@ -568,8 +568,21 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
         // Order on writes: local first (so this node sees its own write immediately),
         // then remote, then publish so other nodes invalidate and lazy-load.
         caffeineCache.put(stringKey, value);
-        writeToL2(stringKey, value);
-        publishInvalidation(InvalidationMessage.OP_INVALIDATE, "put", stringKey);
+        // L2 and publish go through async Redisson APIs end-to-end —
+        // a sync RBucket.set / RTopic.publish here would throw
+        // IllegalStateException("Sync methods can't be invoked from
+        // async/rx/reactive listeners") when put() runs on a Redisson
+        // Netty event-loop thread (Spring's reactive cache integration
+        // drives put() from a CompletionStage continuation; under load
+        // that continuation can run on the I/O thread). On non-event-loop
+        // threads we await the chain to preserve the 1.0.0 sync contract
+        // — callers (and many existing tests) expect put() to be
+        // observable on this node before it returns. Publish is chained
+        // after L2 write so peers reading on invalidate see the new value.
+        awaitUnlessOnEventLoop(
+                writeToL2Async(stringKey, value)
+                        .thenCompose(v -> publishInvalidationAsync(
+                                InvalidationMessage.OP_INVALIDATE, "put", stringKey)));
     }
 
     @Override
@@ -581,18 +594,54 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
         // L2 value that's still present. Always evict the local L1 so this
         // node's L1 ends in a strict-or-equal state vs L2 (cross-node
         // coherence is bounded by TTL when the L2 evict failed).
-        boolean l2Deleted = deleteFromL2(stringKey);
-        if (l2Deleted) {
-            publishInvalidation(InvalidationMessage.OP_INVALIDATE, "evict", stringKey);
-        }
+        //
+        // Async chain for the same reason put() is async — see put() comment.
+        awaitUnlessOnEventLoop(
+                deleteFromL2Async(stringKey)
+                        .thenCompose(l2Deleted -> {
+                            if (Boolean.TRUE.equals(l2Deleted)) {
+                                return publishInvalidationAsync(
+                                        InvalidationMessage.OP_INVALIDATE, "evict", stringKey);
+                            }
+                            return CompletableFuture.completedFuture(null);
+                        }));
         caffeineCache.evict(stringKey);
     }
 
     @Override
     public void clear() {
         caffeineCache.clear();
-        bumpGeneration();
-        publishInvalidation(InvalidationMessage.OP_CLEAR, "clear", null);
+        // Async bump + publish — clear() is reactive-reachable via
+        // @CacheEvict(allEntries=true) on Mono-returning methods. See
+        // put() for the await-vs-fire-and-forget rationale.
+        awaitUnlessOnEventLoop(
+                bumpGenerationAsync()
+                        .thenCompose(v -> publishInvalidationAsync(
+                                InvalidationMessage.OP_CLEAR, "clear", null)));
+    }
+
+    /**
+     * Block on the async chain when invoked from a regular worker thread
+     * (preserving the 1.0.0 sync contract on put / evict / clear), but
+     * leave it running fire-and-forget when invoked from a Redisson
+     * Netty event-loop thread. A {@code .join()} on the event loop would
+     * deadlock — the I/O thread must remain available to drive the
+     * Redis response that completes the future we'd be waiting on. The
+     * thread-name check matches the same threads {@code AsyncBlockHoundIT}
+     * marks as non-blocking (Netty I/O workers spawned by Redisson).
+     *
+     * <p>All call sites compose chains whose handlers swallow their
+     * own failures and complete the future normally, so {@code join()}
+     * here cannot throw.
+     */
+    private static void awaitUnlessOnEventLoop(CompletableFuture<?> chain) {
+        if (isOnRedissonEventLoop()) return;
+        chain.join();
+    }
+
+    private static boolean isOnRedissonEventLoop() {
+        String name = Thread.currentThread().getName();
+        return name.startsWith("redisson-netty-") || name.startsWith("nioEventLoopGroup-");
     }
 
     /**
@@ -620,6 +669,16 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
     public void clearImmediate() {
         caffeineCache.clear();
 
+        // TODO(1.0.x): the sync incrementAndGet and unlinkByPattern below
+        // would throw IllegalStateException if clearImmediate is ever
+        // invoked on a Redisson Netty event-loop thread (e.g. via Spring's
+        // reactive @CacheEvict(allEntries=true) on a Mono-returning method
+        // whose preceding stage completed on the I/O thread). The hot-path
+        // put/evict/clear bug surfaced in the 1.0.1 soak; this control-op
+        // path has not been observed to fire, so it is left sync for the
+        // 1.0.1 patch. unlinkByPattern in particular is an iterating
+        // SCAN+UNLINK that does not lend itself cleanly to fire-and-forget
+        // and is documented to propagate failures.
         long newGen;
         try {
             newGen = breaker.executeSupplier(distributedGeneration::incrementAndGet);
@@ -632,7 +691,7 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
         lastRefreshNanos.set(System.nanoTime());
         long oldGen = newGen - 1;
 
-        publishInvalidation(InvalidationMessage.OP_CLEAR, "clear", null);
+        publishInvalidationAsync(InvalidationMessage.OP_CLEAR, "clear", null);
 
         String pattern = CacheKeys.valueKeyPattern(cacheName, oldGen);
         try {
@@ -695,25 +754,44 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
     }
 
     /**
-     * Deletes the L2 entry. Returns whether the delete completed successfully —
-     * callers (notably {@link #evict(Object)}) use this to decide whether to
-     * publish an invalidation. A failed L2 delete must not publish: telling
-     * remote nodes to invalidate would defeat the cross-node coherence
-     * guarantee, since their L1 would drop to L2 and find the value still
-     * present.
+     * Async L2 delete used by {@link #evict(Object)}. Returns
+     * {@code TRUE} on a successful delete, {@code FALSE} otherwise — the
+     * caller uses this to decide whether to publish an invalidation. A
+     * failed L2 delete must not publish: telling remote nodes to
+     * invalidate would defeat the cross-node coherence guarantee, since
+     * their L1 would drop to L2 and find the value still present.
+     *
+     * <p>The returned future always completes normally (never
+     * exceptionally) — failures are caught, metered, and logged so the
+     * caller's {@code thenCompose} runs unconditionally.
      */
-    private boolean deleteFromL2(String key) {
+    private CompletableFuture<Boolean> deleteFromL2Async(String key) {
+        Supplier<CompletionStage<Boolean>> deleteSupplier = () ->
+                bucket(key).deleteAsync().toCompletableFuture()
+                        .thenApply(deleted -> Boolean.TRUE);
         try {
-            breaker.executeRunnable(() -> bucket(key).delete());
-            return true;
+            return breaker.executeCompletionStage(deleteSupplier).toCompletableFuture()
+                    .handle((v, ex) -> {
+                        if (ex == null) return v;
+                        Throwable cause = unwrapCompletion(ex);
+                        if (cause instanceof CallNotPermittedException) {
+                            l2BreakerOpen.increment();
+                            log.warn("L2 evict failed for key '{}' (breaker open);"
+                                    + " cross-node coherence not guaranteed until TTL",
+                                    keyLogFormatter.format(key));
+                        } else {
+                            l2Failures.increment();
+                            log.warn("L2 evict failed for key '{}'; cross-node coherence"
+                                    + " not guaranteed until TTL",
+                                    keyLogFormatter.format(key), cause);
+                        }
+                        return Boolean.FALSE;
+                    });
         } catch (CallNotPermittedException e) {
             l2BreakerOpen.increment();
-            log.warn("L2 evict failed for key '{}' (breaker open); cross-node coherence not guaranteed until TTL", keyLogFormatter.format(key));
-            return false;
-        } catch (Exception e) {
-            l2Failures.increment();
-            log.warn("L2 evict failed for key '{}'; cross-node coherence not guaranteed until TTL", keyLogFormatter.format(key), e);
-            return false;
+            log.warn("L2 evict failed for key '{}' (breaker open); cross-node coherence"
+                    + " not guaranteed until TTL", keyLogFormatter.format(key));
+            return CompletableFuture.completedFuture(Boolean.FALSE);
         }
     }
 
@@ -738,25 +816,58 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
         // all others return the previously-cached generation, which is correct
         // since the refresh hasn't completed yet by definition.
         if (!lastRefreshNanos.compareAndSet(observed, now)) return localGeneration.get();
+        // TODO(1.0.x): the breaker-wrapped distributedGeneration.get() below
+        // is a sync Redisson call. CAS-guarded (~1/sec/cache) and unobserved
+        // in the 1.0.1 soak, but is theoretically reachable from a Netty
+        // event loop via bucket() -> currentGeneration() on the fire-and-forget
+        // async write paths. Left sync in 1.0.1 because the existing
+        // GenerationRefreshConcurrencyTest asserts sync RAtomicLong.get()
+        // call counts; converting to getAsync would require updating that
+        // test and rethinking the refresh ordering guarantees.
         try {
             breaker.executeRunnable(() -> localGeneration.set(distributedGeneration.get()));
         } catch (Exception e) {
             // Refresh failed — reset so the next call retries rather than
             // waiting a full interval on stale data. CAS ensures we only
-            // reset if nothing else (e.g. bumpGeneration) has written since.
+            // reset if nothing else (e.g. bumpGenerationAsync) has written since.
             lastRefreshNanos.compareAndSet(now, observed);
         }
         return localGeneration.get();
     }
 
-    private void bumpGeneration() {
+    /**
+     * Async generation bump used by {@link #clear()}. Returns a future
+     * that always completes normally — failures are metered and logged
+     * so the caller's chained publish runs unconditionally. The async
+     * shape is required because {@code clear()} is reactive-reachable
+     * via {@code @CacheEvict(allEntries=true)} on a Mono-returning
+     * method; a sync {@code incrementAndGet} on the Netty event loop
+     * would throw {@code IllegalStateException}.
+     */
+    private CompletableFuture<Void> bumpGenerationAsync() {
+        Supplier<CompletionStage<Long>> incrSupplier = () ->
+                distributedGeneration.incrementAndGetAsync().toCompletableFuture();
         try {
-            Long newGen = breaker.executeSupplier(distributedGeneration::incrementAndGet);
-            localGeneration.set(newGen);
-            lastRefreshNanos.set(System.nanoTime());
-        } catch (Exception e) {
-            l2Failures.increment();
-            log.warn("Generation bump failed; clear visible only locally on '{}'", cacheName, e);
+            return breaker.executeCompletionStage(incrSupplier).toCompletableFuture()
+                    .handle((newGen, ex) -> {
+                        if (ex != null) {
+                            Throwable cause = unwrapCompletion(ex);
+                            if (cause instanceof CallNotPermittedException) {
+                                l2BreakerOpen.increment();
+                            } else {
+                                l2Failures.increment();
+                                log.warn("Generation bump failed; clear visible only locally on '{}'",
+                                        cacheName, cause);
+                            }
+                            return null;
+                        }
+                        localGeneration.set(newGen);
+                        lastRefreshNanos.set(System.nanoTime());
+                        return null;
+                    });
+        } catch (CallNotPermittedException e) {
+            l2BreakerOpen.increment();
+            return CompletableFuture.completedFuture(null);
         }
     }
 
@@ -784,53 +895,78 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
      *                 {@code clear}. Distinguishes the two callers that share
      *                 {@code OP_INVALIDATE} on the wire.
      */
-    private void publishInvalidation(String wireOp, String metricOp, String key) {
-        long seq = 0L;
+    private CompletableFuture<Void> publishInvalidationAsync(String wireOp, String metricOp, String key) {
+        // Sentinel: null seq means "skip publish" (INCR failed). When
+        // reconciliation is disabled, the supplier completes with 0 so
+        // the publish proceeds with the no-seq wire value.
+        CompletableFuture<Long> seqStage;
         if (reconciliationEnabled) {
+            Supplier<CompletionStage<Long>> incrSupplier = () ->
+                    distributedSeq.incrementAndGetAsync().toCompletableFuture();
             try {
-                seq = breaker.executeSupplier(distributedSeq::incrementAndGet);
+                seqStage = breaker.executeCompletionStage(incrSupplier).toCompletableFuture()
+                        .handle((seq, ex) -> {
+                            if (ex != null) {
+                                Throwable cause = unwrapCompletion(ex);
+                                if (cause instanceof CallNotPermittedException) {
+                                    l2BreakerOpen.increment();
+                                } else {
+                                    l2Failures.increment();
+                                    log.warn("Reconciliation INCR failed for cache '{}'; skipping publish",
+                                            cacheName, cause);
+                                }
+                                return null;  // sentinel — skip publish
+                            }
+                            // Bump our own watermark to match the just-INCR'd canonical.
+                            // The dispatcher self-skips messages we sent, so without this
+                            // self-bump our lastObservedSeq would lag behind the canonical
+                            // by exactly the number of publishes we've issued — turning
+                            // every reconciliation cycle on a publishing node into a
+                            // false-positive miss declaration. This is the dual of the
+                            // "receivers update on receive" rule: publishers update on
+                            // publish.
+                            lastObservedSeq.accumulateAndGet(seq, Math::max);
+                            return seq;
+                        });
             } catch (CallNotPermittedException e) {
                 l2BreakerOpen.increment();
-                // Without an INCR we have no honest seq to put on the wire.
-                // Skip the publish entirely: peers' L1 ages out via TTL,
-                // and the next reconciliation cycle on each peer will
-                // catch up against the canonical (which did NOT advance
-                // since INCR didn't run).
-                return;
-            } catch (Exception e) {
-                l2Failures.increment();
-                log.warn("Reconciliation INCR failed for cache '{}'; skipping publish",
-                        cacheName, e);
-                return;
+                return CompletableFuture.completedFuture(null);
             }
-            // Bump our own watermark to match the just-INCR'd canonical.
-            // The dispatcher self-skips messages we sent, so without this
-            // self-bump our lastObservedSeq would lag behind the canonical
-            // by exactly the number of publishes we've issued — turning
-            // every reconciliation cycle on a publishing node into a
-            // false-positive miss declaration. This is the dual of the
-            // "receivers update on receive" rule: publishers update on
-            // publish.
-            lastObservedSeq.accumulateAndGet(seq, Math::max);
+        } else {
+            seqStage = CompletableFuture.completedFuture(0L);
         }
-        final long publishedSeq = seq;
-        try {
-            breaker.executeRunnable(() ->
-                    dispatcher.publish(new InvalidationMessage(
-                            dispatcher.getNodeId(), cacheName, wireOp, key, publishedSeq)));
-        } catch (Exception e) {
-            // Suppressed — invalidation failure is bounded by TTL on remote nodes,
-            // or by the next reconciliation cycle when reconciliation is enabled.
-            return;
-        }
-        // Only after the breaker-wrapped publish returns normally: the message
-        // reached RTopic.publish() and we treat it as published.
-        switch (metricOp) {
-            case "put" -> publishedPut.increment();
-            case "evict" -> publishedEvict.increment();
-            case "clear" -> publishedClear.increment();
-            default -> log.warn("Unknown publish metric op '{}' on cache '{}'", metricOp, cacheName);
-        }
+
+        return seqStage.thenCompose(seq -> {
+            if (seq == null) return CompletableFuture.completedFuture(null);
+            long publishedSeq = seq;
+            Supplier<CompletionStage<Long>> publishSupplier = () ->
+                    dispatcher.publishAsync(new InvalidationMessage(
+                                    dispatcher.getNodeId(), cacheName, wireOp, key, publishedSeq))
+                            .toCompletableFuture();
+            CompletableFuture<Long> publishStage;
+            try {
+                publishStage = breaker.executeCompletionStage(publishSupplier).toCompletableFuture();
+            } catch (CallNotPermittedException e) {
+                l2BreakerOpen.increment();
+                return CompletableFuture.completedFuture(null);
+            }
+            return publishStage.handle((receivers, ex) -> {
+                if (ex != null) {
+                    // Suppressed — invalidation failure is bounded by TTL on remote nodes,
+                    // or by the next reconciliation cycle when reconciliation is enabled.
+                    return null;
+                }
+                // Only after the publish returns normally: the message reached
+                // RTopic.publishAsync() and we treat it as published.
+                switch (metricOp) {
+                    case "put" -> publishedPut.increment();
+                    case "evict" -> publishedEvict.increment();
+                    case "clear" -> publishedClear.increment();
+                    default -> log.warn("Unknown publish metric op '{}' on cache '{}'", metricOp, cacheName);
+                }
+                return null;
+            });
+        });
     }
 
     /** Invoked by {@link InvalidationDispatcher} after self-skip and name routing. */
