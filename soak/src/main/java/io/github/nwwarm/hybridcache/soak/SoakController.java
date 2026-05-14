@@ -37,4 +37,15 @@ public class SoakController {
         service.clearProducts();
         return "ok";
     }
+
+    /**
+     * Reactive evict endpoint — drives Spring's reactive cache adapter
+     * which under load completes the continuation on a Redisson Netty
+     * event-loop thread. Pair with the existing sync evict to cover both
+     * shapes in the soak.
+     */
+    @DeleteMapping("/users")
+    public Mono<String> clearUsers() {
+        return service.clearUsers().thenReturn("ok");
+    }
 }

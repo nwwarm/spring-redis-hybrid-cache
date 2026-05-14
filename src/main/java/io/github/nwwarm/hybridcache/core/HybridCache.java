@@ -40,9 +40,13 @@ public interface HybridCache extends Cache {
      * indistinguishable from {@link #clear()} — there is no distributed state to
      * reconcile.
      *
-     * @throws RuntimeException if the generation bump fails (no work performed),
-     *         or if SCAN + UNLINK fails mid-iteration (generation has been bumped,
-     *         so reads return the new prefix; surviving keys expire via TTL).
+     * <p>Failure handling (1.0.1): the underlying chain is async, so failures
+     * surface via the per-tier failure counter and {@code log.warn} from
+     * completion callbacks rather than throwing. The "no orphan keys when this
+     * returns" contract still holds for callers on regular worker threads —
+     * the chain is awaited there. Callers on a Redisson Netty event-loop thread
+     * (Spring reactive {@code @CacheEvict(allEntries=true)}) get fire-and-forget
+     * dispatch to avoid deadlocking the I/O thread.
      */
     void clearImmediate();
 }

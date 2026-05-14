@@ -453,37 +453,58 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
      */
     @Override
     public void clearImmediate() {
-        // TODO(1.0.x): the sync incrementAndGet and unlinkByPattern below
-        // would throw IllegalStateException if clearImmediate is invoked
-        // on a Redisson Netty event-loop thread. Left sync for 1.0.1 —
-        // the hot-path put/evict/clear bug surfaced in soak; this control
-        // op has not been observed to fire from an event loop. unlinkByPattern
-        // is also documented to propagate failures, which is hard to mirror
-        // in a fire-and-forget shape.
-        long newGen;
+        // Async chain end-to-end: incrementAndGetAsync → set local state →
+        // publish OP_CLEAR → unlinkByPatternAsync. Reactive-reachable via
+        // @CacheEvict(allEntries=true) on a Mono-returning method. Mirrors
+        // the NearCache.clearImmediate fix; see that method's comment for
+        // the threading rationale. awaitUnlessOnEventLoop preserves the
+        // "no orphan keys when this returns" contract on regular worker
+        // threads; event-loop callers fire-and-forget to avoid deadlocking
+        // the I/O thread that completes the chain.
+        Supplier<CompletionStage<Long>> incrSupplier = () ->
+                distributedGeneration.incrementAndGetAsync().toCompletableFuture();
+        CompletableFuture<?> chain;
         try {
-            newGen = breaker.executeSupplier(distributedGeneration::incrementAndGet);
-        } catch (RuntimeException e) {
-            failures.increment();
-            log.warn("clearImmediate generation bump failed for cache '{}'", cacheName, e);
-            throw e;
+            chain = breaker.executeCompletionStage(incrSupplier).toCompletableFuture()
+                    .thenCompose(newGen -> {
+                        // Local state advance happens-after the bump lands so peers
+                        // never see localGeneration ahead of persisted Redis state.
+                        localGeneration.set(newGen);
+                        lastRefreshNanos.set(System.nanoTime());
+                        long oldGen = newGen - 1;
+                        publishClearAsync();
+                        String pattern = CacheKeys.valueKeyPattern(cacheName, oldGen);
+                        return redisson.getKeys().unlinkByPatternAsync(pattern)
+                                .toCompletableFuture()
+                                .handle((deleted, unlinkEx) -> {
+                                    if (unlinkEx != null) {
+                                        Throwable cause = unwrapCompletion(unlinkEx);
+                                        failures.increment();
+                                        log.warn("clearImmediate SCAN/UNLINK failed for"
+                                                + " cache '{}' pattern '{}'; surviving"
+                                                + " old-generation keys will expire via TTL",
+                                                cacheName, pattern, cause);
+                                    }
+                                    return null;
+                                });
+                    })
+                    .exceptionally(bumpEx -> {
+                        Throwable cause = unwrapCompletion(bumpEx);
+                        if (cause instanceof CallNotPermittedException) {
+                            breakerOpen.increment();
+                        } else {
+                            failures.increment();
+                            log.warn("clearImmediate generation bump failed for cache '{}'",
+                                    cacheName, cause);
+                        }
+                        return null;
+                    });
+        } catch (CallNotPermittedException e) {
+            breakerOpen.increment();
+            return;
         }
-        localGeneration.set(newGen);
-        lastRefreshNanos.set(System.nanoTime());
-        long oldGen = newGen - 1;
 
-        publishClearAsync();
-
-        String pattern = CacheKeys.valueKeyPattern(cacheName, oldGen);
-        try {
-            redisson.getKeys().unlinkByPattern(pattern);
-        } catch (RuntimeException e) {
-            failures.increment();
-            log.warn("clearImmediate SCAN/UNLINK failed for cache '{}' pattern '{}';"
-                    + " surviving old-generation keys will expire via TTL",
-                    cacheName, pattern, e);
-            throw e;
-        }
+        awaitUnlessOnEventLoop(chain);
     }
 
     private CompletableFuture<Void> publishClearAsync() {
@@ -700,16 +721,28 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
         long now = System.nanoTime();
         if (now - observed < GENERATION_REFRESH_NANOS) return localGeneration.get();
         if (!lastRefreshNanos.compareAndSet(observed, now)) return localGeneration.get();
-        // TODO(1.0.x): sync distributedGeneration.get() — CAS-guarded
-        // (~1/sec/cache) and unobserved in the 1.0.1 soak, but theoretically
-        // reachable from a Netty event loop via bucket() on the
-        // fire-and-forget async write paths. Left sync because
-        // GenerationRefreshConcurrencyTest asserts sync RAtomicLong.get()
-        // call counts; converting to getAsync would require updating that
-        // test. Mirror of NearCache.currentGeneration TODO.
+        // Eventually-consistent refresh as of 1.0.1: dispatch getAsync and
+        // return the cached localGeneration immediately. The next caller
+        // observes the refreshed value, not this one. Forced by the
+        // sync-on-event-loop bug — currentGeneration is reachable from a
+        // Netty event-loop thread via bucket() on the async read/write paths.
+        // Worst-case staleness is bounded by GENERATION_REFRESH_NANOS, which
+        // already governs the cached-generation contract. Mirror of
+        // NearCache.currentGeneration.
+        Supplier<CompletionStage<Long>> getSupplier = () ->
+                distributedGeneration.getAsync().toCompletableFuture();
         try {
-            breaker.executeRunnable(() -> localGeneration.set(distributedGeneration.get()));
-        } catch (Exception e) {
+            breaker.executeCompletionStage(getSupplier).toCompletableFuture()
+                    .whenComplete((value, ex) -> {
+                        if (ex == null) {
+                            localGeneration.set(value);
+                        } else {
+                            // Refresh failed — reset so the next call retries
+                            // rather than waiting a full interval on stale data.
+                            lastRefreshNanos.compareAndSet(now, observed);
+                        }
+                    });
+        } catch (CallNotPermittedException e) {
             lastRefreshNanos.compareAndSet(now, observed);
         }
         return localGeneration.get();

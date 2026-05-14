@@ -46,6 +46,20 @@ public class SoakService {
         // no-op — exercises the @CacheEvict path
     }
 
+    /**
+     * Reactive {@code @CacheEvict(allEntries=true)} on a Mono-returning
+     * method. Drives {@code NearCache.clear()} from inside a Reactor
+     * pipeline; under load Spring's reactive cache adapter completes the
+     * continuation on a Redisson Netty event-loop thread. Added in 1.0.1
+     * so the soak exercises the reactive-evict path — without this, the
+     * soak would never surface event-loop reachability on the clear /
+     * generation-refresh code paths that 1.0.1 fixed.
+     */
+    @CacheEvict(value = "users", allEntries = true)
+    public Mono<Void> clearUsers() {
+        return Mono.empty();
+    }
+
     public long loaderInvocations() {
         return loaderInvocations.get();
     }

@@ -34,7 +34,7 @@
     <properties>
         <java.version>17</java.version>
         <springboot.version>3.5.14</springboot.version>
-        <hybrid.cache.version>1.0.0</hybrid.cache.version>
+        <hybrid.cache.version>1.0.1</hybrid.cache.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 

@@ -90,11 +90,17 @@ public final class SoakDriver {
 
     private Mono<Boolean> issue() {
         int op = ThreadLocalRandom.current().nextInt(100);
-        // 80% reads (50% products, 30% users), 15% sessions, 5% writes.
+        // 80% reads (50% products, 30% users), 15% sessions, 5% writes split
+        // between sync /products clear and reactive /users clear. The reactive
+        // clear exercises the @CacheEvict(allEntries=true) → NearCache.clear()
+        // → bumpGenerationAsync path from a Mono pipeline; under load the
+        // continuation completes on a Redisson Netty event-loop thread, which
+        // is exactly the path the 1.0.1 fix targets.
         if (op < 50) return get("/cache/products/" + ThreadLocalRandom.current().nextLong(10_000));
         if (op < 80) return get("/cache/users/" + ThreadLocalRandom.current().nextLong(10_000));
         if (op < 95) return get("/cache/sessions/tok-" + ThreadLocalRandom.current().nextInt(1_000));
-        return clear();
+        if (op < 98) return clearSync();
+        return clearReactive();
     }
 
     private Mono<Boolean> get(String path) {
@@ -103,8 +109,15 @@ public final class SoakDriver {
                 .onErrorReturn(false);
     }
 
-    private Mono<Boolean> clear() {
+    private Mono<Boolean> clearSync() {
         return client.delete().uri("/cache/products").retrieve().toBodilessEntity()
+                .map(r -> r.getStatusCode().is2xxSuccessful())
+                .onErrorReturn(false)
+                .subscribeOn(Schedulers.boundedElastic());
+    }
+
+    private Mono<Boolean> clearReactive() {
+        return client.delete().uri("/cache/users").retrieve().toBodilessEntity()
                 .map(r -> r.getStatusCode().is2xxSuccessful())
                 .onErrorReturn(false)
                 .subscribeOn(Schedulers.boundedElastic());
