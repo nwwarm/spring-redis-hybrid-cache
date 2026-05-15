@@ -18,8 +18,8 @@ jobs:
   jmh:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-java@v5
         with:
           java-version: 17
           distribution: temurin
@@ -38,7 +38,7 @@ jobs:
             -wi 2 -i 3 -f 1 -r 2 \
             -rf json -rff jmh-results.json
       - name: Post results to PR
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: jmh-results
           path: jmh-results.json
