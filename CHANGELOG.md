@@ -28,6 +28,19 @@
   `cache.reconciliation.seq.regressions` to see the rate of
   benign races vs. real recovery events.
 
+- Covered the reconciler's breaker-open and Redis-error paths with
+  regression tests; no production code change. The 1.0.2 recheck
+  added two new catches per cache class (breaker-open and generic
+  Exception on the recheck read), and the pre-existing first-read
+  catches on DistributedOnlyCache had been uncovered since
+  introduction. All seven net-new failure-mode paths are now
+  exercised via Mockito (RedisTimeoutException injection,
+  `CircuitBreaker.transitionToOpenState()` for the breaker-open
+  path) with assertions on the `cache.reconciliation.skipped`
+  counter (tag `reason` = `breaker-open` or `exception`), absence
+  of state changes, and absence of the cascade "Counter likely
+  deleted by operator" warning.
+
 ## 1.0.1
 
 - Removed an unreachable defensive catch for CallNotPermittedException
