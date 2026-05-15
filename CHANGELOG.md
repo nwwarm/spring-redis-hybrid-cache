@@ -2,6 +2,12 @@
 
 ## 1.0.1
 
+- Removed an unreachable defensive catch for CallNotPermittedException
+  in clearImmediate; the breaker-open path is handled through the
+  async chain's .exceptionally handler (Resilience4j 2.4.0's
+  executeCompletionStage never throws synchronously). No behavior
+  change.
+
 ### Fixed
 - Sync Redisson API calls reachable from Reactor pipelines /
   `CompletableFuture` completions running on Netty event-loop threads

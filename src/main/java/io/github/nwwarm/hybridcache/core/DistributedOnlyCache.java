@@ -463,46 +463,40 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
         // the I/O thread that completes the chain.
         Supplier<CompletionStage<Long>> incrSupplier = () ->
                 distributedGeneration.incrementAndGetAsync().toCompletableFuture();
-        CompletableFuture<?> chain;
-        try {
-            chain = breaker.executeCompletionStage(incrSupplier).toCompletableFuture()
-                    .thenCompose(newGen -> {
-                        // Local state advance happens-after the bump lands so peers
-                        // never see localGeneration ahead of persisted Redis state.
-                        localGeneration.set(newGen);
-                        lastRefreshNanos.set(System.nanoTime());
-                        long oldGen = newGen - 1;
-                        publishClearAsync();
-                        String pattern = CacheKeys.valueKeyPattern(cacheName, oldGen);
-                        return redisson.getKeys().unlinkByPatternAsync(pattern)
-                                .toCompletableFuture()
-                                .handle((deleted, unlinkEx) -> {
-                                    if (unlinkEx != null) {
-                                        Throwable cause = unwrapCompletion(unlinkEx);
-                                        failures.increment();
-                                        log.warn("clearImmediate SCAN/UNLINK failed for"
-                                                + " cache '{}' pattern '{}'; surviving"
-                                                + " old-generation keys will expire via TTL",
-                                                cacheName, pattern, cause);
-                                    }
-                                    return null;
-                                });
-                    })
-                    .exceptionally(bumpEx -> {
-                        Throwable cause = unwrapCompletion(bumpEx);
-                        if (cause instanceof CallNotPermittedException) {
-                            breakerOpen.increment();
-                        } else {
-                            failures.increment();
-                            log.warn("clearImmediate generation bump failed for cache '{}'",
-                                    cacheName, cause);
-                        }
-                        return null;
-                    });
-        } catch (CallNotPermittedException e) {
-            breakerOpen.increment();
-            return;
-        }
+        CompletableFuture<?> chain = breaker.executeCompletionStage(incrSupplier).toCompletableFuture()
+                .thenCompose(newGen -> {
+                    // Local state advance happens-after the bump lands so peers
+                    // never see localGeneration ahead of persisted Redis state.
+                    localGeneration.set(newGen);
+                    lastRefreshNanos.set(System.nanoTime());
+                    long oldGen = newGen - 1;
+                    publishClearAsync();
+                    String pattern = CacheKeys.valueKeyPattern(cacheName, oldGen);
+                    return redisson.getKeys().unlinkByPatternAsync(pattern)
+                            .toCompletableFuture()
+                            .handle((deleted, unlinkEx) -> {
+                                if (unlinkEx != null) {
+                                    Throwable cause = unwrapCompletion(unlinkEx);
+                                    failures.increment();
+                                    log.warn("clearImmediate SCAN/UNLINK failed for"
+                                            + " cache '{}' pattern '{}'; surviving"
+                                            + " old-generation keys will expire via TTL",
+                                            cacheName, pattern, cause);
+                                }
+                                return null;
+                            });
+                })
+                .exceptionally(bumpEx -> {
+                    Throwable cause = unwrapCompletion(bumpEx);
+                    if (cause instanceof CallNotPermittedException) {
+                        breakerOpen.increment();
+                    } else {
+                        failures.increment();
+                        log.warn("clearImmediate generation bump failed for cache '{}'",
+                                cacheName, cause);
+                    }
+                    return null;
+                });
 
         awaitUnlessOnEventLoop(chain);
     }
