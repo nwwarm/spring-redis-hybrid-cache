@@ -627,6 +627,37 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
             ReconciliationDecision decision =
                     ReconciliationDecision.classify(redisSeq, observed, tolerance);
 
+            if (decision == ReconciliationDecision.REGRESSION) {
+                // Non-atomic (redisSeq, observed) snapshot — a concurrent
+                // publisher INCR + watermark bump between the two reads
+                // produces a transient apparent regression. Re-read
+                // through the same breaker to disambiguate from a genuine
+                // counter-deleted regression. See NearCache.reconcile()
+                // for the full mechanism.
+                long redisSeqRecheck;
+                try {
+                    redisSeqRecheck = breaker.executeSupplier(distributedSeq::get);
+                } catch (CallNotPermittedException e) {
+                    Counter.builder("cache.reconciliation.skipped")
+                            .tag("cache", cacheName).tag("reason", "breaker-open")
+                            .register(meterRegistry).increment();
+                    return;
+                } catch (Exception e) {
+                    Counter.builder("cache.reconciliation.skipped")
+                            .tag("cache", cacheName).tag("reason", "exception")
+                            .register(meterRegistry).increment();
+                    log.warn("Reconciliation recheck exception for cache '{}'; skipping",
+                            cacheName, e);
+                    return;
+                }
+                if (redisSeqRecheck >= observed) {
+                    Counter.builder("cache.reconciliation.seq.regression_recheck_resolved")
+                            .tag("cache", cacheName).register(meterRegistry).increment();
+                    redisSeq = redisSeqRecheck;
+                    decision = ReconciliationDecision.classify(redisSeq, observed, tolerance);
+                }
+            }
+
             switch (decision) {
                 case REGRESSION -> {
                     Counter.builder("cache.reconciliation.seq.regressions")

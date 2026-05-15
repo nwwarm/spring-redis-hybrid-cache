@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.0.2
+
+### Fixed
+- Reconciler's two reads (Redis seq, local watermark) were not
+  atomic. Under sustained concurrent writes, the local watermark
+  could be observed strictly greater than the Redis seq snapshot
+  from the same cycle, causing a false REGRESSION classification
+  and an unnecessary watermark reset. The watermark reset
+  cascaded into a false L1 clear on the following cycle when the
+  reset value fell more than `tolerance` below the new Redis
+  seq. Surfaced in the 24h soak that validated 1.0.1: four false
+  regressions in 16 minutes under 1000 req/s, no genuine state
+  loss.
+
+  Fix: on suspected regression, re-read Redis through the same
+  circuit breaker. If the recheck catches up to the local
+  watermark, re-classify and proceed. If the recheck still
+  shows the lower value, fall through to the existing
+  counter-deleted handler (warning + watermark reset).
+  Same change applied to DistributedOnlyCache.
+
+### Added
+- Metric `cache.reconciliation.seq.regression_recheck_resolved`:
+  count of suspected regressions that were race artifacts rather
+  than genuine counter loss. Operators can compare this against
+  `cache.reconciliation.seq.regressions` to see the rate of
+  benign races vs. real recovery events.
+
 ## 1.0.1
 
 - Removed an unreachable defensive catch for CallNotPermittedException

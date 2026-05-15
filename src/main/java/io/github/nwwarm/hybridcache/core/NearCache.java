@@ -1077,6 +1077,40 @@ public class NearCache implements HybridCache, InvalidationListener, Reconciler 
             ReconciliationDecision decision =
                     ReconciliationDecision.classify(redisSeq, observed, tolerance);
 
+            if (decision == ReconciliationDecision.REGRESSION) {
+                // The (redisSeq, observed) reads above are not atomic. A
+                // concurrent publisher's INCR + watermark bump landing
+                // between them produces a transient redisSeq < observed
+                // snapshot that does not correspond to a real counter
+                // regression. Re-read through the same breaker: if Redis
+                // has caught up, it was a race and we re-classify with the
+                // fresh value; otherwise the counter genuinely went
+                // backward (operator DEL / FLUSHALL) and we fall through
+                // to the existing handler.
+                long redisSeqRecheck;
+                try {
+                    redisSeqRecheck = breaker.executeSupplier(distributedSeq::get);
+                } catch (CallNotPermittedException e) {
+                    Counter.builder("cache.reconciliation.skipped")
+                            .tag("cache", cacheName).tag("reason", "breaker-open")
+                            .register(meterRegistry).increment();
+                    return;
+                } catch (Exception e) {
+                    Counter.builder("cache.reconciliation.skipped")
+                            .tag("cache", cacheName).tag("reason", "exception")
+                            .register(meterRegistry).increment();
+                    log.warn("Reconciliation recheck exception for cache '{}'; skipping",
+                            cacheName, e);
+                    return;
+                }
+                if (redisSeqRecheck >= observed) {
+                    Counter.builder("cache.reconciliation.seq.regression_recheck_resolved")
+                            .tag("cache", cacheName).register(meterRegistry).increment();
+                    redisSeq = redisSeqRecheck;
+                    decision = ReconciliationDecision.classify(redisSeq, observed, tolerance);
+                }
+            }
+
             switch (decision) {
                 case REGRESSION -> {
                     // Operator-driven (manual DEL, FLUSHALL). Reset the

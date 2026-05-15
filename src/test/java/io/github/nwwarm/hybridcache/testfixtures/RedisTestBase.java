@@ -344,6 +344,31 @@ public abstract class RedisTestBase {
     }
 
     /**
+     * Reconciliation-enabled distributed-only cache for tests that exercise
+     * {@link DistributedOnlyCache#reconcile()}. Mirrors
+     * {@link #newReconcilingNearCache} shape.
+     */
+    protected DistributedOnlyCache newReconcilingDistributedCache(String name,
+                                                                  RedissonClient redisson,
+                                                                  CircuitBreaker breaker,
+                                                                  String nodeId,
+                                                                  MeterRegistry meterRegistry,
+                                                                  Duration interval,
+                                                                  int missTolerance) {
+        CacheProperties.CacheSpec spec = new CacheProperties.CacheSpec(
+                CacheProperties.Tier.DISTRIBUTED_ONLY,
+                Duration.ofMinutes(10), 10_000,
+                Duration.ofSeconds(2), Duration.ofSeconds(10),
+                CacheProperties.Codec.JSON, null, null, null, 0.0, null, null,
+                new CacheProperties.Reconciliation(true, interval, missTolerance),
+                null, null);
+        InvalidationDispatcher dispatcher = new InvalidationDispatcher(redisson, nodeId, meterRegistry);
+        return new DistributedOnlyCache(name, spec, resolveTestCodec(spec.codec()),
+                redisson, breaker, dispatcher, meterRegistry,
+                new KeyLogFormatter(false, "test"));
+    }
+
+    /**
      * Resolves the per-cache codec for direct test construction. Tests that
      * use {@link CacheProperties.Codec#KRYO} get a default {@link Kryo5Codec}
      * with no registration — the production-side registration validator

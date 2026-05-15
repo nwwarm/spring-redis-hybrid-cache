@@ -10,6 +10,11 @@ import org.redisson.api.RAtomicLong;
 import org.redisson.api.RedissonClient;
 
 import java.time.Duration;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -122,9 +127,65 @@ class ReconcilerDetectionIT extends RedisTestBase {
                 .as("regression is a separate signal, not a miss")
                 .isZero();
         assertThat(regressionsCounter()).isOne();
+        assertThat(recheckResolvedCounter())
+                .as("genuine deletion is not a race; recheck must not resolve it")
+                .isZero();
         assertThat(cache.lastObservedSeq())
                 .as("regression resets the watermark to the new redisSeq")
                 .isZero();
+    }
+
+    @Test
+    void concurrentPublishes_withReconcileLoop_doNotProduceFalseRegressions() throws Exception {
+        // The reconciler's two reads (Redis seq, local watermark) are not
+        // atomic. Under sustained publisher concurrency a stale redisSeq
+        // snapshot paired with an up-to-date observed watermark trips the
+        // REGRESSION branch despite no genuine counter loss. The breaker-
+        // mediated recheck must catch this and prevent the false alarm.
+        //
+        // Pre-fix: regressions > 0 within seconds.
+        // Post-fix: regressions == 0; some recheck_resolved increments are
+        // expected as the race fires and is suppressed.
+        int writers = 8;
+        Duration duration = Duration.ofSeconds(5);
+        AtomicBoolean stop = new AtomicBoolean(false);
+        CountDownLatch ready = new CountDownLatch(writers);
+        CountDownLatch go = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(writers);
+        RAtomicLong seq = canonicalSeq();
+        try {
+            for (int i = 0; i < writers; i++) {
+                pool.submit(() -> {
+                    ready.countDown();
+                    try { go.await(); } catch (InterruptedException e) { return; }
+                    while (!stop.get()) {
+                        // Mimic publishInvalidationAsync's INCR + self-bump
+                        // pair without paying for a full put() (Caffeine +
+                        // L2 SET + publish). The race is in the watermark/
+                        // canonical-seq ordering, not in L1 traffic, so a
+                        // direct INCR+observe pair is the right shape.
+                        long n = seq.incrementAndGet();
+                        cache.onMessageObserved(n);
+                    }
+                });
+            }
+            ready.await();
+            go.countDown();
+            long deadline = System.nanoTime() + duration.toNanos();
+            long cycles = 0;
+            while (System.nanoTime() < deadline) {
+                cache.reconcile();
+                cycles++;
+            }
+            stop.set(true);
+            pool.shutdown();
+            pool.awaitTermination(5, TimeUnit.SECONDS);
+            assertThat(regressionsCounter())
+                    .as("recheck must suppress race-driven false regressions across %d cycles", cycles)
+                    .isZero();
+        } finally {
+            pool.shutdownNow();
+        }
     }
 
     @Test
@@ -194,6 +255,12 @@ class ReconcilerDetectionIT extends RedisTestBase {
 
     private double regressionsCounter() {
         Counter c = meterRegistry.find("cache.reconciliation.seq.regressions")
+                .tag("cache", name).counter();
+        return c == null ? 0.0 : c.count();
+    }
+
+    private double recheckResolvedCounter() {
+        Counter c = meterRegistry.find("cache.reconciliation.seq.regression_recheck_resolved")
                 .tag("cache", name).counter();
         return c == null ? 0.0 : c.count();
     }
