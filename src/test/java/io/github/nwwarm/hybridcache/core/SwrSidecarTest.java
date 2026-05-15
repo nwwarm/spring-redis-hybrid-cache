@@ -81,7 +81,7 @@ class SwrSidecarTest {
         assertThat(loaderCalls.get()).isEqualTo(1);
         assertThat(staleReturns()).isEqualTo(1);
         assertThat(refreshesStarted()).isEqualTo(1);
-        assertThat(refreshesCompleted()).isEqualTo(1);
+        await(() -> refreshesCompleted() == 1);
     }
 
     @Test
@@ -297,7 +297,17 @@ class SwrSidecarTest {
                 .tag("reason", "in_flight").counter().count();
     }
 
-    /** Polls a condition for up to 2s; useful for awaiting executor finalizers. */
+    /**
+     * Polls a condition for up to 2s. Used here for the
+     * latch-vs-metric-increment race: the {@code SwrSidecar} executor
+     * lambda increments {@code refreshesCompleted} / {@code refreshesFailed}
+     * AFTER the loader's {@code refreshTask.call()} returns, but the test's
+     * loader signals its {@code CountDownLatch} from inside the call. On a
+     * loaded runner the test thread can wake from {@code latch.await()} and
+     * read the counter before the executor thread has finalized
+     * bookkeeping. Convert any post-latch assertion on those two counters
+     * to {@code await(() -> counter() == expected)}.
+     */
     private static void await(java.util.function.BooleanSupplier cond) throws InterruptedException {
         long deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos();
         while (System.nanoTime() < deadline) {
