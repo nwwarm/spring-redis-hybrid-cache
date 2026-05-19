@@ -1,6 +1,7 @@
 package io.github.nwwarm.hybridcache.chaos;
 
 import eu.rekawek.toxiproxy.model.ToxicDirection;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -90,10 +91,13 @@ class RedisLatencyInjectionChaosIT extends ChaosTestBase {
         // verify breaker closes after probe calls succeed.
         redisProxy.toxics().get("slow").remove();
         if (breaker.getState() == CircuitBreaker.State.OPEN) {
-            await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-                breaker.executeSupplier(() -> client.getBucket("chaos:probe").get());
-                breaker.executeSupplier(() -> client.getBucket("chaos:probe").get());
-                assertThat(breaker.getState()).isEqualTo(CircuitBreaker.State.CLOSED);
+            await()
+                    .atMost(Duration.ofSeconds(10))
+                    .ignoreException(CallNotPermittedException.class)
+                    .untilAsserted(() -> {
+                        breaker.executeSupplier(() -> client.getBucket("chaos:probe").get());
+                        breaker.executeSupplier(() -> client.getBucket("chaos:probe").get());
+                        assertThat(breaker.getState()).isEqualTo(CircuitBreaker.State.CLOSED);
             });
         }
     }
@@ -111,9 +115,12 @@ class RedisLatencyInjectionChaosIT extends ChaosTestBase {
         }
         redisProxy.toxics().get("slow").remove();
 
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-            String v = breaker.executeSupplier(() -> (String) client.getBucket("chaos:keep").get());
-            assertThat(v).isEqualTo("v");
+        await()
+                .atMost(Duration.ofSeconds(10))
+                .ignoreException(CallNotPermittedException.class)
+                .untilAsserted(() -> {
+                    String v = breaker.executeSupplier(() -> (String) client.getBucket("chaos:keep").get());
+                    assertThat(v).isEqualTo("v");
         });
     }
 }
