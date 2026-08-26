@@ -606,6 +606,12 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
                 .tag("cache", cacheName).register(meterRegistry);
         Timer.Sample sample = Timer.start();
         try {
+            // Two watermark samples bracketing the GET — see
+            // NearCache.reconcile() and NearCache.classifyBracketed for the
+            // full rationale. Same rule, same guarantee: a sample taken
+            // before the GET was issued cannot legitimately exceed what the
+            // GET returns, so REGRESSION measured against it is genuine.
+            long observedBefore = lastObservedSeq.get();
             long redisSeq;
             try {
                 redisSeq = breaker.executeSupplier(distributedSeq::get);
@@ -622,15 +628,16 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
                         cacheName, e);
                 return;
             }
-            long observed = lastObservedSeq.get();
+            long observedAfter = lastObservedSeq.get();
             int tolerance = spec.reconciliation().missTolerance();
             ReconciliationDecision decision =
-                    ReconciliationDecision.classify(redisSeq, observed, tolerance);
+                    classifyBracketed(redisSeq, observedBefore, observedAfter, tolerance);
 
             if (decision == ReconciliationDecision.REGRESSION) {
-                // Non-atomic (redisSeq, observed) snapshot — a concurrent
-                // publisher INCR + watermark bump between the two reads
-                // produces a transient apparent regression. Re-read
+                // Second line of defence, retained from 1.0.2. The bracketed
+                // read removes the single-master race that used to reach
+                // here; a lagging-replica read (custom RedissonClient with
+                // ReadMode.SLAVE) can still show a transient dip. Re-read
                 // through the same breaker to disambiguate from a genuine
                 // counter-deleted regression. See NearCache.reconcile()
                 // for the full mechanism.
@@ -650,11 +657,23 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
                             cacheName, e);
                     return;
                 }
-                if (redisSeqRecheck >= observed) {
+                // Bracket the recheck GET too — see NearCache.reconcile(). Without
+                // this sample the re-classification measured a fresh
+                // redisSeqRecheck against a watermark snapshot taken before the
+                // recheck round-trip, so publishes landing during that round-trip
+                // read as missed and every suppressed regression became a miss.
+                long recheckObservedAfter = lastObservedSeq.get();
+                if (redisSeqRecheck >= observedBefore) {
                     Counter.builder("cache.reconciliation.seq.regression_recheck_resolved")
                             .tag("cache", cacheName).register(meterRegistry).increment();
                     redisSeq = redisSeqRecheck;
-                    decision = ReconciliationDecision.classify(redisSeq, observed, tolerance);
+                    // Adopt the recheck's pair so the MISS branch logs the delta
+                    // it decided on. observedBefore stays the REGRESSION anchor,
+                    // and the branch condition means this call cannot return
+                    // REGRESSION — a resolved regression must not re-open as one.
+                    observedAfter = recheckObservedAfter;
+                    decision = classifyBracketed(
+                            redisSeq, observedBefore, observedAfter, tolerance);
                 }
             }
 
@@ -664,7 +683,7 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
                             .tag("cache", cacheName).register(meterRegistry).increment();
                     log.warn("Reconciliation seq regressed on cache '{}': redisSeq={}, "
                             + "lastObservedSeq={}. Counter likely deleted by operator;"
-                            + " resetting watermark.", cacheName, redisSeq, observed);
+                            + " resetting watermark.", cacheName, redisSeq, observedBefore);
                     lastObservedSeq.set(redisSeq);
                 }
                 case MISS -> {
@@ -672,13 +691,17 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
                             .tag("cache", cacheName).register(meterRegistry).increment();
                     log.info("Reconciliation declared miss on cache '{}': redisSeq={},"
                             + " lastObservedSeq={}, delta={}, tolerance={}. Forcing"
-                            + " generation refresh.", cacheName, redisSeq, observed,
-                            redisSeq - observed, tolerance);
+                            + " generation refresh.", cacheName, redisSeq, observedAfter,
+                            redisSeq - observedAfter, tolerance);
                     // No L1 to clear; force generation refresh — repairs a
                     // possibly-stale locally-cached generation.
                     lastRefreshNanos.set(0);
                     currentGeneration();
-                    lastObservedSeq.set(redisSeq);
+                    // accumulateAndGet, not set — see NearCache's MISS branch:
+                    // set() would discard a publisher self-bump that landed
+                    // after the redisSeq read, walking the watermark backwards
+                    // into a spurious MISS on the following cycle.
+                    lastObservedSeq.accumulateAndGet(redisSeq, Math::max);
                 }
                 case NO_MISS -> { /* nothing to do */ }
             }
@@ -691,6 +714,27 @@ public class DistributedOnlyCache implements HybridCache, InvalidationListener, 
             sample.stop(cycleDuration);
             cyclesCompleted.increment();
         }
+    }
+
+    /**
+     * Two-sample classification (1.0.3). Identical rule to
+     * {@code NearCache.classifyBracketed} — REGRESSION is measured against
+     * the pre-GET sample (the only one that can prove genuine counter loss),
+     * MISS / NO_MISS against the post-GET sample (the only one that reflects
+     * publishes this cycle actually covered), and the window between them is
+     * benign by construction.
+     */
+    private static ReconciliationDecision classifyBracketed(
+            long redisSeq, long observedBefore, long observedAfter, int tolerance) {
+        if (ReconciliationDecision.classify(redisSeq, observedBefore, tolerance)
+                == ReconciliationDecision.REGRESSION) {
+            return ReconciliationDecision.REGRESSION;
+        }
+        ReconciliationDecision decision =
+                ReconciliationDecision.classify(redisSeq, observedAfter, tolerance);
+        return decision == ReconciliationDecision.REGRESSION
+                ? ReconciliationDecision.NO_MISS
+                : decision;
     }
 
     /** Test seam: returns the locally observed seq watermark. */

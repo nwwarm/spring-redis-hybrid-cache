@@ -71,7 +71,18 @@ class DistributedOnlyReconcilerIT extends RedisTestBase {
 
     @Test
     void concurrentPublishes_withReconcileLoop_doNotProduceFalseRegressions() throws Exception {
-        int writers = 8;
+        // See the NearCache twin in ReconcilerDetectionIT for the full
+        // rationale. Short version: 1.0.2 zeroed the regression counter but
+        // turned the suppressed regressions into MISSes (the recheck compared
+        // a fresh redisSeq against a stale watermark snapshot) — ~12.8k of
+        // them in 5s on this test, invisible because only regressions were
+        // asserted. 1.0.3's bracketed read takes both to zero.
+        //
+        // writers MUST stay <= the configured missTolerance (5, from setUp):
+        // the watermark lags the canonical by at most one in-flight bump per
+        // writer, and beyond the tolerance that lag is a correct miss, not a
+        // false one.
+        int writers = 4;
         Duration duration = Duration.ofSeconds(5);
         AtomicBoolean stop = new AtomicBoolean(false);
         CountDownLatch ready = new CountDownLatch(writers);
@@ -89,6 +100,14 @@ class DistributedOnlyReconcilerIT extends RedisTestBase {
                         // The race is in the (redisSeq, watermark)
                         // ordering inside reconcile(); this is the minimal
                         // shape that reproduces it.
+                        //
+                        // onMessageObserved is the *receiver* entry point
+                        // standing in for the *publisher* self-bump in
+                        // publishClearAsync. Interchangeable only while both
+                        // perform the same accumulateAndGet(seq, Math::max)
+                        // (DistributedOnlyCache:588 and :525 respectively);
+                        // if the publisher path diverges, this loop stops
+                        // reproducing the real interleaving.
                         long n = seq.incrementAndGet();
                         cache.onMessageObserved(n);
                     }
@@ -106,7 +125,11 @@ class DistributedOnlyReconcilerIT extends RedisTestBase {
             pool.shutdown();
             pool.awaitTermination(5, TimeUnit.SECONDS);
             assertThat(regressionsCounter())
-                    .as("recheck must suppress race-driven false regressions across %d cycles", cycles)
+                    .as("bracketed read must suppress race-driven false regressions across %d cycles", cycles)
+                    .isZero();
+            assertThat(missesCounter())
+                    .as("and must not cascade into a false miss: a regression used to reset the"
+                            + " watermark below the canonical, which the next cycle read as a gap")
                     .isZero();
         } finally {
             pool.shutdownNow();
@@ -115,6 +138,12 @@ class DistributedOnlyReconcilerIT extends RedisTestBase {
 
     private RAtomicLong canonicalSeq() {
         return redisson.getAtomicLong(CacheKeys.seqKey(name));
+    }
+
+    private double missesCounter() {
+        Counter c = meterRegistry.find("cache.reconciliation.misses.detected")
+                .tag("cache", name).counter();
+        return c == null ? 0.0 : c.count();
     }
 
     private double regressionsCounter() {

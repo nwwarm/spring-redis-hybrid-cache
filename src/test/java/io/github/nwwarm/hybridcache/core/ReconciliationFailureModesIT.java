@@ -25,10 +25,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       therefore do not INCR the seq, therefore do not generate
  *       false-positive misses on peer reconciliation cycles.</li>
  *   <li>"Sustained publish load" — under 10k+ publishes during a window,
- *       the cycle still completes and no misses are detected on the
- *       healthy publisher's own cycle (its lastObservedSeq doesn't matter
- *       for self-publishes since they're self-skipped, but the canonical
- *       seq advances and the cycle must handle it without throwing).</li>
+ *       the cycle still completes and the canonical seq advances by
+ *       exactly the publish count. The publisher's own watermark keeps
+ *       pace: the dispatcher self-skips its messages, so since 1.0.2
+ *       {@code publishInvalidationAsync} bumps {@code lastObservedSeq}
+ *       directly on the INCR reply. The cycle must handle the load
+ *       without throwing.</li>
  * </ul>
  */
 class ReconciliationFailureModesIT extends RedisTestBase {
@@ -126,11 +128,10 @@ class ReconciliationFailureModesIT extends RedisTestBase {
     void sustainedPublishLoad_cycleCompletes_noFalsePositives() {
         String name = "sustained-" + System.nanoTime();
         // High-volume publishes during a window; the reconciliation cycle
-        // must complete (no exception, cycles.completed counter increments)
-        // and must not declare misses on a healthy publisher whose
-        // lastObservedSeq is irrelevant because the publisher self-skips
-        // its own publishes — all advances on canonical seq match
-        // self-skipped messages.
+        // must complete (no exception, cycles.completed counter increments).
+        // The publisher's own watermark keeps pace with the canonical: the
+        // dispatcher self-skips its messages, so publishInvalidationAsync
+        // bumps lastObservedSeq directly on each INCR reply (1.0.2).
         //
         // The test pins the "no double traffic" guardrail under realistic
         // load: 1000 publishes per cycle × 1 cycle = 1000 INCRs, the cycle
@@ -158,15 +159,13 @@ class ReconciliationFailureModesIT extends RedisTestBase {
                     .as("cycle completed despite high publish load")
                     .isEqualTo(1.0);
 
-            // A publisher's own publishes self-skip on receive; lastObservedSeq
-            // stays at 0. Without the self-skip-aware semantics the publisher
-            // would decline its own miss declaration, so the cycle should
-            // declare a miss on its own publishes — and it does, because
-            // tolerance=0 and delta=N. This is correct: a single-node
-            // reconciliation can't distinguish "I published these" from
-            // "someone else published these" via the canonical counter alone.
-            // What's important is that this is bounded (one miss per cycle)
-            // and recoverable (the watermark jumps forward).
+            // A publisher's own publishes self-skip on receive, so before
+            // 1.0.2 lastObservedSeq stayed at 0 here and the cycle declared a
+            // miss on the node's own N publishes (tolerance=0, delta=N).
+            // That is no longer the case: publishInvalidationAsync bumps the
+            // watermark on each INCR reply, so observed tracks the canonical
+            // exactly and this cycle classifies NO_MISS. A publishing node no
+            // longer amplifies its own writes into a self-inflicted L1 clear.
             //
             // The two-node version is in ReconciliationCrossNodeIT; here we
             // just confirm the cycle handled the load without throwing.

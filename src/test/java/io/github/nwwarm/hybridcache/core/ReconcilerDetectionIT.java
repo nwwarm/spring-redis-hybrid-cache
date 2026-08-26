@@ -137,16 +137,32 @@ class ReconcilerDetectionIT extends RedisTestBase {
 
     @Test
     void concurrentPublishes_withReconcileLoop_doNotProduceFalseRegressions() throws Exception {
-        // The reconciler's two reads (Redis seq, local watermark) are not
+        // The reconciler's Redis-seq read and its watermark read are not
         // atomic. Under sustained publisher concurrency a stale redisSeq
         // snapshot paired with an up-to-date observed watermark trips the
-        // REGRESSION branch despite no genuine counter loss. The breaker-
-        // mediated recheck must catch this and prevent the false alarm.
+        // REGRESSION branch despite no genuine counter loss. As of 1.0.3 the
+        // bracketed read (pre-GET sample for REGRESSION, post-GET sample for
+        // MISS) settles this without needing the recheck; the 1.0.2
+        // breaker-mediated recheck remains as a second line of defence.
         //
-        // Pre-fix: regressions > 0 within seconds.
-        // Post-fix: regressions == 0; some recheck_resolved increments are
-        // expected as the race fires and is suppressed.
-        int writers = 8;
+        // Pre-1.0.2: regressions > 0 within seconds.
+        // 1.0.2: regressions == 0, but the *misses* counter was never asserted
+        // and it was not zero. The recheck resolved the suspected regression
+        // and then re-classified a FRESH redisSeq against the STALE observed
+        // snapshot — a delta of tens — so nearly every suppressed regression
+        // came back as a MISS and cleared L1. Measured on this test at 1.0.2:
+        // ~11k misses in 5s. The regression-only assertion hid it completely.
+        // 1.0.3: the bracketed read keeps the cycle out of the recheck path
+        // altogether, and misses go to 0.
+        //
+        // writers MUST stay <= the configured missTolerance (5, from setUp).
+        // Each writer holds at most one INCR whose reply has landed but whose
+        // watermark bump has not yet run, so the watermark lags the canonical
+        // by at most `writers`. Above the tolerance that lag is a *correct*
+        // miss declaration, not a false one, and this assertion would flake.
+        // Four writers still reproduces the defect decisively (~290 misses at
+        // 1.0.2 vs 0 here), so there is nothing to buy by raising it.
+        int writers = 4;
         Duration duration = Duration.ofSeconds(5);
         AtomicBoolean stop = new AtomicBoolean(false);
         CountDownLatch ready = new CountDownLatch(writers);
@@ -164,6 +180,15 @@ class ReconcilerDetectionIT extends RedisTestBase {
                         // L2 SET + publish). The race is in the watermark/
                         // canonical-seq ordering, not in L1 traffic, so a
                         // direct INCR+observe pair is the right shape.
+                        //
+                        // Note that onMessageObserved is the *receiver* entry
+                        // point standing in for the *publisher* self-bump at
+                        // NearCache.publishInvalidationAsync. The substitution
+                        // is valid only while both perform the same
+                        // accumulateAndGet(seq, Math::max); if the publisher
+                        // path ever diverges, this loop stops reproducing the
+                        // real interleaving and silently passes. The variant
+                        // below drives put() for exactly that reason.
                         long n = seq.incrementAndGet();
                         cache.onMessageObserved(n);
                     }
@@ -181,8 +206,73 @@ class ReconcilerDetectionIT extends RedisTestBase {
             pool.shutdown();
             pool.awaitTermination(5, TimeUnit.SECONDS);
             assertThat(regressionsCounter())
-                    .as("recheck must suppress race-driven false regressions across %d cycles", cycles)
+                    .as("bracketed read must suppress race-driven false regressions across %d cycles", cycles)
                     .isZero();
+            assertThat(missesCounter())
+                    .as("and must not cascade into a false miss: the watermark tracks the"
+                            + " canonical exactly here, so there is never a real gap")
+                    .isZero();
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void concurrentRealPublishes_withReconcileLoop_produceNoRegressionsOrMisses() throws Exception {
+        // The companion above simulates the publisher self-bump via
+        // onMessageObserved. This one drives the genuine path — put() →
+        // publishInvalidationAsync → INCR → self-bump — so the invariant the
+        // 1.0.3 fix rests on is exercised end to end against a real Redis:
+        //
+        //   every value lastObservedSeq holds was durable in Redis before it
+        //   was written locally, therefore observedBefore <= redisSeq
+        //
+        // If that holds, REGRESSION (judged against observedBefore) can never
+        // fire without genuine counter loss, and MISS (judged against
+        // observedAfter, which on a self-publishing node tracks the canonical)
+        // can never fire either.
+        int writers = 4;
+        Duration duration = Duration.ofSeconds(2);
+        AtomicBoolean stop = new AtomicBoolean(false);
+        CountDownLatch ready = new CountDownLatch(writers);
+        CountDownLatch go = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(writers);
+        try {
+            for (int i = 0; i < writers; i++) {
+                final int writer = i;
+                pool.submit(() -> {
+                    ready.countDown();
+                    try { go.await(); } catch (InterruptedException e) { return; }
+                    long n = 0;
+                    while (!stop.get()) {
+                        cache.put("w" + writer + "-k" + (n++ % 32), "v" + n);
+                    }
+                });
+            }
+            ready.await();
+            go.countDown();
+            long deadline = System.nanoTime() + duration.toNanos();
+            long cycles = 0;
+            while (System.nanoTime() < deadline) {
+                cache.reconcile();
+                cycles++;
+            }
+            stop.set(true);
+            pool.shutdown();
+            pool.awaitTermination(10, TimeUnit.SECONDS);
+
+            assertThat(cycles)
+                    .as("sanity: the loop must actually have driven cycles")
+                    .isPositive();
+            assertThat(regressionsCounter())
+                    .as("real publishes across %d cycles must produce no regression", cycles)
+                    .isZero();
+            assertThat(missesCounter())
+                    .as("nor any miss — this node published everything it is comparing against")
+                    .isZero();
+            assertThat(cache.lastObservedSeq())
+                    .as("watermark never lags the canonical on a self-publishing node")
+                    .isEqualTo(canonicalSeq().get());
         } finally {
             pool.shutdownNow();
         }

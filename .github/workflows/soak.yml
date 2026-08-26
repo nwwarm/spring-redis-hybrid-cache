@@ -62,6 +62,17 @@ jobs:
             pid=$(cat soak/app.pid)
             jcmd "$pid" GC.heap_info > "soak/heap-$ts.txt" 2>/dev/null || true
             ps -p "$pid" -o pid,etime,rss,pcpu --no-headers >> soak/ps-timeline.txt 2>/dev/null || true
+            # Reconciliation counter trajectory. Start/end values alone cannot
+            # distinguish "climbed steadily" from "one bad hour", and the
+            # reconciler is the subsystem with the most history of silent
+            # misbehaviour (the 1.0.2 recheck turned suppressed regressions
+            # into ~11k false L1 clears with every asserted counter at zero).
+            for m in cycles.completed misses.detected skipped \
+                     seq.regressions seq.regression_recheck_resolved; do
+              v=$(curl -fsS "http://localhost:8080/actuator/metrics/cache.reconciliation.$m" 2>/dev/null \
+                  | grep -o '"statistic":"COUNT","value":[0-9.eE+-]*' | head -1 | cut -d: -f3)
+              echo "$ts cache.reconciliation.$m ${v:-n/a}" >> soak/reconciliation-timeline.txt
+            done
             sleep 1800
           done) &
           echo $! > soak/snapshotter.pid
@@ -79,9 +90,28 @@ jobs:
       - name: Capture metrics snapshot
         if: always()
         run: |
+          # NB: /actuator/metrics with no name returns only the index of metric
+          # names, not values — kept for the inventory, not for numbers.
           curl -fsS http://localhost:8080/actuator/metrics > soak/metrics-end.json || true
           jcmd $(cat soak/app.pid) GC.heap_info > soak/heap-end.txt || true
           jcmd $(cat soak/app.pid) Thread.print > soak/threads-end.txt || true
+
+          # Final reconciliation counters, echoed into the job log so a
+          # reviewer sees them without downloading artefacts.
+          echo "--- reconciliation counters at end of run ---"
+          for m in cycles.completed misses.detected skipped \
+                   seq.regressions seq.regression_recheck_resolved; do
+            curl -fsS "http://localhost:8080/actuator/metrics/cache.reconciliation.$m" \
+              > "soak/reconciliation-$m.json" 2>/dev/null || true
+            v=$(grep -o '"statistic":"COUNT","value":[0-9.eE+-]*' "soak/reconciliation-$m.json" 2>/dev/null \
+                | head -1 | cut -d: -f3)
+            echo "cache.reconciliation.$m = ${v:-n/a}"
+          done
+          # seq.regression_recheck_resolved should be 0 on this runner: the
+          # soak app uses the library's own client, which pins ReadMode.MASTER,
+          # and the seq counter is INCR-only. Non-zero means the reconciler's
+          # read-ordering assumption does not hold here and its miss/regression
+          # verdicts cannot be trusted — worth investigating, not a run failure.
 
       - name: Stop smoke app
         if: always()

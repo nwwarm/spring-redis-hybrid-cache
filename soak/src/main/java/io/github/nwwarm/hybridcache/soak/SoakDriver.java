@@ -9,8 +9,11 @@ import reactor.netty.http.HttpResources;
 import java.lang.management.ManagementFactory;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * 24-hour soak driver. Sustains 1k req/s of mixed read / write
@@ -70,7 +73,9 @@ public final class SoakDriver {
 
         System.out.printf("Soak started: %s for %s @ %d req/s%n", start, soakFor, targetRps);
         printSnapshot("start");
+        printReconciliationCounters("start");
 
+        String reconciliationEnd;
         try {
             Flux.range(0, Integer.MAX_VALUE)
                     .concatMap(i -> issue())
@@ -79,14 +84,86 @@ public final class SoakDriver {
                     .doOnNext(ok -> { if (ok) success.incrementAndGet(); else failure.incrementAndGet(); })
                     .blockLast();
         } finally {
+            // Scrape before the client is torn down — the end snapshot below
+            // runs after HttpResources are disposed, so anything needing HTTP
+            // has to happen here.
+            reconciliationEnd = reconciliationCounters();
             HttpResources.disposeLoopsAndConnections();
             Schedulers.shutdownNow();
         }
 
         printSnapshot("end");
+        System.out.printf("[end] reconciliation %s%n", reconciliationEnd);
         System.out.printf("Soak finished: %s success, %s failures over %s%n",
                 success.get(), failure.get(), Duration.between(start, Instant.now()));
     }
+
+    /**
+     * Reconciliation counters worth a before/after comparison on a soak run.
+     *
+     * <p>{@code seq.regression_recheck_resolved} is the canary of the set. On a
+     * master-reading deployment — which the library pins by default — it should
+     * be zero at both ends of the run. A non-zero value means either a custom
+     * {@code ReadMode.SLAVE} client (benign) or that the reconciler's
+     * read-ordering assumption does not hold here, in which case its miss and
+     * regression verdicts cannot be trusted. Nothing else in the harness would
+     * surface that: the counter reads zero whether the mechanism works or has
+     * silently stopped being exercised.
+     *
+     * <p>{@code misses.detected} is the one to watch for the 1.0.3 fix itself.
+     * Before 1.0.3 a suppressed regression came straight back as a miss and
+     * cleared L1; the 1.0.2 soak never noticed because nobody looked at this
+     * counter — only at {@code seq.regressions}, which the recheck had already
+     * driven to zero.
+     */
+    private static final List<String> RECONCILIATION_METRICS = List.of(
+            "cache.reconciliation.cycles.completed",
+            "cache.reconciliation.misses.detected",
+            "cache.reconciliation.skipped",
+            "cache.reconciliation.seq.regressions",
+            "cache.reconciliation.seq.regression_recheck_resolved");
+
+    private void printReconciliationCounters(String label) {
+        System.out.printf("[%s] reconciliation %s%n", label, reconciliationCounters());
+    }
+
+    /**
+     * Reads each counter's COUNT via {@code /actuator/metrics/{name}}, summed
+     * across caches. Deliberately not {@code /actuator/prometheus}: that
+     * endpoint is listed in the soak app's exposure config but the
+     * {@code micrometer-registry-prometheus} artifact is not on its classpath,
+     * so it 404s. Never throws — a metrics failure must not end a 24h run.
+     */
+    private String reconciliationCounters() {
+        StringBuilder sb = new StringBuilder();
+        for (String metric : RECONCILIATION_METRICS) {
+            if (!sb.isEmpty()) sb.append(", ");
+            sb.append(metric.substring("cache.reconciliation.".length()))
+                    .append('=')
+                    .append(counterValue(metric));
+        }
+        return sb.toString();
+    }
+
+    private String counterValue(String metric) {
+        try {
+            String body = client.get().uri("/actuator/metrics/{m}", metric)
+                    .retrieve().bodyToMono(String.class)
+                    .onErrorReturn("")
+                    .block(Duration.ofSeconds(10));
+            if (body == null || body.isEmpty()) return "n/a";
+            // {"name":"...","measurements":[{"statistic":"COUNT","value":42.0}],...}
+            Matcher m = COUNT_VALUE.matcher(body);
+            return m.find() ? m.group(1) : "0.0";
+        } catch (Exception e) {
+            // A 404 (counter never registered because no cache opted into
+            // reconciliation) is normal and reads as n/a, not a failure.
+            return "n/a";
+        }
+    }
+
+    private static final Pattern COUNT_VALUE =
+            Pattern.compile("\"statistic\"\\s*:\\s*\"COUNT\"\\s*,\\s*\"value\"\\s*:\\s*([0-9.eE+-]+)");
 
     private Mono<Boolean> issue() {
         int op = ThreadLocalRandom.current().nextInt(100);

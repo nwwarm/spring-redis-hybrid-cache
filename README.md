@@ -195,10 +195,10 @@ This is the section that distinguishes a production cache from a demo. Every sce
 | **Cluster/Sentinel read routing** | Reads are routed to masters by default to preserve read-your-writes coherence with the invalidation pipeline. Applications can override via custom `RedissonClient` bean if eventual-consistency reads are acceptable in exchange for higher read throughput. |
 | **Network partition between nodes** | Each side of the partition serves from L1 within TTL bounds. After partition heals, normal pub/sub propagation resumes. Stale entries written before the partition expire via TTL. This is a correctness-vs-availability tradeoff: the library favors availability. |
 | **Subscriber briefly disconnects** | Redisson auto-reconnects. Messages lost during the disconnect window are recovered by the next reconciliation cycle (when `reconciliation.enabled=true`): a `redisSeq − lastObservedSeq > miss-tolerance` reading triggers `caffeineCache.clear()` on `NearCache` or a generation-pointer refresh on `DistributedOnlyCache`. Worst-case staleness is bounded by the reconciliation interval (default 60s). |
-| **Reconciliation cycle fails** | Cycle is skipped, `cache.reconciliation.skipped{cache, reason=breaker_open\|exception}` increments, no exception escapes. Next cycle runs as normal. |
-| **Reconciliation declares a miss** | `cache.reconciliation.misses{cache}` increments, INFO log lines name the cache and the seq delta, and the recovery action runs. The cache resets `lastObservedSeq` so the next cycle does not re-fire on the same gap. |
-| **SWR refresh fails** | Stale value continues to serve until `stale-until`. `cache.swr.refresh.failures{cache}` increments; WARN log. No exception surfaces to the caller. |
-| **Refresh-ahead refresh fails** | Same handling as SWR refresh failure — `cache.refresh.ahead.failures{cache}` increments, no exception surfaces. The next read inside the fresh window may roll the dice again. |
+| **Reconciliation cycle fails** | Cycle is skipped, `cache.reconciliation.skipped{cache, reason=breaker-open\|exception}` increments, no exception escapes. Next cycle runs as normal. |
+| **Reconciliation declares a miss** | `cache.reconciliation.misses.detected{cache}` increments, INFO log lines name the cache and the seq delta, and the recovery action runs. The cache resets `lastObservedSeq` so the next cycle does not re-fire on the same gap. |
+| **SWR refresh fails** | Stale value continues to serve until `stale-until`. `cache.swr.refreshes{cache, status=failed}` increments; WARN log. No exception surfaces to the caller. |
+| **Refresh-ahead refresh fails** | Same handling as SWR refresh failure — `cache.refresh_ahead.refreshes{cache, status=failed}` increments, no exception surfaces. The next read inside the fresh window may roll the dice again. |
 | **Async loader fails** | Returned `CompletableFuture` is completed exceptionally with the loader's cause, wrapped in `Cache.ValueRetrievalException` to match the sync path. Single-flight in-flight entry is removed; subsequent calls retry. Failed futures with `recordExceptions` causes count toward the breaker. |
 | **Async path with breaker open** | `CompletableFuture` resolves to `null` (treated as a miss; caller's loader runs). `cache.l2.breaker.open{cache}` increments. Identical to sync-path semantics. |
 | **Reconciliation seq counter `RAtomicLong` lost** (operator action: manual `DEL`, `FLUSHALL`) | Receivers detect `redisSeq < lastObservedSeq`, clamp to "no miss," reset `lastObservedSeq`, and `cache.reconciliation.seq.regressions{cache}` increments with a WARN log once per event. The library does not propagate operator action into a cache-clearing cascade. |
@@ -357,7 +357,7 @@ cache:
         miss-tolerance: 5    # default 5
 ```
 
-What this buys: a missed invalidation message no longer waits for TTL. The receiving node detects `redisSeq − lastObservedSeq > miss-tolerance` on the next cycle and runs a local recovery (`caffeineCache.clear()` on `NearCache`, generation-pointer refresh on `DistributedOnlyCache`). Reconciliation is repair mode, not the first line of defence: pub/sub still carries every healthy invalidation. The metric `cache.reconciliation.misses{cache}` increments once per detected gap; if it climbs in steady state, look at pub/sub or the network before tightening the tolerance.
+What this buys: a missed invalidation message no longer waits for TTL. The receiving node detects `redisSeq − lastObservedSeq > miss-tolerance` on the next cycle and runs a local recovery (`caffeineCache.clear()` on `NearCache`, generation-pointer refresh on `DistributedOnlyCache`). Reconciliation is repair mode, not the first line of defence: pub/sub still carries every healthy invalidation. The metric `cache.reconciliation.misses.detected{cache}` increments once per detected gap; if it climbs in steady state, look at pub/sub or the network before tightening the tolerance.
 
 ---
 
@@ -396,7 +396,7 @@ cache:
         beta: 1.0            # XFetch β; default 1.0 matches the paper
 ```
 
-`refresh-ahead.enabled=true` requires `swr.fresh-for` and `swr.stale-for` configured; the validator rejects RA-without-SWR at startup. Higher β fires earlier (more aggressive). Track `cache.refresh.ahead.fires{cache}` to confirm RA is firing as expected.
+`refresh-ahead.enabled=true` requires `swr.fresh-for` and `swr.stale-for` configured; the validator rejects RA-without-SWR at startup. Higher β fires earlier (more aggressive). Track `cache.refresh_ahead.refreshes{cache, status=started}` to confirm RA is firing as expected.
 
 ---
 
@@ -452,15 +452,15 @@ The library exposes the following Micrometer metrics, tagged by cache name:
 | `cache.invalidations.suppressed.cold_load{cache}` | counter | Cold-load completions that intentionally did not publish (peer L1 has nothing stale to drop). Different question from the publish/receive pair — leaves the publish path quieter than naive write-through would. |
 | `resilience4j.circuitbreaker.state{name=redis-cache}` | gauge | Breaker state. 0=closed, 1=half-open, 2=open. |
 | `cache.size{cache}` | gauge | Current Caffeine entry count. |
-| `cache.reconciliation.cycles{cache}` | counter | Periodic reconciliation cycles invoked, regardless of outcome. Pair with `misses` to compute miss rate. |
-| `cache.reconciliation.misses{cache}` | counter | Cycles that declared a miss (`redisSeq − lastObservedSeq > tolerance`); each increment corresponds to one local recovery action. |
-| `cache.reconciliation.skipped{cache, reason=breaker_open\|exception}` | counter | Cycles skipped because Redis was unhealthy (breaker open) or threw unexpectedly. Tagged so dashboards distinguish the two. |
-| `cache.reconciliation.seq.regressions{cache}` | counter | Cycles where `redisSeq < lastObservedSeq`. Almost always operator-driven (`DEL`, `FLUSHALL`); WARN log once per event. |
+| `cache.reconciliation.cycles.completed{cache}` | counter | Reconciliation cycles that ran to completion, whatever the outcome. Pair with `misses.detected` to compute miss rate. The coordinator also emits `cache.reconciliation.cycles.scheduled{cache}` at dispatch; a gap between the two means cycles are throwing past the cache's own catch-all. |
+| `cache.reconciliation.misses.detected{cache}` | counter | Cycles that declared a miss (`redisSeq − lastObservedSeq > tolerance`); each increment corresponds to one local recovery action — an L1 clear on `NEAR_CACHE`, a generation-pointer refresh on `DISTRIBUTED_ONLY`. |
+| `cache.reconciliation.skipped{cache, reason=breaker-open\|exception}` | counter | Cycles skipped because Redis was unhealthy (breaker open) or threw unexpectedly. Tagged so dashboards distinguish the two. |
+| `cache.reconciliation.seq.regressions{cache}` | counter | Cycles where the canonical counter was below the watermark this node had already observed as durable in Redis. Non-zero means `<cache>:seq` genuinely lost state — investigate Redis, not the cache: manual `DEL`, `FLUSHALL`/`FLUSHDB`, key eviction under `maxmemory`, or a failover that promoted a replica missing recent writes. WARN log once per event. |
+| `cache.reconciliation.seq.regression_recheck_resolved{cache}` | counter | Suspected regressions that a second read disproved — the counter had dipped and recovered, so no state was lost and no recovery ran. **On a master-reading deployment this should stay at zero.** The library pins `ReadMode.MASTER` on cluster and sentinel, and the counter is `INCR`-only, so a dip cannot happen: a non-zero value means either (a) you supplied your own `RedissonClient` with `ReadMode.SLAVE` and are seeing replica lag, which is expected and benign, or (b) neither of those applies — in which case the reconciler's read-ordering assumption does not hold on your deployment and its miss/regression classification cannot be trusted. Treat case (b) as a bug report. |
 | `cache.swr.refreshes{cache, status=started\|completed\|failed\|suppressed_breaker_open}` | counter | SWR async refresh dispatches grouped by outcome. Breaker-open suppression is a separate status from failure so dashboards distinguishing "Redis incident" from "loader bug" stay honest. |
 | `cache.swr.refreshes.skipped{cache, reason=in_flight}` | counter | Stale reads that found an in-flight refresh and did not dispatch a duplicate. Confirms the per-key collapse is firing. |
 | `cache.swr.stale_returns{cache}` | counter | Reads that returned a stale value (and dispatched an SWR refresh, except when suppressed). |
-| `cache.refresh.ahead.fires{cache}` | counter | Reads inside the fresh window where the XFetch predicate returned true and a refresh was dispatched. |
-| `cache.refresh.ahead.failures{cache}` | counter | Failed RA refreshes; kept distinct from SWR's failure counter because the trigger is different. |
+| `cache.refresh_ahead.refreshes{cache, status=started\|completed\|failed\|deduped\|suppressed_breaker_open}` | counter | Refresh-ahead dispatches grouped by outcome — same shape as `cache.swr.refreshes`, deliberately a separate family because the trigger differs (XFetch probability inside the fresh window, not staleness). `status=started` counts reads where the predicate fired; `deduped` counts those that found an in-flight refresh and did not dispatch a duplicate. Note the underscore in `refresh_ahead`, which does not match the dotted `cache.swr.*` family. |
 | `cache.refresh.queue.size` | gauge | Current depth of the shared refresh executor's work queue. Sustained non-zero means the executor is undersized. |
 | `cache.refresh.executor.active` | gauge | Currently-running refresh tasks across SWR, RA, and the async loader hop. |
 
@@ -794,9 +794,9 @@ step elsewhere in this README; this checklist is the integration view.
   for high-criticality caches (cost: one extra GET per cache per
   cycle).
 - [ ] Default `miss-tolerance=5` accommodates legitimate in-flight
-  bursts. Tune up if `cache.reconciliation.misses` increments
+  bursts. Tune up if `cache.reconciliation.misses.detected` increments
   under healthy traffic; tune down if you want faster detection.
-- [ ] Track `cache.reconciliation.cycles` / `misses` / `skipped` /
+- [ ] Track `cache.reconciliation.cycles.completed` / `misses.detected` / `skipped` /
   `seq.regressions` on your dashboards. The "stuck open" or
   "regression spam" patterns surface here first.
 
@@ -806,7 +806,7 @@ step elsewhere in this README; this checklist is the integration view.
   Operator-meaningful values: `fresh-for` ≈ acceptable freshness
   window; `stale-for` ≈ TTL.
 - [ ] RA (`refresh-ahead.enabled=true`, requires SWR configured) is
-  probabilistic, track `cache.refresh.ahead.fires` to confirm
+  probabilistic, track `cache.refresh_ahead.refreshes{status=started}` to confirm
   it's firing as you expect. β default `1.0` matches the XFetch
   paper's recommendation.
 - [ ] Size the refresh executor via `cache.refresh.scheduler-pool-size`
