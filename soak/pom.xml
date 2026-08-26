@@ -34,7 +34,25 @@
     <properties>
         <java.version>17</java.version>
         <springboot.version>3.5.14</springboot.version>
-        <hybrid.cache.version>1.0.1</hybrid.cache.version>
+        <!--
+          Must match the <version> of the root pom, because the soak app
+          is meant to exercise the library that was just built. This is a
+          sibling project, not a reactor module, so ${project.version}
+          here would resolve to cache-soak's own version and Maven does
+          not allow a property in a <parent> version — a literal is the
+          only option, and it has to be bumped with the root pom.
+
+          Both CI (.github/workflows/soak.yml) and SOAK_GUIDE.md step 1
+          run `mvn -DskipTests install` at the root first, so the locally
+          installed jar shadows Maven Central and the soak sees the
+          working tree. If this literal ever falls behind the root pom,
+          that resolution silently reverts to the released artifact from
+          Central and the soak tests the wrong code: it was pinned at
+          1.0.1 through the whole of 1.0.2, so no soak ever ran against
+          the 1.0.2 tree. Override per-run with
+          -Dhybrid.cache.version=<v> if you need a different one.
+        -->
+        <hybrid.cache.version>1.0.2</hybrid.cache.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 
@@ -79,10 +97,36 @@
                     <parameters>true</parameters>
                 </configuration>
             </plugin>
+            <!--
+              The repackage execution is required, not decorative. This
+              project does not inherit from spring-boot-starter-parent
+              (it imports spring-boot-dependencies instead), so nothing
+              binds `repackage` to the package phase on our behalf, and
+              declaring the plugin alone runs no goal at all. Without it
+              `mvn package` produces a plain jar with no Main-Class and
+              no BOOT-INF, and `java -jar soak/target/cache-soak-*.jar`
+              fails with "no main manifest attribute".
+
+              That is how the app is started in CI
+              (.github/workflows/soak.yml, "Boot smoke app"), so the
+              nightly soak booted nothing and still reported success —
+              its health-check loop returns the exit status of `sleep`,
+              the driver exits 0 no matter how many requests fail, and
+              the app-log gate greps for Exception/ERROR in a log that
+              only contains the manifest error. SOAK_GUIDE.md's local
+              path uses `spring-boot:run` and was never affected.
+            -->
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <version>${springboot.version}</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>

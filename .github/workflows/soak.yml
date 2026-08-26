@@ -21,10 +21,41 @@ jobs:
         run: docker run -d --name redis -p 6379:6379 redis:7-alpine
 
       - name: Install library
-        run: mvn -B -DskipTests install
+        id: lib
+        run: |
+          mvn -B -DskipTests install
+          # Derive the version we just installed and hand it to the soak
+          # build. soak/pom.xml carries a literal default that has to be
+          # bumped by hand (sibling project, so ${project.version} there
+          # is cache-soak's own version), and when that literal falls
+          # behind the root pom, Maven quietly resolves the last released
+          # artifact from Central instead — the soak then reports on code
+          # nobody changed. It was pinned at 1.0.1 for the whole of 1.0.2.
+          # Deriving it here makes the pin unable to drift in CI.
+          v=$(mvn -B -q -DforceStdout help:evaluate -Dexpression=project.version | tail -n 1 | tr -d '[:space:]')
+          if [ -z "$v" ]; then
+            echo "::error::Could not resolve project.version from the root pom"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Installed library version: $v"
 
       - name: Build soak app
-        run: mvn -B -f soak/pom.xml package
+        run: |
+          mvn -B -f soak/pom.xml package \
+            -Dhybrid.cache.version=${{ steps.lib.outputs.version }}
+          # Assert the repackaged jar actually bundles that version. The
+          # point of this job is to soak the code this run built; without
+          # the check, any future regression in the wiring above goes back
+          # to being invisible, which is how the previous one lasted a
+          # release.
+          want="hybrid-cache-spring-boot-starter-${{ steps.lib.outputs.version }}.jar"
+          if ! unzip -l soak/target/cache-soak-*.jar | grep -q "BOOT-INF/lib/$want"; then
+            echo "::error::Soak jar does not bundle $want — it would soak the wrong library build."
+            unzip -l soak/target/cache-soak-*.jar | grep "hybrid-cache" || true
+            exit 1
+          fi
+          echo "Soak jar bundles $want"
 
       - name: Resolve soak jar
         id: jar
@@ -80,6 +111,7 @@ jobs:
       - name: Run soak driver
         run: |
           mvn -B -f soak/pom.xml exec:java \
+            -Dhybrid.cache.version=${{ steps.lib.outputs.version }} \
             -Dexec.mainClass=io.github.nwwarm.hybridcache.soak.SoakDriver \
             -Dexec.args="http://localhost:8080 24h 1000"
 
