@@ -28,6 +28,9 @@ import org.redisson.config.ReadMode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.actuate.health.HealthIndicator;
+import org.springframework.boot.autoconfigure.AutoConfigureBefore;
+import org.springframework.boot.autoconfigure.cache.CacheAutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -54,6 +57,7 @@ import java.util.concurrent.TimeoutException;
  * with a different codec for JPA entities) without forking the rest.
  */
 @Configuration(proxyBeanMethods = false)
+@AutoConfigureBefore(CacheAutoConfiguration.class)
 @EnableCaching
 @EnableConfigurationProperties(CacheProperties.class)
 public class CacheConfig {
@@ -461,9 +465,14 @@ public class CacheConfig {
      * Spring Boot Actuator integration. Only registered when
      * {@link HealthIndicator} is on the classpath, so applications that
      * exclude {@code spring-boot-starter-actuator} aren't forced to add it.
+     * Also requires an actual {@link HybridCacheManager} bean: if the
+     * application supplies its own {@code CacheManager} and {@link
+     * #cacheManager} correctly backs off, this must do the same instead of
+     * failing to autowire one that was never going to exist.
      */
     @Bean
     @ConditionalOnClass(HealthIndicator.class)
+    @ConditionalOnBean(HybridCacheManager.class)
     @ConditionalOnMissingBean(name = "hybridCacheHealthIndicator")
     public HybridCacheHealthIndicator hybridCacheHealthIndicator(
             RedissonClient redisson,
